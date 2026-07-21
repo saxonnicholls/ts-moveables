@@ -59,6 +59,25 @@ jobs:
         if: ${{ matrix.asan }}
         run: make asan CXX=${{ matrix.cxx }} STD=c++20
 
+  cmake:
+    name: CMake ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure
+        run: cmake -B build-cmake -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-cmake --config Release
+
+      - name: Test
+        run: ctest --test-dir build-cmake -C Release --output-on-failure
+
   msvc:
     name: Windows x86-64 MSVC
     runs-on: windows-latest

@@ -1,5 +1,6 @@
-# Build output from the Makefile
+# Build output from the Makefile and CMake
 build/
+build-cmake/
 
 # Xcode user state
 xcuserdata/

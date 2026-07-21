@@ -127,6 +127,31 @@ make test STD=c++17   # any target can be built against a different standard
 
 The Xcode project builds the same demo (`main.cpp`).
 
+### CMake
+
+The library exports the interface target `snicholls::ts_moveables`, which carries the C++17 requirement, Threads, and (on Linux) libatomic. The easiest integration is FetchContent:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(ts_moveables
+    GIT_REPOSITORY https://github.com/saxonnicholls/ts-moveables.git
+    GIT_TAG main)
+FetchContent_MakeAvailable(ts_moveables)
+
+target_link_libraries(my_app PRIVATE snicholls::ts_moveables)
+```
+
+`add_subdirectory` works the same way. Or build, test and install it system-wide:
+
+```sh
+cmake -B build-cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cmake
+ctest --test-dir build-cmake --output-on-failure   # the same cassert unit tests
+cmake --install build-cmake                        # then: find_package(ts_moveables REQUIRED)
+```
+
+However the library arrives — vendored, fetched or installed — `#include "ts_moveables.hpp"` is the same.
+
 CI runs the test suite on every push across Linux (x86-64 and ARM64, GCC and Clang), macOS (Apple Silicon and Intel, Apple Clang), and Windows (MSVC), in both C++17 and C++20, with ThreadSanitizer on every POSIX platform and Address + UB Sanitizers on Linux.
 
 ### About ThreadSanitizer
