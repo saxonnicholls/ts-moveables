@@ -40,7 +40,7 @@ jobs:
             cxx: c++
             tsan: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Unit tests (C++17)
         run: make clean && make test CXX=${{ matrix.cxx }} STD=c++17
@@ -63,7 +63,7 @@ jobs:
     name: Windows x86-64 MSVC
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Unit tests (C++17 and C++20)
         shell: cmd
