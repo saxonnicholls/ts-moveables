@@ -27,6 +27,17 @@
 using namespace snicholls;
 using namespace std::chrono_literals;
 
+// Some libstdc++ versions disable their pthread clocklock path under TSan but
+// leave the steady_clock try_lock_until overloads of the timed mutexes calling
+// it (GCC bug 113327), so those overloads fail to compile. Use system_clock
+// deadlines for the timed-mutex tests there; every other build uses
+// steady_clock as normal.
+#if defined(_GLIBCXX_TSAN)
+using deadline_clock = std::chrono::system_clock;
+#else
+using deadline_clock = std::chrono::steady_clock;
+#endif
+
 namespace {
 
 int tests_run = 0;
@@ -328,7 +339,7 @@ void test_mutex_variants()
     moveable_timed_mutex tm;
     assert(tm.try_lock_for(10ms));
     tm.unlock();
-    assert(tm.try_lock_until(std::chrono::steady_clock::now() + 10ms));
+    assert(tm.try_lock_until(deadline_clock::now() + 10ms));
     tm.unlock();
 
     // Shared - two simultaneous readers
@@ -349,7 +360,7 @@ void test_mutex_variants()
     moveable_shared_timed_mutex stm;
     assert(stm.try_lock_shared_for(10ms));
     stm.unlock_shared();
-    assert(stm.try_lock_shared_until(std::chrono::steady_clock::now() + 10ms));
+    assert(stm.try_lock_shared_until(deadline_clock::now() + 10ms));
     stm.unlock_shared();
 
     // A shared-locked mutex refuses to move
