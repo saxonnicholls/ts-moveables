@@ -209,7 +209,7 @@ panel[0].clicked(1);                            // every connection still fires
 
 (The name is `moveable_signal` rather than `signal` because POSIX declares a global C function `::signal`, which makes the unqualified short name ambiguous the moment `<csignal>` leaks into a translation unit.)
 
-A comprehensive demo lives in [demos/signal_slot_demo.cpp](demos/signal_slot_demo.cpp) (`make demo-signals`): a typed emitter/observer architecture — per-type emitters, virtual observers with RAII subscriptions, multi-type emitters and observers wired with fold expressions — measured through fan-out, multi-type, cross-thread, and many-to-many 4×4 mesh scenarios, in both messages per second and checksummed GB/s.
+The architecture this enables at scale — typed emitters, observers, meshes, capture and replay — is shown working in the [Demos](#demos) section below.
 
 ## Building and testing
 
@@ -298,6 +298,40 @@ Measured on the reference machine — a 2014 Intel iMac, Apple Clang, `-O3` — 
 | many-to-many mesh 4×4, 4 KiB frames | ~15 M deliveries/s | ~64 GB/s |
 
 Sustained across the whole signal demo: ~27M deliveries/s — on the order of **95 billion events per hour** — in constant memory. The GB/s figures are bytes actually checksummed by consumers; payloads move zero-copy by `const&`, which is why delivery bandwidth can exceed DRAM bandwidth. The batched disruptor headline is the LMAX thesis in one row: amortise the coordination and the cost per event approaches a nanosecond.
+
+The self-verifying demos (every number below was produced while asserting ordering and bit-exact replay hashes):
+
+| `make demo-capture` — 3-hop capture/replay topology | Result |
+|---|---|
+| pipeline, 3 reentrant hops, no capture | ~10 M events/s (~35 billion events/hour) |
+| ingress journal overhead | **~10–13 ns/event** |
+| replay from journal (fresh topology, hashes identical) | ~10 M events/s |
+| 4 partitioned pipelines on 4 threads | ~11–14 M events/s total |
+
+| `make demo-pcap` — packet decode + flow partition | Result |
+|---|---|
+| live: decode → 4 flow nodes, every payload byte hashed | ~6.8 M packets/s, ~0.6 GB/s |
+| replay from the offset journal (hashes identical) | ~6.9 M packets/s |
+
+| `make demo-taskflow` — dependency graphs on signals | Result |
+|---|---|
+| fan-out/fan-in 1→64→1, join counter as the scheduler | ~23 M task executions/s |
+| 4 independent diamond graphs on 4 threads | ~15 M waves/s |
+| 4-stage pipeline, 4 concurrent producers | ~1.7 M tokens/s end to end |
+| computation-as-event (submit → compute → result) | ~16 M jobs/s round-tripped |
+
+## Demos
+
+Working programs, not snippets. Each builds and runs with one make target; the last three verify their own correctness and fail loudly, so CI runs them on every push as cross-platform integration tests.
+
+| Demo | Run with | What it shows |
+|---|---|---|
+| [signal_slot_demo](demos/signal_slot_demo.cpp) | `make demo-signals` | the typed emitter/observer architecture: per-type emitters, virtual observers with RAII subscriptions, multi-type plants and many-to-many 4×4 meshes wired with fold expressions — measured in events/s and checksummed GB/s |
+| [capture_replay_demo](demos/capture_replay_demo.cpp) | `make demo-capture` | the HFT discipline: journal every ingress event (~13 ns/event), replay through a fresh multi-hop topology, and prove the egress stream hash reproduces exactly — ordering asserted at every hop, live and replayed, single-threaded and across four partitioned pipelines |
+| [pcap_replay_demo](demos/pcap_replay_demo.cpp) | `make demo-pcap` | the same discipline over real network captures: a dependency-free classic-pcap reader, packets travelling zero-copy by `const&` through decode and flow-partition nodes, a journal of 4-byte offsets, and a bit-exact replay |
+| [taskflow_style_demo](demos/taskflow_style_demo.cpp) | `make demo-taskflow` | [Taskflow](https://taskflow.github.io)-style dependency graphs on signals: diamonds, 1→64→1 fan-in joins, graph reuse, concurrent pipelines and computation-as-event — with no scheduler, so no thread starvation: a task runs inline on the thread that completes its last dependency |
+
+For the pcap demo, bring your own data — `./build/pcap_replay_demo capture.pcap` — or capture live traffic with [scripts/capture_pcap.sh](scripts/capture_pcap.sh), which auto-detects your default interface (`en0` on macOS, `eth0`-style on Linux), runs `sudo tcpdump -s 0 -w`, and prints the replay command. Public capture files to experiment with are indexed at [netresec.com/?page=PcapFiles](https://www.netresec.com/?page=PcapFiles) — note that many are pcapng or gzipped, and the reader takes classic pcap, so convert first: `tcpdump -r in.pcapng -w out.pcap`. Without any file, the demo synthesises a capture, so it always runs.
 
 ## Where this is going
 

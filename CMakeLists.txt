@@ -68,6 +68,12 @@ if(TS_MOVEABLES_BUILD_TESTS)
     add_executable(ts_moveables_signal_slot_demo demos/signal_slot_demo.cpp)
     target_link_libraries(ts_moveables_signal_slot_demo PRIVATE snicholls::ts_moveables)
     target_compile_definitions(ts_moveables_signal_slot_demo PRIVATE NDEBUG)
+
+    foreach(demo capture_replay_demo pcap_replay_demo taskflow_style_demo)
+        add_executable(ts_moveables_${demo} demos/${demo}.cpp)
+        target_link_libraries(ts_moveables_${demo} PRIVATE snicholls::ts_moveables)
+        target_compile_definitions(ts_moveables_${demo} PRIVATE NDEBUG)
+    endforeach()
 endif()
 
 # Install and export

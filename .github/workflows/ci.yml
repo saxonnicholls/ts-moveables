@@ -53,6 +53,7 @@ jobs:
 
       - name: Throughput (informational)
         run: |
+          set -o pipefail
           make build/bench build/signal_slot_demo CXX=${{ matrix.cxx }}
           {
             echo "## Throughput - ${{ matrix.name }}"
@@ -60,6 +61,18 @@ jobs:
             ./build/bench --markdown
             echo ""
             ./build/signal_slot_demo --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Demos (self-verifying)
+        run: |
+          set -o pipefail
+          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo CXX=${{ matrix.cxx }}
+          {
+            ./build/capture_replay_demo --markdown
+            echo ""
+            ./build/pcap_replay_demo --markdown
+            echo ""
+            ./build/taskflow_style_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: ThreadSanitizer
@@ -92,6 +105,7 @@ jobs:
       - name: Throughput (informational)
         shell: bash
         run: |
+          set -o pipefail
           run_exe() {
             if [ -x "build-cmake/Release/$1.exe" ]; then "build-cmake/Release/$1.exe" --markdown
             elif [ -x "build-cmake/Release/$1" ]; then "build-cmake/Release/$1" --markdown
@@ -104,6 +118,12 @@ jobs:
             run_exe ts_moveables_bench
             echo ""
             run_exe ts_moveables_signal_slot_demo
+            echo ""
+            run_exe ts_moveables_capture_replay_demo
+            echo ""
+            run_exe ts_moveables_pcap_replay_demo
+            echo ""
+            run_exe ts_moveables_taskflow_style_demo
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   msvc:

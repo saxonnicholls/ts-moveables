@@ -48,6 +48,15 @@ build/bench: benchmarks/bench.cpp $(HEADERS) | build
 build/signal_slot_demo: demos/signal_slot_demo.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/signal_slot_demo.cpp -o $@ $(LDLIBS)
 
+build/capture_replay_demo: demos/capture_replay_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/capture_replay_demo.cpp -o $@ $(LDLIBS)
+
+build/pcap_replay_demo: demos/pcap_replay_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/pcap_replay_demo.cpp -o $@ $(LDLIBS)
+
+build/taskflow_style_demo: demos/taskflow_style_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/taskflow_style_demo.cpp -o $@ $(LDLIBS)
+
 test: build/tests
 	./build/tests
 
@@ -66,7 +75,16 @@ bench: build/bench
 demo-signals: build/signal_slot_demo
 	./build/signal_slot_demo
 
+demo-capture: build/capture_replay_demo
+	./build/capture_replay_demo
+
+demo-pcap: build/pcap_replay_demo
+	./build/pcap_replay_demo
+
+demo-taskflow: build/taskflow_style_demo
+	./build/taskflow_style_demo
+
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo bench demo-signals clean
+.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow clean
