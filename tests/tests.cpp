@@ -168,7 +168,7 @@ void test_atomic_threaded()
     moveable_atomic_int counter{0};
     std::vector<std::thread> threads;
     for (int t = 0; t < n_threads; ++t)
-        threads.emplace_back([&counter] {
+        threads.emplace_back([&] {
             for (int i = 0; i < n_iters; ++i)
                 ++counter;
         });

@@ -1,0 +1,14 @@
+# ThreadSanitizer suppressions for known toolchain false positives.
+#
+# libstdc++'s timed mutexes acquire their locks through pthread_mutex_clocklock
+# (and the shared variants through pthread_rwlock_clock*lock) when the platform
+# provides them. Some libtsan builds - GCC's on current Ubuntu, for example -
+# do not intercept those functions, so TSan never observes the lock and then
+# misreports the perfectly matched unlock as "unlock of an unlocked mutex".
+#
+# These suppressions are scoped to the std timed mutex unlock frames only;
+# genuine mutex misuse anywhere else still reports.
+mutex:std::timed_mutex::unlock
+mutex:std::recursive_timed_mutex::unlock
+mutex:std::shared_timed_mutex::unlock
+mutex:std::shared_timed_mutex::unlock_shared
