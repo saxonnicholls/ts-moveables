@@ -7,17 +7,47 @@
       <BreakpointProxy
          BreakpointExtensionID = "Xcode.Breakpoint.FileBreakpoint">
          <BreakpointContent
-            uuid = "26F2F27E-B847-469F-90DD-05177074858D"
+            uuid = "7E0B1E29-FFE5-469D-85F2-E8A3E6664114"
             shouldBeEnabled = "Yes"
             ignoreCount = "0"
             continueAfterRunningActions = "No"
             filePath = "TSMoveables/main.cpp"
             startingColumnNumber = "9223372036854775807"
             endingColumnNumber = "9223372036854775807"
-            startingLineNumber = "36"
-            endingLineNumber = "36"
-            landmarkName = "main()"
+            startingLineNumber = "55"
+            endingLineNumber = "55"
+            landmarkName = "MoveableMutexExample()"
             landmarkType = "9">
+            <Locations>
+               <Location
+                  uuid = "7E0B1E29-FFE5-469D-85F2-E8A3E6664114 - 2efd308431469795"
+                  shouldBeEnabled = "Yes"
+                  ignoreCount = "0"
+                  continueAfterRunningActions = "No"
+                  symbolName = "MoveableMutexExample()"
+                  moduleName = "TSMoveables"
+                  usesParentBreakpointCondition = "Yes"
+                  urlString = "file:///Users/Shared/Development/TSMoveables/TSMoveables/main.cpp"
+                  startingColumnNumber = "9223372036854775807"
+                  endingColumnNumber = "9223372036854775807"
+                  startingLineNumber = "55"
+                  endingLineNumber = "55">
+               </Location>
+               <Location
+                  uuid = "7E0B1E29-FFE5-469D-85F2-E8A3E6664114 - bcfd97e837540e9f"
+                  shouldBeEnabled = "Yes"
+                  ignoreCount = "0"
+                  continueAfterRunningActions = "No"
+                  symbolName = "MoveableMutexExample()::$_1::operator()() const"
+                  moduleName = "TSMoveables"
+                  usesParentBreakpointCondition = "Yes"
+                  urlString = "file:///Users/Shared/Development/TSMoveables/TSMoveables/main.cpp"
+                  startingColumnNumber = "9223372036854775807"
+                  endingColumnNumber = "9223372036854775807"
+                  startingLineNumber = "55"
+                  endingLineNumber = "55">
+               </Location>
+            </Locations>
          </BreakpointContent>
       </BreakpointProxy>
    </Breakpoints>

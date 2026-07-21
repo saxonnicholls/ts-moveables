@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64 GCC
+            os: ubuntu-latest
+            cxx: g++
+            tsan: true
+          - name: Linux x86-64 Clang
+            os: ubuntu-latest
+            cxx: clang++
+            tsan: true
+            asan: true
+          - name: Linux ARM64 GCC
+            os: ubuntu-24.04-arm
+            cxx: g++
+            tsan: true
+          - name: Linux ARM64 Clang
+            os: ubuntu-24.04-arm
+            cxx: clang++
+            tsan: true
+          - name: macOS ARM64 Apple Clang
+            os: macos-latest
+            cxx: c++
+            tsan: true
+          - name: macOS x86-64 Apple Clang
+            os: macos-13
+            cxx: c++
+            tsan: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests (C++17)
+        run: make clean && make test CXX=${{ matrix.cxx }} STD=c++17
+
+      - name: Unit tests (C++20)
+        run: make clean && make test CXX=${{ matrix.cxx }} STD=c++20
+
+      - name: Demo
+        run: make demo CXX=${{ matrix.cxx }} STD=c++20
+
+      - name: ThreadSanitizer
+        if: ${{ matrix.tsan }}
+        run: make tsan CXX=${{ matrix.cxx }} STD=c++20
+
+      - name: Address + UB Sanitizers
+        if: ${{ matrix.asan }}
+        run: make asan CXX=${{ matrix.cxx }} STD=c++20
+
+  msvc:
+    name: Windows x86-64 MSVC
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests (C++17 and C++20)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          cl /nologo /std:c++17 /EHsc /W4 /O2 tests\tests.cpp /Fe:tests17.exe || exit /b 1
+          tests17.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 tests\tests.cpp /Fe:tests20.exe || exit /b 1
+          tests20.exe || exit /b 1

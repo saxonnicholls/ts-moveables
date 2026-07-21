@@ -8,7 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		DF239D972BBF5845007BF438 /* main.cpp in Sources */ = {isa = PBXBuildFile; fileRef = DF239D962BBF5845007BF438 /* main.cpp */; };
-		DF239D9F2BBF5871007BF438 /* moveable_atomic.cpp in Sources */ = {isa = PBXBuildFile; fileRef = DF239D9D2BBF5871007BF438 /* moveable_atomic.cpp */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -26,8 +25,15 @@
 /* Begin PBXFileReference section */
 		DF239D932BBF5845007BF438 /* TSMoveables */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = TSMoveables; sourceTree = BUILT_PRODUCTS_DIR; };
 		DF239D962BBF5845007BF438 /* main.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = main.cpp; sourceTree = "<group>"; };
-		DF239D9D2BBF5871007BF438 /* moveable_atomic.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = moveable_atomic.cpp; sourceTree = "<group>"; };
 		DF239D9E2BBF5871007BF438 /* moveable_atomic.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_atomic.hpp; sourceTree = "<group>"; };
+		DFFDEE442BCF91220068B437 /* moveable_mutex.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_mutex.hpp; sourceTree = "<group>"; };
+		DFA1000129CE00010000AA01 /* moveable_spin_lock.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_spin_lock.hpp; sourceTree = "<group>"; };
+		DFA1000229CE00010000AA02 /* moveable_condition_variable.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_condition_variable.hpp; sourceTree = "<group>"; };
+		DFA1000329CE00010000AA03 /* moveable_once_flag.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_once_flag.hpp; sourceTree = "<group>"; };
+		DFA1000429CE00010000AA04 /* moveable_semaphore.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_semaphore.hpp; sourceTree = "<group>"; };
+		DFA1000529CE00010000AA05 /* moveable_latch.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_latch.hpp; sourceTree = "<group>"; };
+		DFA1000629CE00010000AA06 /* moveable_barrier.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_barrier.hpp; sourceTree = "<group>"; };
+		DFA1000729CE00010000AA07 /* ts_moveables.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = ts_moveables.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -61,8 +67,15 @@
 			isa = PBXGroup;
 			children = (
 				DF239D962BBF5845007BF438 /* main.cpp */,
-				DF239D9D2BBF5871007BF438 /* moveable_atomic.cpp */,
 				DF239D9E2BBF5871007BF438 /* moveable_atomic.hpp */,
+				DFFDEE442BCF91220068B437 /* moveable_mutex.hpp */,
+				DFA1000129CE00010000AA01 /* moveable_spin_lock.hpp */,
+				DFA1000229CE00010000AA02 /* moveable_condition_variable.hpp */,
+				DFA1000329CE00010000AA03 /* moveable_once_flag.hpp */,
+				DFA1000429CE00010000AA04 /* moveable_semaphore.hpp */,
+				DFA1000529CE00010000AA05 /* moveable_latch.hpp */,
+				DFA1000629CE00010000AA06 /* moveable_barrier.hpp */,
+				DFA1000729CE00010000AA07 /* ts_moveables.hpp */,
 			);
 			path = TSMoveables;
 			sourceTree = "<group>";
@@ -125,7 +138,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				DF239D972BBF5845007BF438 /* main.cpp in Sources */,
-				DF239D9F2BBF5871007BF438 /* moveable_atomic.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

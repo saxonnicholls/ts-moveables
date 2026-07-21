@@ -1,0 +1,6 @@
+# Build output from the Makefile
+build/
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
