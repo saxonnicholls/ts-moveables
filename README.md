@@ -66,6 +66,7 @@ Moved-from objects are always left valid and usable.
 | `synchronized_heterogeneous.hpp` | `synchronized_variant<Ts...>`, `synchronized_tuple<Ts...>`, `synchronized_any`, `synchronized_type_map`, `synchronized_bag` | — | locked | locked |
 | `circular_buffer.hpp` | `circular_buffer<T>` / `circular_buffer<T, N>` | `boost::lockfree::spsc_queue` (immovable) | checked | checked, contents transfer |
 | `disruptor.hpp` | `disruptor<T, WaitStrategy>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
+| `moveable_signal.hpp` | `moveable_signal<Args...>` + `connection` / `scoped_connection` | Boost.Signals2 / sigslot | — | connections survive the move |
 | `ts_moveables.hpp` | umbrella header — includes everything | | | |
 
 Two implementation strategies are used:
@@ -182,6 +183,31 @@ d.publish([&](Trade& t) {                journal.run(keep_going, [](Trade& t, st
 ```
 
 The producer claims, mutates in place, and publishes with one release store — no allocation after construction, gated so it can never lap the slowest consumer. A design note on moveability: all shared state lives behind a stable heap core, so the disruptor *handle* moves freely even while producer and consumers are running — consumer references stay valid — at the price of one pointer indirection on the hot path.
+
+## moveable_signal
+
+Thread-safe signal/slot for any object. Everything — connect, disconnect, emit, slot execution — may happen from any thread, and the classic failure modes are designed out:
+
+- **Emission never holds the signal's lock while calling user code.** An emit grabs an immutable snapshot of the slot list (one brief lock, a `shared_ptr` copy) and invokes without it — slots may freely connect, disconnect or re-emit, deadlock-free by construction, and the emit path allocates nothing.
+- **Slots run in connection order** (several popular libraries do not promise this).
+- **Lifetime tracking**: `connect(shared_ptr, &Object::method)` auto-disconnects when the object dies, and holds the object alive for the duration of any call already dispatched to it.
+- **Connections survive moves** — the differentiator none of the incumbents offer: connections bind to the signal's shared internal state, never to the signal object's address, so a signal member moves freely with its owner.
+
+```cpp
+struct Button {
+    snicholls::moveable_signal<int> clicked;    // Button still gets the rule of zero
+};
+
+Button b;
+auto c = b.clicked.connect([](int n) { /* ... */ });
+snicholls::scoped_connection sc(b.clicked.connect(obj, &Handler::on_click));
+
+std::vector<Button> panel;
+panel.push_back(std::move(b));                  // move it anywhere -
+panel[0].clicked(1);                            // every connection still fires
+```
+
+(The name is `moveable_signal` rather than `signal` because POSIX declares a global C function `::signal`, which makes the unqualified short name ambiguous the moment `<csignal>` leaks into a translation unit.)
 
 ## Building and testing
 

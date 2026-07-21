@@ -38,6 +38,7 @@
 		DFA1000929CE00010000AA09 /* synchronized_heterogeneous.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = synchronized_heterogeneous.hpp; sourceTree = "<group>"; };
 		DFA1000A29CE00010000AA0A /* circular_buffer.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = circular_buffer.hpp; sourceTree = "<group>"; };
 		DFA1000B29CE00010000AA0B /* disruptor.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = disruptor.hpp; sourceTree = "<group>"; };
+		DFA1000C29CE00010000AA0C /* moveable_signal.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_signal.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -84,6 +85,7 @@
 				DFA1000929CE00010000AA09 /* synchronized_heterogeneous.hpp */,
 				DFA1000A29CE00010000AA0A /* circular_buffer.hpp */,
 				DFA1000B29CE00010000AA0B /* disruptor.hpp */,
+				DFA1000C29CE00010000AA0C /* moveable_signal.hpp */,
 			);
 			path = TSMoveables;
 			sourceTree = "<group>";

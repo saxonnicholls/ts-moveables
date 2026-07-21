@@ -102,7 +102,7 @@ The single-op ring number swings several-fold run to run with thread placement �
 
 ---
 
-## 4. Thread-safe signal/slot — events without the lifetime bugs
+## 4. Thread-safe signal/slot — events without the lifetime bugs ✅ shipped
 
 **What.** `signal<void(Args...)>` with connect/disconnect/emit callable from any thread, RAII `connection` handles, and the three classic failure modes designed out:
 
@@ -113,6 +113,8 @@ The single-op ring number swings several-fold run to run with thread placement �
 **Prior art, honestly.** Boost.Signals2 is thread-safe but heavyweight and slow on emission (mutex work per emit); libsigc++ is not meaningfully thread-safe; `palacaze/sigslot` is the strongest modern header-only option and deserves study before we write a line — our justification is moveability, integration with these primitives, and a smaller surface, not novelty for its own sake. If study shows sigslot already does everything we want, the right outcome is a recommendation in the README, not a component.
 
 **Effort.** Medium. The snapshot-swap core is small; the lifetime-tracking edge cases are where the tests earn their keep.
+
+**Status: shipped** as `moveable_signal.hpp` (named to dodge POSIX `::signal`, which makes the unqualified short name ambiguous once `<csignal>` leaks in — discovered the hard way on macOS). The prior-art study happened as promised: *nano-signal-slot* does not guarantee emission order and its default thread-safe policy holds locks during emission ("does not mitigate any deadlocks that could occur due to slot emissions fiddling with their signals"); *palacaze/sigslot* is solid on thread safety and weak-ptr tracking but silent on moveability — neither moves a signal with live connections. So the component was justified, and the shipped design delivers the plan: snapshot emission (no lock held while calling user code, no emit-path allocation), guaranteed connection order, `connection`/`scoped_connection` handles valid even after the signal dies, weak-ptr auto-disconnect with the target held alive during dispatched calls, and free moveability via shared internal state. Reentrancy (connect/disconnect/re-emit from inside slots) and cross-thread emission are covered by tests.
 
 ---
 
@@ -131,6 +133,6 @@ Written down so nobody — including us — spends a busy week on them:
 |---|---|---|---|
 | 1 | `synchronized<T>` | Small | **Shipped** |
 | 2 | `circular_buffer` (SPSC) | Medium | **Shipped** — benchmarks pending |
-| 3 | Signal/slot | Medium | After sigslot study; may become a recommendation instead |
+| 3 | Signal/slot | Medium | **Shipped** (study done; the gap was real) |
 | 4 | Disruptor phase 1 | Large | **Shipped** |
 | 5 | Disruptor phase 2 (multi-producer) | Large | Only after phase 1 has miles on it |

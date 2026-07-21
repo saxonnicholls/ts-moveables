@@ -53,7 +53,8 @@ if(TS_MOVEABLES_BUILD_TESTS)
         tests/tests.cpp
         tests/tests_synchronized.cpp
         tests/tests_circular_buffer.cpp
-        tests/tests_disruptor.cpp)
+        tests/tests_disruptor.cpp
+        tests/tests_signal.cpp)
     target_link_libraries(ts_moveables_tests PRIVATE snicholls::ts_moveables)
     add_test(NAME unit_tests COMMAND ts_moveables_tests)
 

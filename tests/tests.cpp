@@ -25,6 +25,7 @@
 void run_synchronized_tests();
 void run_circular_buffer_tests();
 void run_disruptor_tests();
+void run_signal_tests();
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -750,6 +751,7 @@ void test_everything_in_one_object()
         circular_buffer<int>            ring{8};
         circular_buffer<int, 4>         static_ring;
         disruptor<int>                  events{8};
+        moveable_signal<int>            changed;
         moveable_semaphore              semaphore{1};
         moveable_latch                  latch{1};
         moveable_barrier<>              barrier{1};
@@ -811,6 +813,7 @@ int main()
     run_synchronized_tests();
     run_circular_buffer_tests();
     run_disruptor_tests();
+    run_signal_tests();
 
     test_once_flag();
 
