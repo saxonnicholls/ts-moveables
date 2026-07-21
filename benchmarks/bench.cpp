@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <queue>
@@ -39,6 +40,7 @@ constexpr int repeats = 5;
 constexpr std::int64_t total_items = 2'000'000;
 
 volatile std::int64_t sink = 0;             // keeps sums observable - defeats DCE
+bool markdown = false;                      // --markdown: emit a GitHub-flavoured table
 
 template <typename F>
 double best_seconds(F&& f)
@@ -57,7 +59,10 @@ void report(const char* name, double seconds, std::int64_t items)
 {
     const double mops = static_cast<double>(items) / seconds / 1e6;
     const double ns = seconds / static_cast<double>(items) * 1e9;
-    std::printf("  %-42s %9.2f Mops/s  %8.1f ns/op\n", name, mops, ns);
+    if (markdown)
+        std::printf("| `%s` | %.2f Mops/s | %.1f ns |\n", name, mops, ns);
+    else
+        std::printf("  %-42s %9.2f Mops/s  %8.1f ns/op\n", name, mops, ns);
 }
 
 // ------------------------------------------------------------ ring, singles
@@ -286,11 +291,21 @@ void bench_disruptor_batch()
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    std::printf("TSMoveables benchmarks - %lld items per case, best of %d runs\n",
-                static_cast<long long>(total_items), repeats);
-    std::printf("SPSC: one producer thread, one consumer thread\n\n");
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--markdown") == 0)
+            markdown = true;
+
+    if (markdown) {
+        std::printf("### `make bench` - SPSC, %lldM items, 1 producer + 1 consumer thread, best of %d\n\n",
+                    static_cast<long long>(total_items / 1'000'000), repeats);
+        std::printf("| Case | Throughput | Per op |\n|---|---|---|\n");
+    } else {
+        std::printf("TSMoveables benchmarks - %lld items per case, best of %d runs\n",
+                    static_cast<long long>(total_items), repeats);
+        std::printf("SPSC: one producer thread, one consumer thread\n\n");
+    }
 
     bench_ring_singles();
     bench_ring_static_singles();
@@ -301,6 +316,7 @@ int main()
     bench_spin_queue();
     bench_synchronized_queue();
 
-    std::printf("\n(sink=%lld)\n", static_cast<long long>(sink));
+    if (!markdown)
+        std::printf("\n(sink=%lld)\n", static_cast<long long>(sink));
     return 0;
 }

@@ -271,7 +271,7 @@ To check your own code that composes these types, the same single flag applies: 
 
 ## Throughput
 
-Measured on the reference machine — a 2014 Intel iMac, Apple Clang, `-O3` — via `make bench` and `make demo-signals`. Treat them as *relative* guidance and rerun on your own hardware; CI runs both harnesses on every push (informational: logged in the job output, never a pass/fail gate). Single-op SPSC numbers swing severalfold with thread placement (sibling hyperthreads share cache; separate cores bounce it) — the batched numbers are stable precisely because batching amortises that traffic.
+Measured on the reference machine — a 2014 Intel iMac, Apple Clang, `-O3` — via `make bench` and `make demo-signals`. Treat them as *relative* guidance and rerun on your own hardware. CI runs both harnesses on every push and publishes these same tables to each run's **Summary page**, per platform (informational — never a pass/fail gate; both harnesses accept `--markdown`). Single-op SPSC numbers swing severalfold with thread placement (sibling hyperthreads share cache; separate cores bounce it) — the batched numbers are stable precisely because batching amortises that traffic.
 
 `make bench` — SPSC, 2M items, one producer and one consumer thread, best of 5:
 

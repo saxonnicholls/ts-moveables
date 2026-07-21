@@ -52,7 +52,15 @@ jobs:
         run: make demo CXX=${{ matrix.cxx }} STD=c++20
 
       - name: Throughput (informational)
-        run: make bench CXX=${{ matrix.cxx }} && make demo-signals CXX=${{ matrix.cxx }}
+        run: |
+          make build/bench build/signal_slot_demo CXX=${{ matrix.cxx }}
+          {
+            echo "## Throughput - ${{ matrix.name }}"
+            echo ""
+            ./build/bench --markdown
+            echo ""
+            ./build/signal_slot_demo --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: ThreadSanitizer
         if: ${{ matrix.tsan }}
@@ -84,12 +92,19 @@ jobs:
       - name: Throughput (informational)
         shell: bash
         run: |
-          for exe in ts_moveables_bench ts_moveables_signal_slot_demo; do
-            if [ -x "build-cmake/Release/$exe.exe" ]; then "build-cmake/Release/$exe.exe"
-            elif [ -x "build-cmake/Release/$exe" ]; then "build-cmake/Release/$exe"
-            else "build-cmake/$exe"
+          run_exe() {
+            if [ -x "build-cmake/Release/$1.exe" ]; then "build-cmake/Release/$1.exe" --markdown
+            elif [ -x "build-cmake/Release/$1" ]; then "build-cmake/Release/$1" --markdown
+            else "build-cmake/$1" --markdown
             fi
-          done
+          }
+          {
+            echo "## Throughput - CMake ${{ matrix.os }}"
+            echo ""
+            run_exe ts_moveables_bench
+            echo ""
+            run_exe ts_moveables_signal_slot_demo
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   msvc:
     name: Windows x86-64 MSVC

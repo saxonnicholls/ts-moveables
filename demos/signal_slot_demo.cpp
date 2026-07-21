@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -168,6 +169,7 @@ namespace {
 
 long long grand_total_events = 0;
 double grand_total_seconds = 0;
+bool markdown = false;              // --markdown: emit a GitHub-flavoured table
 
 double seconds_since(std::chrono::steady_clock::time_point t0)
 {
@@ -178,17 +180,23 @@ void report(const char* name, long long events, double s)
 {
     grand_total_events += events;
     grand_total_seconds += s;
-    std::printf("  %-46s %10.1f M events/s  %7.1f ns/event\n",
-                name, static_cast<double>(events) / s / 1e6,
-                s / static_cast<double>(events) * 1e9);
+    const double mps = static_cast<double>(events) / s / 1e6;
+    if (markdown)
+        std::printf("| `%s` | %.1f M events/s | |\n", name, mps);
+    else
+        std::printf("  %-46s %10.1f M events/s  %7.1f ns/event\n",
+                    name, mps, s / static_cast<double>(events) * 1e9);
 }
 
 void report_gb(const char* name, long long deliveries, double gigabytes, double s)
 {
     grand_total_events += deliveries;
     grand_total_seconds += s;
-    std::printf("  %-46s %10.1f M events/s  %7.2f GB/s\n",
-                name, static_cast<double>(deliveries) / s / 1e6, gigabytes / s);
+    const double mps = static_cast<double>(deliveries) / s / 1e6;
+    if (markdown)
+        std::printf("| `%s` | %.1f M events/s | %.2f GB/s |\n", name, mps, gigabytes / s);
+    else
+        std::printf("  %-46s %10.1f M events/s  %7.2f GB/s\n", name, mps, gigabytes / s);
 }
 
 volatile std::uint64_t checksum_sink = 0;   // keeps the payload scans observable
@@ -197,12 +205,24 @@ volatile std::uint64_t checksum_sink = 0;   // keeps the payload scans observabl
 
 int main(int argc, char** argv)
 {
-    const long long scale = (argc > 1) ? std::atoll(argv[1]) : 1;
+    long long scale = 1;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--markdown") == 0)
+            markdown = true;
+        else
+            scale = std::atoll(argv[i]);
+    }
     const long long N = 5'000'000 * (scale > 0 ? scale : 1);
 
-    std::printf("moveable_signal demo - typed publish/subscribe at speed\n");
-    std::printf("%lld emissions per scenario (pass a multiplier to scale up)\n\n",
-                static_cast<long long>(N));
+    if (markdown) {
+        std::printf("### `make demo-signals` - typed signal/slot pub/sub, %lldM emissions per scenario\n\n",
+                    static_cast<long long>(N / 1'000'000));
+        std::printf("| Scenario | Rate | Bandwidth |\n|---|---|---|\n");
+    } else {
+        std::printf("moveable_signal demo - typed publish/subscribe at speed\n");
+        std::printf("%lld emissions per scenario (pass a multiplier to scale up)\n\n",
+                    static_cast<long long>(N));
+    }
 
     // ------------------------------------------------ 1. direct dispatch
     {
@@ -391,12 +411,21 @@ int main(int argc, char** argv)
 
         if (counter.count != 2 || !counter.subscribed())
             return 1;
-        std::printf("  %-46s %s\n", "emitter moved into a vector (twice)",
-                    "connections survived - counts intact");
+        if (markdown)
+            std::printf("| `emitter moved into a vector (twice)` | connections survived - counts intact | |\n");
+        else
+            std::printf("  %-46s %s\n", "emitter moved into a vector (twice)",
+                        "connections survived - counts intact");
     }
 
     // ------------------------------------------------ the punchline
     const double sustained = static_cast<double>(grand_total_events) / grand_total_seconds;
+    if (markdown) {
+        std::printf("\nSustained %.1fM deliveries/s (%.1f billion events/hour) in constant memory; "
+                    "GB/s is bytes checksummed by consumers, payloads zero-copy by `const&`.\n",
+                    sustained / 1e6, sustained * 3600.0 / 1e9);
+        return 0;
+    }
     std::printf("\n  delivered %.0fM events in %.2fs - sustained %.1fM events/s\n",
                 static_cast<double>(grand_total_events) / 1e6, grand_total_seconds,
                 sustained / 1e6);
