@@ -3,9 +3,16 @@ Thread Safe Moveable Objects
 
 [![CI](https://github.com/saxonnicholls/ts-moveables/actions/workflows/ci.yml/badge.svg)](https://github.com/saxonnicholls/ts-moveables/actions/workflows/ci.yml)
 
-We often need to move, so called "immovable" objects in C++ such as atomics, mutexes and condition variables. This code provides portable mechanisms to do this. It is simple and proven: header-only, C++17 and later, no dependencies, tested with plain `cassert` unit tests.
+We often need to move, so called "immovable" objects in C++ such as atomics, mutexes and condition variables. This library provides portable mechanisms to do this — and the same discipline, applied consistently, has grown into a small header-only concurrency toolkit:
 
-Of course these types are not *truly* moveable — the point is to **keep the integrity of the state** across a move so that ordinary objects composed from them can be written safely, with compiler-generated move (and where sensible, copy) operations.
+- **[the moveable primitives](#the-types)** — atomic, the full mutex family, spin lock, condition variable, once flag, semaphore, latch, barrier: every "immovable" synchronisation type, moveable with its state integrity intact
+- **[`synchronized<T>`](#synchronizedt)** — a value bonded to its mutex, reachable only under the lock, plus ready-made thread-safe heterogeneous containers (variant / tuple / any / type map / bag)
+- **[`circular_buffer`](#circular_buffer)** — a wait-free SPSC ring with two honest cache-line-separated atomics; ~2 ns/op batched
+- **[`disruptor`](#disruptor)** — the LMAX pattern: pre-allocated events, consumer dependency graphs, batch consumption; ~1 ns/event batched
+- **[`moveable_signal`](#moveable_signal)** — thread-safe signal/slot whose connections survive moves, with no lock held while slots run
+- **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs
+
+One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rule: every type keeps the **integrity of its state** across a move — a move happens on a quiescent object or fails loudly — which hands classes composed from these types the [rule of zero](https://en.cppreference.com/cpp/language/rule_of_three) back: write no special member functions, and the compiler generates correct moves. The overhead: composition wrappers are the same size as what they wrap (the tests `static_assert` it), the safety checks are a `try_lock` probe or a relaxed flag, and everything is header-only, C++17 and later, dependency-free, `cassert`-tested, and ThreadSanitizer-verified across the CI matrix.
 
 ## Why this library?
 
