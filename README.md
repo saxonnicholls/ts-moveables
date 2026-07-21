@@ -269,6 +269,36 @@ Four practical notes:
 
 To check your own code that composes these types, the same single flag applies: `-fsanitize=thread` with Clang or GCC, or enable "Thread Sanitizer" in your Xcode scheme's diagnostics.
 
+## Throughput
+
+Measured on the reference machine — a 2014 Intel iMac, Apple Clang, `-O3` — via `make bench` and `make demo-signals`. Treat them as *relative* guidance and rerun on your own hardware; CI runs both harnesses on every push (informational: logged in the job output, never a pass/fail gate). Single-op SPSC numbers swing severalfold with thread placement (sibling hyperthreads share cache; separate cores bounce it) — the batched numbers are stable precisely because batching amortises that traffic.
+
+`make bench` — SPSC, 2M items, one producer and one consumer thread, best of 5:
+
+| Case | Throughput | Per op |
+|---|---|---|
+| `circular_buffer` singles | 30–260 Mops/s (placement-sensitive) | 4–33 ns |
+| `circular_buffer` batched (64) | ~420–480 Mops/s | ~2.3 ns |
+| `disruptor` publish/poll | ~25–29 Mops/s | ~38 ns |
+| **`disruptor` publish_n/poll (64)** | **~860 Mops/s** | **~1.2 ns** |
+| `std::mutex` + `std::queue` | ~9 Mops/s | ~110 ns |
+| `moveable_spin_lock` + `std::queue` | ~14 Mops/s | ~70 ns |
+| `synchronized_waitable<std::queue>` (cv) | ~6 Mops/s | ~160 ns |
+
+`make demo-signals` — the typed signal/slot architecture, 5M emissions per scenario:
+
+| Scenario | Rate | Bandwidth |
+|---|---|---|
+| 1 emitter → 1 observer | ~32 M events/s | |
+| 1 emitter → 8 observers | ~163 M deliveries/s | |
+| multi-type plant (Tick/Trade/Heartbeat) | ~41 M deliveries/s | |
+| 4 threads emitting into 1 observer | ~9 M events/s | |
+| many-to-many mesh 4×4 | ~12 M deliveries/s | |
+| 4 KiB frames → 1 observer, checksummed | ~12 M frames/s | ~48 GB/s |
+| many-to-many mesh 4×4, 4 KiB frames | ~15 M deliveries/s | ~64 GB/s |
+
+Sustained across the whole signal demo: ~27M deliveries/s — on the order of **95 billion events per hour** — in constant memory. The GB/s figures are bytes actually checksummed by consumers; payloads move zero-copy by `const&`, which is why delivery bandwidth can exceed DRAM bandwidth. The batched disruptor headline is the LMAX thesis in one row: amortise the coordination and the cost per event approaches a nanosecond.
+
 ## Where this is going
 
 The roadmap — `synchronized<T>`, a moveable SPSC circular buffer with honest atomics, a disruptor, and a thread-safe signal/slot — lives in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md), along with the non-goals and the reasoning behind both.

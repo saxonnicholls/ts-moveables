@@ -51,6 +51,9 @@ jobs:
       - name: Demo
         run: make demo CXX=${{ matrix.cxx }} STD=c++20
 
+      - name: Throughput (informational)
+        run: make bench CXX=${{ matrix.cxx }} && make demo-signals CXX=${{ matrix.cxx }}
+
       - name: ThreadSanitizer
         if: ${{ matrix.tsan }}
         run: make tsan CXX=${{ matrix.cxx }} STD=c++20
@@ -77,6 +80,16 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build-cmake -C Release --output-on-failure
+
+      - name: Throughput (informational)
+        shell: bash
+        run: |
+          for exe in ts_moveables_bench ts_moveables_signal_slot_demo; do
+            if [ -x "build-cmake/Release/$exe.exe" ]; then "build-cmake/Release/$exe.exe"
+            elif [ -x "build-cmake/Release/$exe" ]; then "build-cmake/Release/$exe"
+            else "build-cmake/$exe"
+            fi
+          done
 
   msvc:
     name: Windows x86-64 MSVC

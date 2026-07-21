@@ -261,6 +261,29 @@ void bench_disruptor()
     report("disruptor<T>  publish/poll", s, total_items);
 }
 
+void bench_disruptor_batch()
+{
+    // static: not captured by the lambdas (MSVC C3493) yet still a constant
+    // expression inside them (MSVC C2131)
+    static constexpr std::size_t batch = 64;
+    const double s = best_seconds([] {
+        disruptor<std::int64_t> d{1024};
+        auto& consumer = d.add_consumer();
+        std::thread producer([&] {
+            for (std::int64_t i = 0; i < total_items; i += static_cast<std::int64_t>(batch))
+                d.publish_n(batch, [](std::int64_t& e, std::int64_t seq) { e = seq; });
+        });
+        std::int64_t sum = 0;
+        std::int64_t received = 0;
+        while (received < total_items)
+            received += static_cast<std::int64_t>(
+                consumer.poll([&](std::int64_t& e, std::int64_t, bool) { sum += e; }));
+        producer.join();
+        sink = sum;
+    });
+    report("disruptor<T>  publish_n/poll (64)", s, total_items);
+}
+
 } // namespace
 
 int main()
@@ -273,6 +296,7 @@ int main()
     bench_ring_static_singles();
     bench_ring_batch();
     bench_disruptor();
+    bench_disruptor_batch();
     bench_mutex_queue();
     bench_spin_queue();
     bench_synchronized_queue();
