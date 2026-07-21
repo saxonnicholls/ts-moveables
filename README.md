@@ -209,6 +209,8 @@ panel[0].clicked(1);                            // every connection still fires
 
 (The name is `moveable_signal` rather than `signal` because POSIX declares a global C function `::signal`, which makes the unqualified short name ambiguous the moment `<csignal>` leaks into a translation unit.)
 
+A comprehensive demo lives in [demos/signal_slot_demo.cpp](demos/signal_slot_demo.cpp) (`make demo-signals`): a typed emitter/observer architecture — per-type emitters, virtual observers with RAII subscriptions, multi-type emitters and observers wired with fold expressions — measured through fan-out, multi-type, cross-thread, and many-to-many 4×4 mesh scenarios, in both messages per second and checksummed GB/s.
+
 ## Building and testing
 
 The library is header-only — just add the headers to your include path.

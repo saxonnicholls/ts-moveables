@@ -64,6 +64,10 @@ if(TS_MOVEABLES_BUILD_TESTS)
     add_executable(ts_moveables_bench benchmarks/bench.cpp)
     target_link_libraries(ts_moveables_bench PRIVATE snicholls::ts_moveables)
     target_compile_definitions(ts_moveables_bench PRIVATE NDEBUG)
+
+    add_executable(ts_moveables_signal_slot_demo demos/signal_slot_demo.cpp)
+    target_link_libraries(ts_moveables_signal_slot_demo PRIVATE snicholls::ts_moveables)
+    target_compile_definitions(ts_moveables_signal_slot_demo PRIVATE NDEBUG)
 endif()
 
 # Install and export

@@ -45,6 +45,9 @@ build/demo: TSMoveables/main.cpp $(HEADERS) | build
 build/bench: benchmarks/bench.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread benchmarks/bench.cpp -o $@ $(LDLIBS)
 
+build/signal_slot_demo: demos/signal_slot_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/signal_slot_demo.cpp -o $@ $(LDLIBS)
+
 test: build/tests
 	./build/tests
 
@@ -60,7 +63,10 @@ demo: build/demo
 bench: build/bench
 	./build/bench
 
+demo-signals: build/signal_slot_demo
+	./build/signal_slot_demo
+
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo bench clean
+.PHONY: all test tsan asan demo bench demo-signals clean
