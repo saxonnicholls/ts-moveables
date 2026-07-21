@@ -112,8 +112,10 @@ void bench_ring_static_singles()
 
 void bench_ring_batch()
 {
-    constexpr std::size_t batch = 64;
-    const double s = best_seconds([&] {
+    // static: not captured by the lambdas (MSVC C3493) yet still a constant
+    // expression inside them (MSVC C2131)
+    static constexpr std::size_t batch = 64;
+    const double s = best_seconds([] {
         circular_buffer<std::int64_t> ring{1024};
         std::thread producer([&] {
             std::int64_t chunk[batch];
@@ -213,8 +215,8 @@ void bench_synchronized_queue()
 {
     // Deliberately the convenient, blocking style - this is what the ring is
     // faster than, and what you should still use when convenience wins
-    constexpr std::int64_t items = total_items / 10;    // cv wakeups are slow; keep the run short
-    const double s = best_seconds([&] {
+    static constexpr std::int64_t items = total_items / 10;    // cv wakeups are slow; keep the run short
+    const double s = best_seconds([] {
         synchronized_waitable<std::queue<std::int64_t>> q;
         std::thread producer([&] {
             for (std::int64_t i = 0; i < items; ++i)
