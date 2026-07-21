@@ -62,6 +62,10 @@ Moved-from objects are always left valid and usable.
 | `moveable_semaphore.hpp` | `moveable_semaphore` | `std::counting_semaphore` | — | count transfers |
 | `moveable_latch.hpp` | `moveable_latch` | `std::latch` | — | count transfers |
 | `moveable_barrier.hpp` | `moveable_barrier<Completion>` | `std::barrier` | — | config + phase transfer |
+| `synchronized.hpp` | `synchronized<T, M>` / `synchronized_waitable<T, M>` | `folly::Synchronized` / P0290 | locked | locked / checked |
+| `synchronized_heterogeneous.hpp` | `synchronized_variant<Ts...>`, `synchronized_tuple<Ts...>`, `synchronized_any`, `synchronized_type_map`, `synchronized_bag` | — | locked | locked |
+| `circular_buffer.hpp` | `circular_buffer<T>` / `circular_buffer<T, N>` | `boost::lockfree::spsc_queue` (immovable) | checked | checked, contents transfer |
+| `disruptor.hpp` | `disruptor<T, WaitStrategy>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
 | `ts_moveables.hpp` | umbrella header — includes everything | | | |
 
 Two implementation strategies are used:
@@ -110,6 +114,75 @@ snicholls::moveable_mutex<> m;
 auto stolen = std::move(m);     // throws std::runtime_error
 ```
 
+## synchronized&lt;T&gt;
+
+Built on the primitives: a value bonded to its mutex, where the *only* way to reach the value is a closure that runs with the lock held. Closures that try to return a reference are rejected at compile time — the lock cannot be escaped.
+
+```cpp
+snicholls::synchronized<std::vector<int>> items;
+
+items.with_lock([](auto& v) { v.push_back(42); });
+auto n = items.with_lock([](const auto& v) { return v.size(); });
+```
+
+`M` may be any BasicLockable: `std::shared_mutex` enables `with_read_lock`, `std::recursive_mutex` allows nesting, `moveable_spin_lock` suits very short sections. Copy and move take the source's lock, and the mutex itself never moves — so `synchronized` needs no quiescent contract at all; its copy and move are themselves thread-safe with respect to the source. `synchronized_waitable<T>` adds the producer/consumer vocabulary — `update()` (mutate then wake all waiters), `wait(pred)`, `wait_then(pred, consume)` — with waiter tracking, so moving while threads are blocked throws, exactly like the raw condition variable.
+
+It is also the answer to "a thread-safe heterogeneous container": compose it with the standard heterogeneous types rather than inventing a new container. `synchronized_heterogeneous.hpp` ships the compositions ready made, each with the typed conveniences that make it pleasant:
+
+```cpp
+snicholls::synchronized_variant<Idle, Running, Done> state;     // closed set
+state = Running{};
+state.visit([](const auto& s) { /* runs under the lock */ });
+
+snicholls::synchronized_tuple<Config, Stats> bundle;            // fixed bundle
+bundle.set<Config>(Config{5});
+auto stats = bundle.get<Stats>();
+
+snicholls::synchronized_type_map ctx;                           // one value per type
+ctx.put(Config{3});
+ctx.with<Config>([](Config& c) { ++c.retries; });               // race-free read-modify-write
+
+snicholls::synchronized_bag bag;                                // open, ordered bag
+bag.push(42);
+bag.push(std::string("x"));
+auto ints = bag.extract<int>();
+```
+
+(plus `synchronized_any` for a single value of unknown type). Value-returning reads (`try_get`, `holds`, `count`) are snapshots; the closure forms (`visit`, `apply`, `with`, `for_each`) are the race-free read-modify-write paths. Everything is built on `synchronized<T>`, so the whole structure still moves.
+
+## circular_buffer
+
+A single-producer / single-consumer ring whose entire concurrent state is two indices you can point at — `tail` (producer) and `head` (consumer), each an atomic on its own cache line, each side keeping a private cached copy of the other's index so the common push/pop touches no shared cache line at all. Capacity is a power of two; indices increase monotonically and wrap by mask, so full and empty are distinguished by the difference and no slot is wasted. Every memory-ordering choice is commented in the header with the reason it is what it is.
+
+```cpp
+snicholls::circular_buffer<Message> ring{1024};     // runtime capacity, one allocation ever
+snicholls::circular_buffer<Message, 1024> fixed;    // compile-time capacity, zero allocation
+
+// producer thread                     // consumer thread
+ring.try_push(msg);                    auto m = ring.try_pop();          // optional<Message>
+ring.push_n(first, n);                 ring.pop_n(out_iterator, max);    // batched - amortises the atomic traffic
+```
+
+`try_push`/`try_pop` are wait-free. `size()`/`empty()`/`full()` are safe from any thread, as snapshots. Moves transfer the queued elements in order and leave the source empty but fully usable, capacity intact; copies are snapshots. The quiescent check here is honest best-effort — a lock-free ring has no lock to probe, so each side raises a flag (two relaxed stores to a cache line it already owns, effectively free) and move/copy throws `std::runtime_error` if a push or pop is literally in flight.
+
+## disruptor
+
+Phase 1 of the [LMAX Disruptor](https://lmax-exchange.github.io/disruptor/) pattern: a pre-allocated ring of events, sequence counters instead of queue locks, consumers that see contiguous batches, and explicit dependency graphs. Single producer; each consumer is pumped by one thread via `poll()` or `run()`. Wait strategies (busy-spin / yielding / blocking) plug in per disruptor.
+
+```cpp
+snicholls::disruptor<Trade> d{4096};
+auto& journal = d.add_consumer();               // parallel stage
+auto& enrich  = d.add_consumer();               // parallel stage
+auto& publish = d.add_consumer({&journal, &enrich});  // sees events only after both
+
+// producer thread                       // consumer threads
+d.publish([&](Trade& t) {                journal.run(keep_going, [](Trade& t, std::int64_t seq, bool end_of_batch) {
+    t = incoming;                            // handlers get batches, in order
+});                                      });
+```
+
+The producer claims, mutates in place, and publishes with one release store — no allocation after construction, gated so it can never lap the slowest consumer. A design note on moveability: all shared state lives behind a stable heap core, so the disruptor *handle* moves freely even while producer and consumers are running — consumer references stay valid — at the price of one pointer indirection on the hot path.
+
 ## Building and testing
 
 The library is header-only — just add the headers to your include path.
@@ -121,6 +194,7 @@ make test    # build and run the unit tests
 make tsan    # the same tests under ThreadSanitizer
 make asan    # the same tests under Address + UB Sanitizers
 make demo    # build and run the demo (same code as the Xcode target)
+make bench   # dependency-free throughput benchmarks (ring vs mutex/spin/cv baselines)
 
 make test STD=c++17   # any target can be built against a different standard
 ```
@@ -166,6 +240,10 @@ Four practical notes:
 - If `make tsan` dies immediately with an illegal instruction before printing anything, the toolchain's TSan runtime is broken, not the tests — we have seen this on some Xcode/Intel macOS combinations. The CI matrix is the reliable reference.
 
 To check your own code that composes these types, the same single flag applies: `-fsanitize=thread` with Clang or GCC, or enable "Thread Sanitizer" in your Xcode scheme's diagnostics.
+
+## Where this is going
+
+The roadmap — `synchronized<T>`, a moveable SPSC circular buffer with honest atomics, a disruptor, and a thread-safe signal/slot — lives in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md), along with the non-goals and the reasoning behind both.
 
 ## Caveats
 

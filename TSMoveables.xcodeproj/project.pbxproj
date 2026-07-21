@@ -34,6 +34,10 @@
 		DFA1000529CE00010000AA05 /* moveable_latch.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_latch.hpp; sourceTree = "<group>"; };
 		DFA1000629CE00010000AA06 /* moveable_barrier.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_barrier.hpp; sourceTree = "<group>"; };
 		DFA1000729CE00010000AA07 /* ts_moveables.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = ts_moveables.hpp; sourceTree = "<group>"; };
+		DFA1000829CE00010000AA08 /* synchronized.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = synchronized.hpp; sourceTree = "<group>"; };
+		DFA1000929CE00010000AA09 /* synchronized_heterogeneous.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = synchronized_heterogeneous.hpp; sourceTree = "<group>"; };
+		DFA1000A29CE00010000AA0A /* circular_buffer.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = circular_buffer.hpp; sourceTree = "<group>"; };
+		DFA1000B29CE00010000AA0B /* disruptor.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = disruptor.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -76,6 +80,10 @@
 				DFA1000529CE00010000AA05 /* moveable_latch.hpp */,
 				DFA1000629CE00010000AA06 /* moveable_barrier.hpp */,
 				DFA1000729CE00010000AA07 /* ts_moveables.hpp */,
+				DFA1000829CE00010000AA08 /* synchronized.hpp */,
+				DFA1000929CE00010000AA09 /* synchronized_heterogeneous.hpp */,
+				DFA1000A29CE00010000AA0A /* circular_buffer.hpp */,
+				DFA1000B29CE00010000AA0B /* disruptor.hpp */,
 			);
 			path = TSMoveables;
 			sourceTree = "<group>";

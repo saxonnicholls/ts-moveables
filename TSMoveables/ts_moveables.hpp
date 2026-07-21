@@ -20,5 +20,9 @@
 #include "moveable_semaphore.hpp"           // IWYU pragma: export
 #include "moveable_latch.hpp"               // IWYU pragma: export
 #include "moveable_barrier.hpp"             // IWYU pragma: export
+#include "circular_buffer.hpp"              // IWYU pragma: export
+#include "disruptor.hpp"                    // IWYU pragma: export
+#include "synchronized.hpp"                 // IWYU pragma: export
+#include "synchronized_heterogeneous.hpp"   // IWYU pragma: export
 
 #endif /* ts_moveables_hpp */

@@ -4,25 +4,27 @@
 //
 //  Copyright 2026 Saxon Herschel Nicholls
 //
-//  Thread Safe Moveables - unit tests
+//  Thread Safe Moveables - unit tests for the moveable primitives, plus main
 //
 //  Deliberately lightweight: cassert only, no test framework.
 //  Build and run with `make test` from the repository root.
 //
 
-#undef NDEBUG
-#include <cassert>
+#include "test_helpers.hpp"
 
 #include <chrono>
-#include <iostream>
 #include <shared_mutex>
-#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "../TSMoveables/ts_moveables.hpp"
+
+// Defined in the per-area test translation units
+void run_synchronized_tests();
+void run_circular_buffer_tests();
+void run_disruptor_tests();
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -39,33 +41,6 @@ using deadline_clock = std::chrono::steady_clock;
 #endif
 
 namespace {
-
-int tests_run = 0;
-
-void pass(const char* name)
-{
-    ++tests_run;
-    std::cout << "PASS  " << name << "\n";
-}
-
-// Spin until a condition is true - avoids sleep-based flakiness
-template <typename Pred>
-void spin_until(Pred pred)
-{
-    while (!pred())
-        std::this_thread::yield();
-}
-
-template <typename F>
-bool throws_runtime_error(F&& f)
-{
-    try {
-        f();
-    } catch (const std::runtime_error&) {
-        return true;
-    }
-    return false;
-}
 
 // ---------------------------------------------------------- zero overhead ---
 
@@ -770,6 +745,11 @@ void test_everything_in_one_object()
         moveable_condition_variable<>   cv;
         moveable_condition_variable_any cv_any;
         moveable_once_flag              once;
+        synchronized<int>               sync{0};
+        synchronized_waitable<int>      sync_waitable{0};
+        circular_buffer<int>            ring{8};
+        circular_buffer<int, 4>         static_ring;
+        disruptor<int>                  events{8};
         moveable_semaphore              semaphore{1};
         moveable_latch                  latch{1};
         moveable_barrier<>              barrier{1};
@@ -827,6 +807,10 @@ int main()
 
     test_condition_variable();
     test_condition_variable_any();
+
+    run_synchronized_tests();
+    run_circular_buffer_tests();
+    run_disruptor_tests();
 
     test_once_flag();
 

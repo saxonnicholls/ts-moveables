@@ -88,7 +88,7 @@ jobs:
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
-          cl /nologo /std:c++17 /EHsc /W4 /O2 tests\tests.cpp /Fe:tests17.exe || exit /b 1
+          cl /nologo /std:c++17 /EHsc /W4 /O2 tests\*.cpp /Fe:tests17.exe || exit /b 1
           tests17.exe || exit /b 1
-          cl /nologo /std:c++20 /EHsc /W4 /O2 tests\tests.cpp /Fe:tests20.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 tests\*.cpp /Fe:tests20.exe || exit /b 1
           tests20.exe || exit /b 1

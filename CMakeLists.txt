@@ -49,12 +49,20 @@ option(TS_MOVEABLES_BUILD_TESTS "Build the ts-moveables unit tests and demo" ${T
 if(TS_MOVEABLES_BUILD_TESTS)
     enable_testing()
 
-    add_executable(ts_moveables_tests tests/tests.cpp)
+    add_executable(ts_moveables_tests
+        tests/tests.cpp
+        tests/tests_synchronized.cpp
+        tests/tests_circular_buffer.cpp
+        tests/tests_disruptor.cpp)
     target_link_libraries(ts_moveables_tests PRIVATE snicholls::ts_moveables)
     add_test(NAME unit_tests COMMAND ts_moveables_tests)
 
     add_executable(ts_moveables_demo TSMoveables/main.cpp)
     target_link_libraries(ts_moveables_demo PRIVATE snicholls::ts_moveables)
+
+    add_executable(ts_moveables_bench benchmarks/bench.cpp)
+    target_link_libraries(ts_moveables_bench PRIVATE snicholls::ts_moveables)
+    target_compile_definitions(ts_moveables_bench PRIVATE NDEBUG)
 endif()
 
 # Install and export

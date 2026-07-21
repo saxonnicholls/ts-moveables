@@ -22,24 +22,28 @@ ifeq ($(UNAME_S),Linux)
   LDLIBS += -latomic
 endif
 
-HEADERS  := $(wildcard TSMoveables/*.hpp)
+HEADERS  := $(wildcard TSMoveables/*.hpp) $(wildcard tests/*.hpp)
+TEST_SRC := $(wildcard tests/*.cpp)
 
 all: build/tests build/demo
 
 build:
 	mkdir -p build
 
-build/tests: tests/tests.cpp $(HEADERS) | build
-	$(CXX) $(CXXFLAGS) -pthread tests/tests.cpp -o $@ $(LDLIBS)
+build/tests: $(TEST_SRC) $(HEADERS) | build
+	$(CXX) $(CXXFLAGS) -pthread $(TEST_SRC) -o $@ $(LDLIBS)
 
-build/tests_tsan: tests/tests.cpp $(HEADERS) | build
-	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread tests/tests.cpp -o $@ $(LDLIBS)
+build/tests_tsan: $(TEST_SRC) $(HEADERS) | build
+	$(CXX) $(CXXFLAGS) -pthread -fsanitize=thread $(TEST_SRC) -o $@ $(LDLIBS)
 
-build/tests_asan: tests/tests.cpp $(HEADERS) | build
-	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined tests/tests.cpp -o $@ $(LDLIBS)
+build/tests_asan: $(TEST_SRC) $(HEADERS) | build
+	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined $(TEST_SRC) -o $@ $(LDLIBS)
 
 build/demo: TSMoveables/main.cpp $(HEADERS) | build
 	$(CXX) $(CXXFLAGS) -pthread TSMoveables/main.cpp -o $@ $(LDLIBS)
+
+build/bench: benchmarks/bench.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread benchmarks/bench.cpp -o $@ $(LDLIBS)
 
 test: build/tests
 	./build/tests
@@ -53,7 +57,10 @@ asan: build/tests_asan
 demo: build/demo
 	./build/demo
 
+bench: build/bench
+	./build/bench
+
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo clean
+.PHONY: all test tsan asan demo bench clean
