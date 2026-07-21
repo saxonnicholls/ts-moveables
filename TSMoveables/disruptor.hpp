@@ -86,7 +86,7 @@ namespace snicholls
             std::unique_lock<std::mutex> lock(m);
             cv.wait_for(lock, std::chrono::milliseconds(1), ready);
         }
-        void signal() {
+        void signal() noexcept {
             cv.notify_all();
         }
     };
@@ -149,7 +149,7 @@ namespace snicholls
         public:
             // Constructed by add_consumer - core is private, so only the
             // disruptor can supply these arguments
-            consumer(core* c, std::vector<const detail::sequence*> barrier)
+            consumer(core* c, std::vector<const detail::sequence*> barrier) noexcept
                 : c_(c), barrier_(std::move(barrier)) {}
 
             consumer(const consumer&) = delete;

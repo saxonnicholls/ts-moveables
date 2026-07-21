@@ -32,10 +32,14 @@ namespace snicholls
         using atomic_type = std::atomic<T>;
         using value_type = T;
 
+        static constexpr bool is_always_lock_free = atomic_type::is_always_lock_free;
+
         atomic_type a;                          // a for atomic
 
         moveable_atomic() noexcept : a() {}
-        moveable_atomic(T t) noexcept : a(t) {}
+        // constexpr, like std::atomic's own value constructor: statics of this
+        // type are constant-initialized, never dynamically initialized
+        constexpr moveable_atomic(T t) noexcept : a(t) {}
         explicit moveable_atomic(const std::atomic<T>& other) noexcept : a(other.load()) {}
 
         moveable_atomic(const moveable_atomic& cpy) noexcept : a(cpy.a.load()) {}
@@ -124,7 +128,7 @@ namespace snicholls
         std::atomic<bool> a{false};
 
         moveable_atomic_flag() noexcept = default;
-        explicit moveable_atomic_flag(bool set) noexcept : a(set) {}
+        explicit constexpr moveable_atomic_flag(bool set) noexcept : a(set) {}
 
         moveable_atomic_flag(const moveable_atomic_flag& cpy) noexcept : a(cpy.a.load()) {}
         moveable_atomic_flag(moveable_atomic_flag&& mve) noexcept : a(mve.a.load()) {}

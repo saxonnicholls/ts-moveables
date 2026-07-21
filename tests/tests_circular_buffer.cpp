@@ -42,6 +42,16 @@ void test_ring_basics()
     static_assert(alignof(circular_buffer<int>) >= 64);
     static_assert(circular_buffer<int>::cache_line_size >= 64);
 
+    // The ring's machinery never throws - only T's operations can, and the
+    // noexcept specification is conditional on exactly that
+    static_assert(noexcept(std::declval<circular_buffer<int>&>().try_push(1)));
+    static_assert(noexcept(std::declval<circular_buffer<int>&>().try_pop(std::declval<int&>())));
+    static_assert(noexcept(std::declval<circular_buffer<int>&>().try_pop()));
+    static_assert(!noexcept(std::declval<circular_buffer<std::string>&>()
+                                .try_push(std::declval<const std::string&>())));
+    static_assert(noexcept(std::declval<circular_buffer<std::string>&>()
+                               .try_push(std::declval<std::string&&>())));
+
     circular_buffer<int> ring{100};
     assert(ring.capacity() == 128);         // rounded up to a power of two
     assert(ring.empty());

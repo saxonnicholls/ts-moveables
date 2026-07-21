@@ -43,6 +43,39 @@ using deadline_clock = std::chrono::steady_clock;
 
 namespace {
 
+// The constexpr constructors make statics of these types constant-initialized;
+// constinit (C++20) is the compiler-enforced proof
+#if defined(__cpp_constinit)
+constinit moveable_atomic_int constinit_counter{7};
+constinit moveable_atomic_flag constinit_flag{true};
+constinit moveable_spin_lock constinit_lock;
+#endif
+
+// ------------------------------------------------- constexpr and noexcept ---
+
+void test_constexpr_and_noexcept()
+{
+    static_assert(moveable_atomic_int::is_always_lock_free);
+    static_assert(moveable_atomic_bool::is_always_lock_free);
+
+    // try_lock and unlock throw nothing, as the standard requires of every
+    // standard mutex; lock may throw std::system_error and stays unmarked
+    static_assert(noexcept(std::declval<moveable_mutex<>&>().try_lock()));
+    static_assert(noexcept(std::declval<moveable_mutex<>&>().unlock()));
+    static_assert(!noexcept(std::declval<moveable_mutex<>&>().lock()));
+    static_assert(noexcept(std::declval<moveable_shared_mutex&>().unlock_shared()));
+    static_assert(noexcept(std::declval<moveable_spin_lock&>().lock()));
+
+#if defined(__cpp_constinit)
+    assert(constinit_counter.get() == 7);
+    assert(constinit_flag.test());
+    constinit_lock.lock();
+    constinit_lock.unlock();
+#endif
+
+    pass("constexpr construction and noexcept guarantees");
+}
+
 // ---------------------------------------------------------- zero overhead ---
 
 void test_zero_size_overhead()
@@ -791,6 +824,7 @@ void test_everything_in_one_object()
 
 int main()
 {
+    test_constexpr_and_noexcept();
     test_zero_size_overhead();
 
     test_atomic_basics();

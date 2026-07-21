@@ -44,7 +44,9 @@ namespace snicholls
         }
 
     public:
-        moveable_spin_lock() noexcept = default;
+        // constexpr: a static moveable_spin_lock is constant-initialized -
+        // usable before main, no dynamic-initialization order concerns
+        constexpr moveable_spin_lock() noexcept = default;
 
         moveable_spin_lock(const moveable_spin_lock&) = delete;
         moveable_spin_lock& operator=(const moveable_spin_lock&) = delete;

@@ -252,8 +252,10 @@ namespace snicholls
 
         // ------------------------------------------------------ producer side
 
+        // Conditionally noexcept throughout: the ring's own machinery (atomics,
+        // index arithmetic, placement new) never throws - only T's operations can
         template <typename... Args>
-        bool try_emplace(Args&&... args) {
+        bool try_emplace(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args&&...>) {
             side_guard g(producer_active_);
             // Relaxed: only the producer writes tail_, so this is our own value
             const std::size_t t = tail_.load(std::memory_order_relaxed);
@@ -272,8 +274,12 @@ namespace snicholls
             return true;
         }
 
-        bool try_push(const T& v) { return try_emplace(v); }
-        bool try_push(T&& v)      { return try_emplace(std::move(v)); }
+        bool try_push(const T& v) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+            return try_emplace(v);
+        }
+        bool try_push(T&& v) noexcept(std::is_nothrow_move_constructible_v<T>) {
+            return try_emplace(std::move(v));
+        }
 
         // Copy up to n elements from first; returns how many were pushed.
         // Amortises the atomic traffic: one acquire at most, one release total.
@@ -297,7 +303,7 @@ namespace snicholls
 
         // ------------------------------------------------------ consumer side
 
-        bool try_pop(T& out) {
+        bool try_pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
             side_guard g(consumer_active_);
             // Relaxed: only the consumer writes head_
             const std::size_t h = head_.load(std::memory_order_relaxed);
@@ -317,7 +323,7 @@ namespace snicholls
             return true;
         }
 
-        std::optional<T> try_pop() {
+        std::optional<T> try_pop() noexcept(std::is_nothrow_move_constructible_v<T>) {
             side_guard g(consumer_active_);
             const std::size_t h = head_.load(std::memory_order_relaxed);
             if (h == tail_cache_) {
@@ -354,7 +360,7 @@ namespace snicholls
         }
 
         // Discard everything queued (a consumer-side operation)
-        void clear() {
+        void clear() noexcept {
             side_guard g(consumer_active_);
             const std::size_t h = head_.load(std::memory_order_relaxed);
             const std::size_t t = tail_.load(std::memory_order_acquire);

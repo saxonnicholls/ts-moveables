@@ -74,10 +74,12 @@ namespace snicholls
 
         ~moveable_mutex() = default;
 
-        // Exclusive locking
-        void lock()     { m.lock(); }
-        bool try_lock() { return m.try_lock(); }
-        void unlock()   { m.unlock(); }
+        // Exclusive locking. lock() may throw std::system_error and is left
+        // unmarked; the standard requires try_lock and unlock to throw nothing
+        // for every standard mutex, so we promise that too.
+        void lock()              { m.lock(); }
+        bool try_lock() noexcept { return m.try_lock(); }
+        void unlock() noexcept   { m.unlock(); }
 
         // Timed locking - std::timed_mutex, std::recursive_timed_mutex, std::shared_timed_mutex
         template <typename Rep, typename Period>
@@ -87,9 +89,9 @@ namespace snicholls
         bool try_lock_until(const std::chrono::time_point<Clock, Duration>& t) { return m.try_lock_until(t); }
 
         // Shared locking - std::shared_mutex, std::shared_timed_mutex
-        void lock_shared()     { m.lock_shared(); }
-        bool try_lock_shared() { return m.try_lock_shared(); }
-        void unlock_shared()   { m.unlock_shared(); }
+        void lock_shared()              { m.lock_shared(); }
+        bool try_lock_shared() noexcept { return m.try_lock_shared(); }
+        void unlock_shared() noexcept   { m.unlock_shared(); }
 
         template <typename Rep, typename Period>
         bool try_lock_shared_for(const std::chrono::duration<Rep, Period>& d) { return m.try_lock_shared_for(d); }

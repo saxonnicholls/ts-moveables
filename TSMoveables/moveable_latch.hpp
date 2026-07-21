@@ -81,7 +81,9 @@ namespace snicholls
                 cv.notify_all();
         }
 
-        bool try_wait() const noexcept {
+        // Not noexcept, unlike std::latch::try_wait: ours takes the mutex,
+        // and locking may throw std::system_error
+        bool try_wait() const {
             std::lock_guard<std::mutex> lock(m);
             return count == 0;
         }
