@@ -45,6 +45,14 @@ build/demo: TSMoveables/main.cpp $(HEADERS) | build
 build/bench: benchmarks/bench.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread benchmarks/bench.cpp -o $@ $(LDLIBS)
 
+# Head-to-head vs moodycamel. Fetches the third-party headers first (gitignored).
+# Warning flags relaxed here because the third-party headers are not ours to lint.
+benchmarks/third_party/concurrentqueue.h:
+	bash scripts/fetch_bench_deps.sh
+
+build/bench_compare: benchmarks/bench.cpp $(HEADERS) benchmarks/third_party/concurrentqueue.h | build
+	$(CXX) -std=$(STD) -O3 -DNDEBUG -DTS_BENCH_COMPARE -Ibenchmarks/third_party -pthread benchmarks/bench.cpp -o $@ $(LDLIBS)
+
 build/signal_slot_demo: demos/signal_slot_demo.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/signal_slot_demo.cpp -o $@ $(LDLIBS)
 
@@ -71,6 +79,9 @@ demo: build/demo
 
 bench: build/bench
 	./build/bench
+
+bench-compare: build/bench_compare
+	./build/bench_compare
 
 demo-signals: build/signal_slot_demo
 	./build/signal_slot_demo

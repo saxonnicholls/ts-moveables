@@ -34,6 +34,15 @@
 
 #include "../TSMoveables/ts_moveables.hpp"
 
+// Optional head-to-head comparison against moodycamel's lock-free queues.
+// Enabled by `make bench-compare` (which fetches the headers via
+// scripts/fetch_bench_deps.sh). NOT a library dependency - the comparison is
+// build-time-optional tooling; the default `make bench` never touches these.
+#if defined(TS_BENCH_COMPARE)
+#include "concurrentqueue.h"        // moodycamel::ConcurrentQueue (MPMC)
+#include "readerwriterqueue.h"      // moodycamel::ReaderWriterQueue (SPSC)
+#endif
+
 using namespace snicholls;
 
 namespace {
@@ -415,6 +424,152 @@ void bench_disruptor_batch()
     report("disruptor<T>  publish_n/poll (64)", s, total_items);
 }
 
+#if defined(TS_BENCH_COMPARE)
+
+void report_compare(const char* category, const char* impl, double seconds, std::int64_t items)
+{
+    const double mops = static_cast<double>(items) / seconds / 1e6;
+    const double ns = seconds / static_cast<double>(items) * 1e9;
+    if (markdown)
+        std::printf("| %s | `%s` | %.1f Mops/s | %.1f ns |\n", category, impl, mops, ns);
+    else
+        std::printf("  %-9s %-42s %8.1f Mops/s %8.1f ns/op\n", category, impl, mops, ns);
+}
+
+void bench_compare_spsc()
+{
+    // Ours: bounded SPSC ring
+    {
+        const double s = best_seconds([] {
+            circular_buffer<std::int64_t> ring{1024};
+            std::thread producer([&] {
+                for (std::int64_t i = 0; i < total_items;)
+                    if (ring.try_push(i)) ++i;
+            });
+            std::int64_t sum = 0;
+            for (std::int64_t got = 0; got < total_items;) {
+                std::int64_t v;
+                if (ring.try_pop(v)) { sum += v; ++got; }
+            }
+            producer.join();
+            sink = sum;
+        });
+        report_compare("SPSC", "snicholls::circular_buffer (checked)", s, total_items);
+    }
+    // Ours in performance mode: move-check compiled out - the fair fight against
+    // an immovable specialist queue
+    {
+        const double s = best_seconds([] {
+            circular_buffer<std::int64_t, 0, false> ring{1024};
+            std::thread producer([&] {
+                for (std::int64_t i = 0; i < total_items;)
+                    if (ring.try_push(i)) ++i;
+            });
+            std::int64_t sum = 0;
+            for (std::int64_t got = 0; got < total_items;) {
+                std::int64_t v;
+                if (ring.try_pop(v)) { sum += v; ++got; }
+            }
+            producer.join();
+            sink = sum;
+        });
+        report_compare("SPSC", "snicholls::circular_buffer (unchecked)", s, total_items);
+    }
+    // moodycamel: ReaderWriterQueue with try_enqueue (bounded, no growth)
+    {
+        const double s = best_seconds([] {
+            moodycamel::ReaderWriterQueue<std::int64_t> q{1024};
+            std::thread producer([&] {
+                for (std::int64_t i = 0; i < total_items;)
+                    if (q.try_enqueue(i)) ++i;
+            });
+            std::int64_t sum = 0;
+            for (std::int64_t got = 0; got < total_items;) {
+                std::int64_t v;
+                if (q.try_dequeue(v)) { sum += v; ++got; }
+            }
+            producer.join();
+            sink = sum;
+        });
+        report_compare("SPSC", "moodycamel::ReaderWriterQueue", s, total_items);
+    }
+}
+
+void bench_compare_mpmc()
+{
+    static constexpr int producers = 4;
+    static constexpr int consumers = 4;
+    static const std::int64_t per = total_items / producers;
+    static const std::int64_t total = per * producers;
+
+    // Ours: bounded, so producers backpressure (yield) when full
+    {
+        const double s = best_seconds([] {
+            mpmc_queue<std::int64_t> q{8192};
+            std::atomic<std::int64_t> consumed{0};
+            std::atomic<std::int64_t> sum{0};
+            std::vector<std::thread> ts;
+            for (int p = 0; p < producers; ++p)
+                ts.emplace_back([&, p] {
+                    for (std::int64_t i = 0; i < per; ++i) {
+                        const std::int64_t v = static_cast<std::int64_t>(p) * per + i;
+                        while (!q.push(v)) std::this_thread::yield();
+                    }
+                });
+            for (int c = 0; c < consumers; ++c)
+                ts.emplace_back([&] {
+                    std::int64_t v;
+                    for (;;) {
+                        if (q.try_pop(v)) {
+                            sum.fetch_add(v, std::memory_order_relaxed);
+                            if (consumed.fetch_add(1, std::memory_order_acq_rel) + 1 == total) return;
+                        } else if (consumed.load(std::memory_order_acquire) >= total) {
+                            return;
+                        } else {
+                            std::this_thread::yield();
+                        }
+                    }
+                });
+            for (auto& t : ts) t.join();
+            sink = sum.load();
+        });
+        report_compare("MPMC 4x4", "snicholls::mpmc_queue (bounded)", s, total);
+    }
+    // moodycamel: ConcurrentQueue is unbounded, so producers never block
+    {
+        const double s = best_seconds([] {
+            moodycamel::ConcurrentQueue<std::int64_t> q;
+            std::atomic<std::int64_t> consumed{0};
+            std::atomic<std::int64_t> sum{0};
+            std::vector<std::thread> ts;
+            for (int p = 0; p < producers; ++p)
+                ts.emplace_back([&, p] {
+                    for (std::int64_t i = 0; i < per; ++i)
+                        q.enqueue(static_cast<std::int64_t>(p) * per + i);
+                });
+            for (int c = 0; c < consumers; ++c)
+                ts.emplace_back([&] {
+                    std::int64_t v;
+                    for (;;) {
+                        if (q.try_dequeue(v)) {
+                            sum.fetch_add(v, std::memory_order_relaxed);
+                            if (consumed.fetch_add(1, std::memory_order_acq_rel) + 1 == total) return;
+                        } else if (consumed.load(std::memory_order_acquire) >= total) {
+                            return;
+                        } else {
+                            std::this_thread::yield();
+                        }
+                    }
+                });
+            for (auto& t : ts) t.join();
+            sink = sum.load();
+        });
+        report_compare("MPMC 4x4", "moodycamel::ConcurrentQueue (unbounded)", s, total);
+    }
+}
+
+#endif // TS_BENCH_COMPARE
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -457,6 +612,16 @@ int main(int argc, char** argv)
     else
         std::printf("\nfork-join - %lld tasks spawned from inside workers:\n", fj_total);
     bench_forkjoin();
+
+#if defined(TS_BENCH_COMPARE)
+    if (markdown)
+        std::printf("\n### head-to-head vs moodycamel (same harness, best of %d)\n\n"
+                    "| Case | Implementation | Throughput | Per op |\n|---|---|---|---|\n", repeats);
+    else
+        std::printf("\nhead-to-head vs moodycamel (same harness):\n");
+    bench_compare_spsc();
+    bench_compare_mpmc();
+#endif
 
     if (!markdown)
         std::printf("\n(sink=%lld)\n", static_cast<long long>(sink));

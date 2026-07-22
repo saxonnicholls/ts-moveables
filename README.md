@@ -174,7 +174,9 @@ ring.try_push(msg);                    auto m = ring.try_pop();          // opti
 ring.push_n(first, n);                 ring.pop_n(out_iterator, max);    // batched - amortises the atomic traffic
 ```
 
-`try_push`/`try_pop` are wait-free. `size()`/`empty()`/`full()` are safe from any thread, as snapshots. Moves transfer the queued elements in order and leave the source empty but fully usable, capacity intact; copies are snapshots. The quiescent check here is honest best-effort — a lock-free ring has no lock to probe, so each side raises a flag (two relaxed stores to a cache line it already owns, effectively free) and move/copy throws `std::runtime_error` if a push or pop is literally in flight.
+`try_push`/`try_pop` are wait-free. `size()`/`empty()`/`full()` are safe from any thread, as snapshots. Moves transfer the queued elements in order and leave the source empty but fully usable, capacity intact; copies are snapshots. The quiescent check here is honest best-effort — a lock-free ring has no lock to probe, so each side raises a flag and move/copy throws `std::runtime_error` if a push or pop is literally in flight.
+
+That check is the ring's only per-op overhead, and it's a compile-time choice: `circular_buffer<T, N, Checked>` defaults to `Checked = true`, or takes `Checked = false` to compile the check out on a proven hot path (safety vs performance — see the [head-to-head](#head-to-head-vs-moodycamel)).
 
 ## disruptor
 
@@ -233,6 +235,7 @@ make tsan    # the same tests under ThreadSanitizer
 make asan    # the same tests under Address + UB Sanitizers
 make demo    # build and run the demo (same code as the Xcode target)
 make bench   # dependency-free throughput benchmarks (ring vs mutex/spin/cv baselines)
+make bench-compare   # head-to-head vs moodycamel (fetches its headers on demand; not a dependency)
 
 make test STD=c++17   # any target can be built against a different standard
 ```
@@ -322,6 +325,26 @@ And fork-join, where tasks spawn sub-tasks from inside a worker — work-stealin
 | `mutex_task_pool` (fork-join) | ~3.4 M tasks/s | ~300 ns |
 
 Two honest shapes here. First, the cv-backed pools are wakeup-latency-bound (~2 µs per task is condition-variable signalling, not the queue); the lock-free pools avoid that and run several times faster. Second, `work_stealing_task_pool` looks mid-pack on *external* trivial submits (every task funnels through the injector and pays a heap allocation) but is the fastest of all on **fork-join** — 4× its own external number — because spawned work lands in hot local deques instead of a shared queue. That is exactly why work-stealing exists, and why the comparison harness matters: no single pool wins every shape.
+
+### Head-to-head vs moodycamel
+
+To ground the claims honestly, `make bench-compare` runs the *same* harness against [moodycamel](https://github.com/cameron314/concurrentqueue)'s lock-free queues — the field's reference implementations. The headers are fetched on demand (`scripts/fetch_bench_deps.sh`, gitignored); they are **not** a library dependency. On the Intel reference machine:
+
+| Case | Implementation | Throughput | Per op |
+|---|---|---|---|
+| SPSC | `snicholls::circular_buffer` (checked) | ~30 Mops/s | ~34 ns |
+| SPSC | `snicholls::circular_buffer` (**unchecked** — perf mode) | ~36 Mops/s | ~28 ns |
+| SPSC | `moodycamel::ReaderWriterQueue` | **~450 Mops/s** | **~2.2 ns** |
+| MPMC 4×4 | `snicholls::mpmc_queue` (bounded) | ~4.2 Mops/s | ~239 ns |
+| MPMC 4×4 | `moodycamel::ConcurrentQueue` (unbounded) | **~6.8 Mops/s** | **~147 ns** |
+
+**moodycamel wins — decisively on SPSC, clearly on MPMC — and that is the honest answer to "do we beat the specialists on raw single-op throughput": no.** Three things sit behind the numbers, all measured, not asserted:
+
+- **Safety vs performance is the developer's choice, at compile time.** `circular_buffer<T, N, Checked>` defaults to `Checked = true` (the quiescent-move-check). `Checked = false` compiles the check out for a proven hot path — recovering the ~6 ns/op it costs (~34 → ~28 ns). Use the default unless you've measured that you need otherwise.
+- **But the move-check was never the real gap.** Even *unchecked*, we're ~13× behind moodycamel. That gap is **architectural**: moodycamel's queues are block-based and amortise atomic traffic across ~hundreds of elements per block; our slot-based ring touches an atomic every single op. Closing that gap means *becoming* moodycamel — a fundamentally more complex queue — which is the opposite of this ring's teaching-quality, moveable, simple design.
+- **Where batching applies, we close most of the gap on our own terms.** `circular_buffer::push_n` and the disruptor's `publish_n` hit 400–1800 Mops/s (tables above) because batching amortises the same way moodycamel's blocks do — on Apple Silicon the batched disruptor's 0.5 ns/event is in moodycamel's single-op league. (Note `mpmc_queue` carries *no* move-check on its hot path — its ~1.6× gap to `ConcurrentQueue` is pure design, block-based vs per-cell CAS.)
+
+So the positioning the [non-goals](FUTURE_DIRECTIONS.md) always stated holds, now with receipts: we do **not** compete with the specialist lock-free queues on raw single-op throughput, and don't claim to. We offer what they don't — moveability (with a safety/performance switch), the quiescent contract, a bounded option, and a toolkit that composes — at throughput that is more than enough for the overwhelming majority of concurrent code, and genuinely fast in batch. Run `make bench-compare` and see for yourself; the comparison is reproducible, not curated.
 
 `make demo-signals` — the typed signal/slot architecture, 5M emissions per scenario:
 

@@ -2,6 +2,10 @@
 build/
 build-cmake/
 
+# Fetched benchmark-only comparison headers (moodycamel) - not committed;
+# `make bench-compare` fetches them. The library itself is dependency-free.
+benchmarks/third_party/
+
 # Xcode user state
 xcuserdata/
 *.xcuserstate

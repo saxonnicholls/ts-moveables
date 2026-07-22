@@ -45,12 +45,24 @@ namespace snicholls
     // Move and copy follow the library's quiescent contract, with an honest
     // caveat: a lock-free ring has no lock to probe, so the check is
     // best-effort - each side sets an "active" flag (two relaxed stores to a
-    // cache line that side already owns, effectively free) and move/copy
-    // throws std::runtime_error if either flag is up. It makes concurrent
-    // misuse loud; it does not make move-during-push a sensible program.
-    // Moves transfer the queued elements in order and leave the source empty
-    // and fully usable, with its capacity and storage intact.
-    template <typename T, std::size_t N = 0>
+    // cache line that side already owns) and move/copy throws std::runtime_error
+    // if either flag is up. It makes concurrent misuse loud; it does not make
+    // move-during-push a sensible program. Moves transfer the queued elements in
+    // order and leave the source empty and fully usable.
+    //
+    // Safety vs performance is the caller's choice, at compile time:
+    //
+    //   Checked = true  (default) - the move-check above is active. That check
+    //       is the only per-op overhead the ring carries; on a hot SPSC path it
+    //       costs on the order of ~10 ns/op (measured). Use this unless you have
+    //       proven you need otherwise.
+    //   Checked = false           - the flag stores are compiled out entirely,
+    //       so push/pop carry NO move-check overhead at all (the ring's raw
+    //       throughput, for a head-to-head against immovable specialist queues).
+    //       Moves still work but are UNCHECKED: it is then purely the caller's
+    //       contract to move only a quiescent ring. Choose this only on a proven
+    //       hot path where you own the lifecycle.
+    template <typename T, std::size_t N = 0, bool Checked = true>
     struct circular_buffer {
 
         static_assert(N == 0 || (N & (N - 1)) == 0,
@@ -94,19 +106,28 @@ namespace snicholls
         alignas(cache_line_size) std::size_t mask_ = has_static_capacity ? N - 1 : 0;
         storage_type storage_{};
 
-        // Two relaxed stores to a line the side already owns - effectively free
+        // Marks a side active for the move-check. When Checked is false the
+        // stores compile away entirely, so the hot path carries zero overhead.
         struct side_guard {
             std::atomic<bool>& flag;
             explicit side_guard(std::atomic<bool>& f) noexcept : flag(f) {
-                flag.store(true, std::memory_order_relaxed);
+                if constexpr (Checked)
+                    flag.store(true, std::memory_order_relaxed);
             }
-            ~side_guard() { flag.store(false, std::memory_order_release); }
+            ~side_guard() {
+                if constexpr (Checked)
+                    flag.store(false, std::memory_order_release);
+            }
         };
 
         static void ensure_quiescent(const circular_buffer& other) {
-            if (other.producer_active_.load(std::memory_order_acquire) ||
-                other.consumer_active_.load(std::memory_order_acquire))
-                throw std::runtime_error("circular_buffer: moving while operations are in flight");
+            if constexpr (Checked) {
+                if (other.producer_active_.load(std::memory_order_acquire) ||
+                    other.consumer_active_.load(std::memory_order_acquire))
+                    throw std::runtime_error("circular_buffer: moving while operations are in flight");
+            } else {
+                (void)other;                    // unchecked mode: move is the caller's contract
+            }
         }
 
         static constexpr std::size_t round_up_pow2(std::size_t n) noexcept {
