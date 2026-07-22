@@ -457,10 +457,26 @@ We do **not** claim to beat the work-stealing greats (Taskflow, TBB, Tokio) — 
 
 The two lock-free building blocks stand alone too: `mpmc_queue<T>` is a bounded Vyukov MPMC ring (moveable when quiescent), and `work_stealing_deque<T>` is a bounded Chase-Lev deque with the memory-model-verified orderings from Le et al. (2013).
 
-The roadmap — `synchronized<T>`, a moveable SPSC circular buffer with honest atomics, a disruptor, and a thread-safe signal/slot — lives in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md), along with the non-goals and the reasoning behind both.
+The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Most of it has now shipped; what remains is disruptor phase 2 (multi-producer) and a signal/slot refinement.
+
+## The bigger picture: the host side of accelerated systems
+
+The heavy parallel math increasingly runs on accelerators — NVIDIA GPUs (CUDA), FPGAs, and tensor engines / TPUs. But every one of them sits behind a **CPU host** that has to feed it, drain it, orchestrate it, and hold the state around it — and in real pipelines that host-side coordination, not the device, is often the limiter. Keeping the accelerator busy is a CPU concurrency problem.
+
+This library is that host side. It does not run on the device and does not try to — it is the dependency-free CPU fabric that surrounds one, and it complements the accelerator toolchains (CUDA/cuDNN/XLA, FPGA HLS, vendor runtimes) rather than competing with them:
+
+- **Staging and hand-off.** `circular_buffer`, `mpmc_queue`, and the `disruptor` are the host-side producer/consumer rings that batch work *toward* a device — H2D copies, kernel and stream enqueues, DMA descriptors — and drain results back. Their batch APIs (`push_n`, `publish_n`) line up exactly with how you feed an accelerator: amortise the transfers, launch in batches. Batch throughput is our strength, and batch is precisely what devices want.
+- **Orchestration and lifecycle.** The moveable primitives, `synchronized<T>`, and the thread pools build the host runtime objects that own CUDA streams, device buffers, FPGA DMA channels and handles — and *move cleanly*. A class holding a stream or a device pointer gets the rule of zero back, which is exactly the ownership hygiene a heterogeneous runtime needs.
+- **Ingest and routing.** `moveable_signal` and the capture/replay demos are the event fabric that gets data to the device and results to whoever consumes them, deterministically and replayably — the same discipline an HFT feed handler or an ML data loader needs before the tensor cores ever spin up.
+
+So the relationship is complementary: the GPU/FPGA/TPU does the compute; this is the low-overhead, moveable CPU coordination layer that keeps it fed. Where the host is the bottleneck — feeding the beast — a clean, dependency-free fabric is exactly what you want, and it stays out of the way of whatever device toolchain you pair it with.
 
 ## Caveats
 
 - The quiescence probe on `moveable_mutex` and `moveable_spin_lock` is a `try_lock`; on a recursive mutex it cannot detect a lock held by the moving thread itself. Moving a mutex you yourself hold is still a logic error.
 - A mutex/condition-variable move is safe against *stale* use, not against *concurrent* use: a thread may lock or wait immediately after the probe. Move objects when they are quiescent; the checks exist to make misuse loud.
 - `moveable_barrier`'s completion function runs while the barrier's internal lock is held; it must not call back into the barrier (as with `std::barrier`, where that is undefined behaviour).
+
+## Contributing
+
+Pull requests are **more than welcome** — I'm happy to collaborate. Bug reports, new moveable types, portability and compiler fixes, benchmark numbers from your own hardware, sharper tests, or just a good question all move this forward. Open an issue or a PR and let's build it together.
