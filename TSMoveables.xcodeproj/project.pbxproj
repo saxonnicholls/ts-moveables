@@ -39,6 +39,9 @@
 		DFA1000A29CE00010000AA0A /* circular_buffer.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = circular_buffer.hpp; sourceTree = "<group>"; };
 		DFA1000B29CE00010000AA0B /* disruptor.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = disruptor.hpp; sourceTree = "<group>"; };
 		DFA1000C29CE00010000AA0C /* moveable_signal.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = moveable_signal.hpp; sourceTree = "<group>"; };
+		DFA1000D29CE00010000AA0D /* thread_pool.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = thread_pool.hpp; sourceTree = "<group>"; };
+		DFA1000E29CE00010000AA0E /* mpmc_queue.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = mpmc_queue.hpp; sourceTree = "<group>"; };
+		DFA1000F29CE00010000AA0F /* work_stealing_deque.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = work_stealing_deque.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -86,6 +89,9 @@
 				DFA1000A29CE00010000AA0A /* circular_buffer.hpp */,
 				DFA1000B29CE00010000AA0B /* disruptor.hpp */,
 				DFA1000C29CE00010000AA0C /* moveable_signal.hpp */,
+				DFA1000D29CE00010000AA0D /* thread_pool.hpp */,
+				DFA1000E29CE00010000AA0E /* mpmc_queue.hpp */,
+				DFA1000F29CE00010000AA0F /* work_stealing_deque.hpp */,
 			);
 			path = TSMoveables;
 			sourceTree = "<group>";

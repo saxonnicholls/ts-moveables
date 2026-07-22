@@ -72,8 +72,11 @@ Moved-from objects are always left valid and usable.
 | `synchronized.hpp` | `synchronized<T, M>` / `synchronized_waitable<T, M>` | `folly::Synchronized` / P0290 | locked | locked / checked |
 | `synchronized_heterogeneous.hpp` | `synchronized_variant<Ts...>`, `synchronized_tuple<Ts...>`, `synchronized_any`, `synchronized_type_map`, `synchronized_bag` | — | locked | locked |
 | `circular_buffer.hpp` | `circular_buffer<T>` / `circular_buffer<T, N>` | `boost::lockfree::spsc_queue` (immovable) | checked | checked, contents transfer |
+| `mpmc_queue.hpp` | `mpmc_queue<T>` (bounded, lock-free) | Vyukov bounded MPMC / moodycamel | — | quiescent, contents transfer |
+| `work_stealing_deque.hpp` | `work_stealing_deque<T>` (bounded Chase-Lev) | Chase-Lev / Taskflow internals | — | — (internal, stable) |
 | `disruptor.hpp` | `disruptor<T, WaitStrategy>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
 | `moveable_signal.hpp` | `moveable_signal<Args...>` + `connection` / `scoped_connection` | Boost.Signals2 / sigslot | — | connections survive the move |
+| `thread_pool.hpp` | `task_pool` interface + `mutex_` / `sharded_` / `dispatch_` / `mpmc_` / `work_stealing_task_pool` | Taskflow / TBB / `std::async` | — | moveable handle (heap core) |
 | `ts_moveables.hpp` | umbrella header — includes everything | | | |
 
 Two implementation strategies are used:
@@ -292,6 +295,26 @@ Measured on the reference machine — a 2014 Intel iMac, Apple Clang, `-O3` — 
 | `moveable_spin_lock` + `std::queue` | ~14 Mops/s | ~70 ns |
 | `synchronized_waitable<std::queue>` (cv) | ~6 Mops/s | ~160 ns |
 
+Thread pools (`make bench` also, 500k trivial tasks, submit + `wait_idle`):
+
+| Pool | Throughput | Per task |
+|---|---|---|
+| **`dispatch_task_pool`** (lock-free ring, single-dispatcher) | **~6–7 M tasks/s** | **~150 ns** |
+| `mpmc_task_pool` (lock-free MPMC, submit-anywhere) | ~3.6 M tasks/s | ~280 ns |
+| `work_stealing_task_pool` (external submit → injector) | ~1.7 M tasks/s | ~570 ns |
+| `mutex_task_pool` (one cv-blocked queue) | ~0.5 M tasks/s | ~1900 ns |
+| `sharded_task_pool` (K cv-blocked queues) | ~0.4 M tasks/s | ~2200 ns |
+| `std::async` (thread per task) | ~0.07 M tasks/s | ~15000 ns |
+
+And fork-join, where tasks spawn sub-tasks from inside a worker — work-stealing's home turf:
+
+| Pool | Throughput | Per task |
+|---|---|---|
+| **`work_stealing_task_pool`** (fork-join) | **~7.5 M tasks/s** | **~130 ns** |
+| `mutex_task_pool` (fork-join) | ~3.4 M tasks/s | ~300 ns |
+
+Two honest shapes here. First, the cv-backed pools are wakeup-latency-bound (~2 µs per task is condition-variable signalling, not the queue); the lock-free pools avoid that and run several times faster. Second, `work_stealing_task_pool` looks mid-pack on *external* trivial submits (every task funnels through the injector and pays a heap allocation) but is the fastest of all on **fork-join** — 4× its own external number — because spawned work lands in hot local deques instead of a shared queue. That is exactly why work-stealing exists, and why the comparison harness matters: no single pool wins every shape.
+
 `make demo-signals` — the typed signal/slot architecture, 5M emissions per scenario:
 
 | Scenario | Rate | Bandwidth |
@@ -340,7 +363,27 @@ Working programs, not snippets. Each builds and runs with one make target; the l
 
 For the pcap demo, bring your own data — `./build/pcap_replay_demo capture.pcap` — or capture live traffic with [scripts/capture_pcap.sh](scripts/capture_pcap.sh), which auto-detects your default interface (`en0` on macOS, `eth0`-style on Linux), runs `sudo tcpdump -s 0 -w`, and prints the replay command. Public capture files to experiment with are indexed at [netresec.com/?page=PcapFiles](https://www.netresec.com/?page=PcapFiles) — note that many are pcapng or gzipped, and the reader takes classic pcap, so convert first: `tcpdump -r in.pcapng -w out.pcap`. Without any file, the demo synthesises a capture, so it always runs.
 
-## Where this is going
+## thread_pool
+
+A pure-virtual `task_pool` interface — the point is *comparison*: good thread pools are rare, and the design choices (one shared queue vs. sharded vs. lock-free hand-off; block vs. spin) are hard to weigh without a common surface. Three implementations, each built visibly from this library's own primitives, span the spectrum:
+
+```cpp
+snicholls::mutex_task_pool         pool{4};   // one synchronized_waitable queue — the honest baseline
+snicholls::sharded_task_pool       pool{4};   // K queues, round-robin — one hot lock becomes K cool ones
+snicholls::dispatch_task_pool      pool{4};   // one lock-free circular_buffer per worker (single-dispatcher)
+snicholls::mpmc_task_pool          pool{4};   // one shared lock-free MPMC queue — general submit-anywhere
+snicholls::work_stealing_task_pool pool{4};   // per-worker Chase-Lev deques + stealing — best for fork-join
+
+pool.submit([] { /* work */ });
+auto fut = snicholls::async(pool, [] { return 42; });   // result-returning, over the interface
+pool.wait_idle();
+```
+
+Each is built visibly from the library's own parts. `dispatch_task_pool` is where the SPSC `circular_buffer` fits — its **single-dispatcher** contract (submit from one thread) is the deterministic feed-handler pattern, named honestly rather than hidden behind a submission lock. `mpmc_task_pool` is the general submit-anywhere pool, built on the lock-free [`mpmc_queue`](#the-types). `work_stealing_task_pool` is the design that competes with the incumbents on load balance: each worker owns a Chase-Lev deque (a task that spawns work pushes to its own hot deque), a shared `mpmc_queue` absorbs external submissions, and idle workers steal from random victims — with an inline-on-saturation policy so a fork-join can never deadlock. Pools are moveable (heap core, disruptor-style); polymorphic users hold them through `std::unique_ptr<task_pool>`.
+
+We do **not** claim to beat the work-stealing greats (Taskflow, TBB, Tokio) — they have years of hardening. What we add is narrow and real: pools composed from the toolkit, moveable handles, a bounded lock-free MPMC queue and a Chase-Lev deque as reusable components, dependency-free, and a level comparison harness. It also completes the [taskflow demo](#demos)'s story — *static* graphs need no pool; *dynamic* submission is where a pool earns its place.
+
+The two lock-free building blocks stand alone too: `mpmc_queue<T>` is a bounded Vyukov MPMC ring (moveable when quiescent), and `work_stealing_deque<T>` is a bounded Chase-Lev deque with the memory-model-verified orderings from Le et al. (2013).
 
 The roadmap — `synchronized<T>`, a moveable SPSC circular buffer with honest atomics, a disruptor, and a thread-safe signal/slot — lives in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md), along with the non-goals and the reasoning behind both.
 

@@ -26,6 +26,8 @@ void run_synchronized_tests();
 void run_circular_buffer_tests();
 void run_disruptor_tests();
 void run_signal_tests();
+void run_mpmc_queue_tests();
+void run_thread_pool_tests();
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -848,6 +850,8 @@ int main()
     run_circular_buffer_tests();
     run_disruptor_tests();
     run_signal_tests();
+    run_mpmc_queue_tests();
+    run_thread_pool_tests();
 
     test_once_flag();
 

@@ -18,6 +18,11 @@ graph TD
     R --> D[disruptor]
     P --> G[signal / slot]
     S -.-> G
+    S --> TP[thread_pool]
+    R --> TP
+    P --> Q[bounded mpmc_queue]
+    Q --> WS[work-stealing pool]
+    TP -.-> WS
 ```
 
 ---
@@ -118,6 +123,58 @@ The single-op ring number swings several-fold run to run with thread placement �
 
 ---
 
+## 5. Thread pool — an interface for comparing implementations
+
+**What.** A tiny pure-virtual `task_pool` interface, and several concrete implementations that span the design space, so they can be raced against one identical workload. The interface is the deliverable as much as any single pool: good thread pools are rare, and the reason is that the interesting choices (one shared queue vs. sharded vs. lock-free hand-off; block vs. spin; steal vs. partition) are hard to compare fairly without a common harness. This library already measures everything and compares honestly — the pool is that ethos pointed at itself.
+
+```cpp
+struct task_pool {
+    using task = std::function<void()>;
+    virtual ~task_pool() = default;
+    virtual void submit(task) = 0;              // enqueue work
+    virtual void wait_idle() = 0;               // block until all submitted work has run
+    virtual std::size_t worker_count() const noexcept = 0;
+};
+
+// result-returning submission over ANY implementation - non-virtual, generic,
+// like snicholls::call_once: wraps a packaged_task, returns its future
+template <class F>
+std::future<std::invoke_result_t<F>> async(task_pool&, F&&);
+```
+
+**The implementations — three points on the spectrum, built from our own parts.**
+
+- `mutex_task_pool` — one `synchronized_waitable<std::deque<task>>`; workers block on its condition variable via `wait_then`; submit from any thread. The honest "correct but contended" reference every faster design must beat.
+- `sharded_task_pool` — *K* independent shards, each a `synchronized_waitable` queue, round-robin on an atomic index; submit from any thread. Trades one hot lock for *K* cool ones — the cheapest real win, and it shows the library's "shared-nothing scales" thesis with a knob.
+- `dispatch_task_pool` — the `circular_buffer` showcase: one lock-free SPSC ring per worker, hand-off with no lock at all. **This is where the ring genuinely fits, and its constraint is the point:** the ring is SPSC, so this pool documents a *single-dispatcher* contract — `submit` is called from one thread. That is not a cop-out; it is the deterministic feed-handler pattern from low-latency systems (one thread fans a market-data feed out to a worker per partition), and naming the constraint is more honest than a "general" pool that quietly serialises submission behind a lock.
+
+**Why the interface earns its keep despite the cost.** The virtual `submit(std::function<void()>)` path pays a type-erasure and a virtual call per task — exactly the overhead the rest of the library avoids. The framing is the same as `moveable_mutex<M>` versus the raw primitives: the interface is for *comparison and polymorphic wiring*; a latency-critical caller takes a concrete pool by value and submits a concrete callable. The bench races all three (plus `std::async` as an external yardstick) on the same task graph, so the per-implementation cost is visible rather than asserted.
+
+**Completion and shutdown.** `wait_idle` rides a shared completion tracker — an atomic outstanding-count plus a `moveable_condition_variable`, decremented as each task finishes. Destruction signals stop, drains whatever is already queued, and joins — so a `wait_idle` can never be left hanging by a shutdown. Pool state lives behind a heap core (disruptor-style), so the concrete handle is *moveable* — and polymorphic users already hold it through a moveable `std::unique_ptr<task_pool>` regardless.
+
+**Prior art, honestly.** There are hundreds of C++ thread pools and few good ones; the good ones (Taskflow's executor, TBB, Tokio's multi-thread scheduler, `progschj/ThreadPool` as the popular-but-basic baseline) are work-stealing and hard to beat. **We do not claim to beat them, and must not.** What we add is narrow and real: pools built visibly from this library's own primitives (so the toolkit is shown composing), a moveable pool handle, dependency-free/header-only/C++17, and — the actual product — a level comparison harness. This also completes the story the taskflow demo started: *static* dependency graphs need no pool (shown, scheduler-free); *dynamic* task submission is exactly where a pool earns its place.
+
+**Effort.** Medium. The interface and completion tracker are small; each pool is a worker loop differing only in its queue; the honest work is the bench and the TSan runs under churn.
+
+---
+
+## 6. Bounded MPMC queue and a work-stealing pool — the "real" general pool ✅ shipped
+
+**What.** The high-performance, submit-from-anywhere pool that section 5 deliberately does *not* attempt, plus the component it must be built on first.
+
+The blocker is structural and worth stating precisely: our `circular_buffer` is SPSC, and a general pool's core need is one of two queues neither of which is SPSC — a **bounded MPMC queue** (many submitters, many workers, one shared queue) or a **Chase-Lev SPMC deque** per worker (owner pushes/pops one end, thieves take the other) for work stealing. So this line depends on a new primitive:
+
+- **`mpmc_queue<T>`** — a bounded, lock-free multi-producer/multi-consumer ring in the Vyukov style (per-slot sequence numbers, CAS on the enqueue/dequeue tickets). Moveable under the quiescent contract, cache-line-padded ends, the same teaching-quality commenting as the SPSC ring. Valuable in its own right, independent of the pool.
+- **work-stealing pool** — per-worker deques, victims chosen at random on starvation, built on a Chase-Lev deque. This is the design that actually competes with the incumbents on load balance.
+
+**Why gated, not now.** Both are genuinely hard to get right (the Vyukov queue's memory ordering; Chase-Lev's ABA and resize hazards), and both must clear the same bar as the disruptor — benchmarks against moodycamel and TBB, every ordering choice justified inline, long stress runs — or they should not ship. Section 5 gives users a working, honest pool immediately; this section is the upgrade path, and the MPMC queue is the prerequisite gate. It also brushes against the "no lock-free container zoo" non-goal, so it ships only if it clears the "what do we add that moodycamel doesn't" test — and the answer had better be *moveability plus the queue as a reusable building block*, not "another MPMC queue."
+
+**Effort.** Large, twice over. Do not start until section 5 has miles on it and there is a concrete need the sharded/dispatch pools cannot meet.
+
+**Status: shipped.** `mpmc_queue.hpp` is the bounded Vyukov MPMC ring — per-cell sequence numbers, CAS tickets, placement-new cells with full element-lifetime handling (non-trivial and move-only `T`), moveable when quiescent (unchecked, and documented as such: no cheap per-side probe exists on the lock-free path, and a shared in-flight counter would contend the very hot path the design keeps clean). `work_stealing_deque.hpp` is the bounded Chase-Lev deque with the CDSChecker-verified orderings from Le et al. (2013), storing pointers so the single-element steal race never touches the pointee. Two new pools use them: `mpmc_task_pool` (one shared `mpmc_queue`, general submit-from-anywhere — the pool the single-dispatcher one could not be) and `work_stealing_task_pool` (per-worker Chase-Lev deques + an `mpmc_queue` injector + random-victim stealing + thread-local routing so a task that spawns work pushes to its own hot deque). One design lesson banked during the build: a bounded injector plus blocking backpressure *deadlocks* a fork-join (every worker can be stuck submitting while none drains), so the work-stealing pool runs a task inline on saturation — deadlock-free backpressure. The MPMC queue is verified with a 4-producer/4-consumer exactly-once test; the pool with a fork-join that forces the local-deque, injector, steal, and inline paths all at once; both survive heavy watchdog stress. Benchmarks: `mpmc_task_pool` ~3.6 M external submits/s, `work_stealing_task_pool` ~7.5 M tasks/s on fork-join (4× its external-submit rate — the locality win, measured). Still honestly short of Taskflow/TBB on a real workload; the value delivered is the two reusable lock-free components and pools that compose the toolkit, not a new speed record.
+
+---
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:
@@ -135,4 +192,6 @@ Written down so nobody — including us — spends a busy week on them:
 | 2 | `circular_buffer` (SPSC) | Medium | **Shipped** — benchmarks pending |
 | 3 | Signal/slot | Medium | **Shipped** (study done; the gap was real) |
 | 4 | Disruptor phase 1 | Large | **Shipped** |
-| 5 | Disruptor phase 2 (multi-producer) | Large | Only after phase 1 has miles on it |
+| 5 | `thread_pool` interface + mutex / sharded / dispatch impls | Medium | **Shipped** |
+| 6 | `mpmc_queue` + work-stealing pool | Large ×2 | **Shipped** |
+| 7 | Disruptor phase 2 (multi-producer) | Large | Only after phase 1 has miles on it |

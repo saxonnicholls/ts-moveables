@@ -20,10 +20,12 @@
 //
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <iterator>
 #include <mutex>
 #include <queue>
@@ -266,6 +268,130 @@ void bench_disruptor()
     report("disruptor<T>  publish/poll", s, total_items);
 }
 
+// -------------------------------------------------------------- thread pools
+// A different metric: submit N trivial tasks and wait for them all. This
+// measures the pool's submit + dispatch + completion overhead per task, not
+// SPSC hand-off, so it lives in its own table. Fewer tasks than the SPSC cases
+// because the mutex baseline notifies on every submit.
+
+constexpr std::int64_t pool_tasks = 500'000;
+
+void report_pool(const char* name, double seconds)
+{
+    const double mtps = static_cast<double>(pool_tasks) / seconds / 1e6;
+    const double ns = seconds / static_cast<double>(pool_tasks) * 1e9;
+    if (markdown)
+        std::printf("| `%s` | %.2f M tasks/s | %.0f ns/task |\n", name, mtps, ns);
+    else
+        std::printf("  %-42s %9.2f M tasks/s %8.0f ns/task\n", name, mtps, ns);
+}
+
+template <typename Pool>
+double pool_run(Pool& pool)
+{
+    return best_seconds([&pool] {
+        std::atomic<std::int64_t> acc{0};
+        for (std::int64_t i = 0; i < pool_tasks; ++i)
+            pool.submit([&acc] { acc.fetch_add(1, std::memory_order_relaxed); });
+        pool.wait_idle();
+        sink = acc.load();
+    });
+}
+
+void bench_thread_pools()
+{
+    {
+        mutex_task_pool p{4};
+        report_pool("mutex_task_pool (submit+run)", pool_run(p));
+    }
+    {
+        sharded_task_pool p{4};
+        report_pool("sharded_task_pool (submit+run)", pool_run(p));
+    }
+    {
+        dispatch_task_pool p{4, 4096};              // single-dispatcher: bench submits from one thread
+        report_pool("dispatch_task_pool (submit+run)", pool_run(p));
+    }
+    {
+        mpmc_task_pool p{4};
+        report_pool("mpmc_task_pool (submit+run)", pool_run(p));
+    }
+    {
+        work_stealing_task_pool p{4};
+        report_pool("work_stealing_task_pool (submit+run)", pool_run(p));
+    }
+    // std::async yardstick - launches a thread per task, so a tiny count only
+    {
+        constexpr std::int64_t async_tasks = 20'000;
+        const double s = best_seconds([] {
+            std::atomic<std::int64_t> acc{0};
+            std::vector<std::future<void>> futs;
+            futs.reserve(async_tasks);
+            for (std::int64_t i = 0; i < async_tasks; ++i)
+                futs.push_back(std::async(std::launch::async,
+                                          [&acc] { acc.fetch_add(1, std::memory_order_relaxed); }));
+            for (auto& f : futs)
+                f.get();
+            sink = acc.load();
+        });
+        const double mtps = static_cast<double>(async_tasks) / s / 1e6;
+        if (markdown)
+            std::printf("| `std::async (thread per task, 20k)` | %.2f M tasks/s | %.0f ns/task |\n",
+                        mtps, s / static_cast<double>(async_tasks) * 1e9);
+        else
+            std::printf("  %-42s %9.2f M tasks/s %8.0f ns/task\n",
+                        "std::async (thread per task, 20k)", mtps,
+                        s / static_cast<double>(async_tasks) * 1e9);
+    }
+}
+
+// Fork-join: spreader tasks spawn many sub-tasks from inside a worker. This is
+// where work-stealing earns its name - spawned tasks hit hot local deques
+// instead of one contended global queue. (Only pools safe for submit-from-
+// within-a-task: work-stealing's inline-on-saturation and the unbounded mutex
+// queue. The bounded mpmc/dispatch pools are not built for this shape.)
+constexpr std::int64_t fj_spreaders = 32;
+constexpr std::int64_t fj_per = 2048;
+constexpr std::int64_t fj_total = fj_spreaders * (fj_per + 1);
+
+template <typename Pool>
+double forkjoin_run(Pool& pool)
+{
+    return best_seconds([&pool] {
+        std::atomic<std::int64_t> acc{0};
+        for (std::int64_t s = 0; s < fj_spreaders; ++s)
+            pool.submit([&pool, &acc] {
+                for (std::int64_t i = 0; i < fj_per; ++i)
+                    pool.submit([&acc] { acc.fetch_add(1, std::memory_order_relaxed); });
+            });
+        pool.wait_idle();
+        sink = acc.load();
+    });
+}
+
+void report_fj(const char* name, double seconds)
+{
+    const double mtps = static_cast<double>(fj_total) / seconds / 1e6;
+    if (markdown)
+        std::printf("| `%s` | %.2f M tasks/s | %.0f ns/task |\n", name, mtps,
+                    seconds / static_cast<double>(fj_total) * 1e9);
+    else
+        std::printf("  %-42s %9.2f M tasks/s %8.0f ns/task\n", name, mtps,
+                    seconds / static_cast<double>(fj_total) * 1e9);
+}
+
+void bench_forkjoin()
+{
+    {
+        work_stealing_task_pool p{4};
+        report_fj("work_stealing_task_pool (fork-join)", forkjoin_run(p));
+    }
+    {
+        mutex_task_pool p{4};
+        report_fj("mutex_task_pool (fork-join)", forkjoin_run(p));
+    }
+}
+
 void bench_disruptor_batch()
 {
     // static: not captured by the lambdas (MSVC C3493) yet still a constant
@@ -315,6 +441,22 @@ int main(int argc, char** argv)
     bench_mutex_queue();
     bench_spin_queue();
     bench_synchronized_queue();
+
+    if (markdown)
+        std::printf("\n### thread pools - %lldk trivial tasks, submit + wait_idle, best of %d\n\n"
+                    "| Pool | Throughput | Per task |\n|---|---|---|\n",
+                    static_cast<long long>(pool_tasks / 1000), repeats);
+    else
+        std::printf("\nthread pools - %lld trivial tasks, submit + wait_idle:\n", pool_tasks);
+    bench_thread_pools();
+
+    if (markdown)
+        std::printf("\n### fork-join - %lldk tasks spawned from inside workers, best of %d\n\n"
+                    "| Pool | Throughput | Per task |\n|---|---|---|\n",
+                    static_cast<long long>(fj_total / 1000), repeats);
+    else
+        std::printf("\nfork-join - %lld tasks spawned from inside workers:\n", fj_total);
+    bench_forkjoin();
 
     if (!markdown)
         std::printf("\n(sink=%lld)\n", static_cast<long long>(sink));
