@@ -14,6 +14,38 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 
 One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rule: every type keeps the **integrity of its state** across a move — a move happens on a quiescent object or fails loudly — which hands classes composed from these types the [rule of zero](https://en.cppreference.com/cpp/language/rule_of_three) back: write no special member functions, and the compiler generates correct moves. The overhead: composition wrappers are the same size as what they wrap (the tests `static_assert` it), the safety checks are a `try_lock` probe or a relaxed flag, and everything is header-only, C++17 and later, dependency-free, `cassert`-tested, and ThreadSanitizer-verified across the CI matrix.
 
+## Quick start
+
+Header-only, zero dependencies, C++17 or later — **nothing to build**. Drop the headers on your include path (or use CMake [FetchContent / `find_package`](#cmake)), then include the umbrella — or just the one header you need:
+
+```cpp
+#include "ts_moveables.hpp"        // everything, or e.g. #include "moveable_mutex.hpp"
+```
+
+The whole point, in five lines — a concurrent class that just *moves*:
+
+```cpp
+struct Account {
+    snicholls::moveable_mutex<>           m;          // a plain std::mutex here would delete Account's move
+    snicholls::moveable_atomic<long long> balance{0};
+};
+std::vector<Account> accounts;                         // grows and reallocates fine — moves are compiler-generated
+```
+
+No special member functions to write; the rule of zero is back. **Now reach for:**
+
+| You want to… | Use |
+|---|---|
+| make a class holding a mutex / atomic / cv / … **moveable** | the [moveable primitive](#the-types) — `moveable_mutex`, `moveable_atomic`, `moveable_semaphore`, `moveable_latch`, … |
+| touch a value **only under its lock** | [`synchronized<T>`](#synchronizedt) (+ heterogeneous `variant` / `tuple` / `any` / type-map / bag) |
+| **hand off between two threads**, lock-free | [`circular_buffer<T>`](#circular_buffer) — reach for `push_n`/`pop_n` when you need throughput |
+| **broadcast an event** to many typed listeners | [`moveable_signal`](#moveable_signal) |
+| a **pipeline** with consumer dependency graphs | [`disruptor<T>`](#disruptor) |
+| **run tasks on a pool** | [`task_pool`](#thread_pool) — `work_stealing_` for fork-join, `mpmc_` for general submit, `dispatch_` for a single feed |
+| the **fastest possible raw single-op queue** | honestly? [moodycamel](#which-should-you-use). We tell you when *not* to pick us. |
+
+Build and test locally: `make test` (or `cmake -B build && ctest --test-dir build --output-on-failure`). Pick the standard with `make test STD=c++17`. That's it.
+
 ## Why this library?
 
 One line of code silently deletes your class's move and copy operations:
@@ -174,9 +206,9 @@ ring.try_push(msg);                    auto m = ring.try_pop();          // opti
 ring.push_n(first, n);                 ring.pop_n(out_iterator, max);    // batched - amortises the atomic traffic
 ```
 
-`try_push`/`try_pop` are wait-free. `size()`/`empty()`/`full()` are safe from any thread, as snapshots. Moves transfer the queued elements in order and leave the source empty but fully usable, capacity intact; copies are snapshots. The quiescent check here is honest best-effort — a lock-free ring has no lock to probe, so each side raises a flag and move/copy throws `std::runtime_error` if a push or pop is literally in flight.
+`try_push`/`try_pop` are wait-free. `size()`/`empty()`/`full()` are safe from any thread, as snapshots. Moves transfer the queued elements in order and leave the source empty but fully usable, capacity intact; copies are snapshots.
 
-That check is the ring's only per-op overhead, and it's a compile-time choice: `circular_buffer<T, N, Checked>` defaults to `Checked = true`, or takes `Checked = false` to compile the check out on a proven hot path (safety vs performance — see the [head-to-head](#head-to-head-vs-moodycamel)).
+The quiescent move-check costs the hot path **nothing**. A lock-free ring has no lock to probe, so rather than flag every op, move/copy samples `head_`/`tail_` over a short window and throws `std::runtime_error` if either index advances — a live push or pop moves an index and is caught, while push/pop themselves maintain no activity flag and pay nothing. It is best-effort by design (it makes concurrent misuse loud, not impossible), and there is no safety-vs-speed knob to choose: one ring type, always checked, always free on the hot path.
 
 ## disruptor
 
@@ -330,21 +362,30 @@ Two honest shapes here. First, the cv-backed pools are wakeup-latency-bound (~2 
 
 To ground the claims honestly, `make bench-compare` runs the *same* harness against [moodycamel](https://github.com/cameron314/concurrentqueue)'s lock-free queues — the field's reference implementations. The headers are fetched on demand (`scripts/fetch_bench_deps.sh`, gitignored); they are **not** a library dependency. On the Intel reference machine:
 
-| Case | Implementation | Throughput | Per op |
-|---|---|---|---|
-| SPSC | `snicholls::circular_buffer` (checked) | ~30 Mops/s | ~34 ns |
-| SPSC | `snicholls::circular_buffer` (**unchecked** — perf mode) | ~36 Mops/s | ~28 ns |
-| SPSC | `moodycamel::ReaderWriterQueue` | **~450 Mops/s** | **~2.2 ns** |
-| MPMC 4×4 | `snicholls::mpmc_queue` (bounded) | ~4.2 Mops/s | ~239 ns |
-| MPMC 4×4 | `moodycamel::ConcurrentQueue` (unbounded) | **~6.8 Mops/s** | **~147 ns** |
+| Case | Implementation | Throughput (this Intel box, unpinned) |
+|---|---|---|
+| SPSC | `snicholls::circular_buffer` | ~45 Mops/s typical (spikes to ~300–480 when the two threads share cache) |
+| SPSC | `moodycamel::ReaderWriterQueue` | **~430 Mops/s** (placement-robust) |
+| MPMC 4×4 | `snicholls::mpmc_queue` (bounded) | ~3.5 Mops/s (stable) |
+| MPMC 4×4 | `moodycamel::ConcurrentQueue` (unbounded) | **~6.5 Mops/s** (stable) |
 
-**moodycamel wins — decisively on SPSC, clearly on MPMC — and that is the honest answer to "do we beat the specialists on raw single-op throughput": no.** Three things sit behind the numbers, all measured, not asserted:
+**moodycamel wins — ~9× on SPSC single-op, ~1.9× on MPMC — and that is the honest answer to "do we beat the specialists on raw single-op throughput": no.** The gap is architectural, and understanding it is worth more than the number:
 
-- **Safety vs performance is the developer's choice, at compile time.** `circular_buffer<T, N, Checked>` defaults to `Checked = true` (the quiescent-move-check). `Checked = false` compiles the check out for a proven hot path — recovering the ~6 ns/op it costs (~34 → ~28 ns). Use the default unless you've measured that you need otherwise.
-- **But the move-check was never the real gap.** Even *unchecked*, we're ~13× behind moodycamel. That gap is **architectural**: moodycamel's queues are block-based and amortise atomic traffic across ~hundreds of elements per block; our slot-based ring touches an atomic every single op. Closing that gap means *becoming* moodycamel — a fundamentally more complex queue — which is the opposite of this ring's teaching-quality, moveable, simple design.
-- **Where batching applies, we close most of the gap on our own terms.** `circular_buffer::push_n` and the disruptor's `publish_n` hit 400–1800 Mops/s (tables above) because batching amortises the same way moodycamel's blocks do — on Apple Silicon the batched disruptor's 0.5 ns/event is in moodycamel's single-op league. (Note `mpmc_queue` carries *no* move-check on its hot path — its ~1.6× gap to `ConcurrentQueue` is pure design, block-based vs per-cell CAS.)
+- **moodycamel's queues are block-based**: they touch their shared atomics roughly *once per block* (~hundreds of elements). Our ring is slot-based: it touches a shared atomic *every op*. So moodycamel's coherence traffic is ~1/512 of ours, which makes it both faster and placement-robust. Our ring's throughput swings with thread placement (~45 Mops/s on separate cores, spiking to ~300–480 when the OS happens to land producer and consumer on cache-sharing sibling threads) — moodycamel holds its number regardless. Closing that gap would mean *becoming* moodycamel — a fundamentally more complex queue — the opposite of this ring's teaching-quality design.
+- **The move-check is free, so there is no safety/performance tradeoff to expose.** It samples the indices at move time rather than flagging every op, so push/pop pay nothing for it (this is what "one ring type, always safe" buys — no knob, and ~27 % faster than the earlier flag-based ring as a bonus). The remaining gap is entirely the block-vs-slot difference above, not the check.
+- **Where batching applies, we close the gap on our own terms.** `circular_buffer::push_n` and the disruptor's `publish_n` hit 400–1800 Mops/s (tables above) because batching amortises the atomic traffic the same way moodycamel's blocks do — and *stably*, no placement drama, since each atomic op now covers 64 elements. On Apple Silicon the batched disruptor's 0.5 ns/event is squarely in moodycamel's single-op league. (`mpmc_queue`'s stable ~1.9× gap to `ConcurrentQueue` is the same story — per-cell CAS vs block-based.)
 
-So the positioning the [non-goals](FUTURE_DIRECTIONS.md) always stated holds, now with receipts: we do **not** compete with the specialist lock-free queues on raw single-op throughput, and don't claim to. We offer what they don't — moveability (with a safety/performance switch), the quiescent contract, a bounded option, and a toolkit that composes — at throughput that is more than enough for the overwhelming majority of concurrent code, and genuinely fast in batch. Run `make bench-compare` and see for yourself; the comparison is reproducible, not curated.
+So the positioning the [non-goals](FUTURE_DIRECTIONS.md) always stated holds: we do **not** compete with the specialist lock-free queues on raw single-op throughput, and don't claim to. We offer what they don't — moveability, the quiescent contract, a bounded option, and a toolkit that composes — at throughput that is more than enough for the overwhelming majority of concurrent code, and genuinely fast in batch. Run `make bench-compare` yourself; the single-op numbers move run to run with placement, so understanding *why* beats any single row.
+
+### Which should you use?
+
+A fair decision guide — this is not a "we're best" pitch:
+
+- **Reach for [moodycamel](https://github.com/cameron314/concurrentqueue) (or Boost.Lockfree, or TBB)** when a *single queue on a hot path* is your measured bottleneck and you need tens-to-hundreds of millions of single-item enqueue/dequeue per second. They are specialist, battle-hardened, and faster than us there by design (~9× SPSC, ~1.9× MPMC). If that is your problem, use them — our own non-goals say so.
+- **Reach for this library's `circular_buffer` / `mpmc_queue`** when you want any of: the queue to be a **member of a moveable object** (moodycamel's are immovable — this is the gap nobody else fills); a **bounded, header-only, dependency-free, C++17** queue with a loud misuse check that costs the hot path nothing; or one coherent, composable toolkit alongside the disruptor, pools, and signal. Their single-op throughput (~tens of millions/s) is not the bottleneck in almost any real system.
+- **Reach for the batch APIs** — `push_n`/`pop_n`, the disruptor's `publish_n` — when you *do* need high throughput from this library. Batching amortises the per-op atomic and lands at 400–1800 Mops/s, competitive with moodycamel and placement-stable. This is the right tool for streaming and market-data fan-out.
+
+**Realistic use cases for our queues:** inter-thread messaging, event pipelines, task dispatch, market-data fan-out, journal/replay — anywhere millions of items/second is plenty (i.e. nearly everywhere), and where moveability, boundedness, or the toolkit matter. **Not a realistic expectation:** beating the specialist queues on a raw single-op microbenchmark. We lose that by ~9×, on purpose, and no flag or trick in this library changes it — if that microbenchmark is genuinely your production bottleneck, use the specialist. The library's value is *moveable concurrent objects and a toolkit that composes*, delivered at throughput that suffices for the vast majority of real code — not a new lock-free speed record.
 
 `make demo-signals` — the typed signal/slot architecture, 5M emissions per scenario:
 

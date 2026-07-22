@@ -75,6 +75,18 @@ jobs:
             ./build/taskflow_style_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Head-to-head vs moodycamel. Best-effort: fetches third-party headers on
+      # demand, so a network hiccup must never gate the build.
+      - name: Head-to-head vs moodycamel (informational)
+        continue-on-error: true
+        run: |
+          make build/bench_compare CXX=${{ matrix.cxx }}
+          {
+            echo "## Head-to-head vs moodycamel - ${{ matrix.name }}"
+            echo ""
+            ./build/bench_compare --markdown --compare-only
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: ThreadSanitizer
         if: ${{ matrix.tsan }}
         run: make tsan CXX=${{ matrix.cxx }} STD=c++20

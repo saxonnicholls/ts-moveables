@@ -310,36 +310,6 @@ void test_ring_static_capacity()
     pass("circular buffer compile-time capacity");
 }
 
-void test_ring_unchecked()
-{
-    // Checked=false: the move-check is compiled out (safety traded for the last
-    // few ns/op). Same behaviour otherwise; moves are the caller's contract.
-    circular_buffer<int, 0, false> ring{8};
-    for (int i = 0; i < 8; ++i)
-        assert(ring.try_push(i));
-    assert(ring.full());
-    int out = 0;
-    for (int i = 0; i < 8; ++i) {
-        assert(ring.try_pop(out));
-        assert(out == i);
-    }
-
-    // Still moveable (just unchecked) - contents transfer, source left empty
-    circular_buffer<int, 0, false> a{8};
-    a.try_push(1);
-    a.try_push(2);
-    circular_buffer<int, 0, false> b(std::move(a));
-    assert(b.size() == 2 && a.empty());
-    assert(*b.try_pop() == 1);
-
-    // Compile-time-capacity, unchecked
-    circular_buffer<int, 4, false> fixed;
-    assert(fixed.try_push(7));
-    assert(*fixed.try_pop() == 7);
-
-    pass("circular buffer unchecked mode (performance switch)");
-}
-
 } // namespace
 
 void run_circular_buffer_tests()
@@ -352,5 +322,4 @@ void run_circular_buffer_tests()
     test_ring_spsc_threaded_batch();
     test_ring_move_copy();
     test_ring_static_capacity();
-    test_ring_unchecked();
 }

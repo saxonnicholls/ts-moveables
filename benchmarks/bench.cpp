@@ -436,6 +436,21 @@ void report_compare(const char* category, const char* impl, double seconds, std:
         std::printf("  %-9s %-42s %8.1f Mops/s %8.1f ns/op\n", category, impl, mops, ns);
 }
 
+// Keeps the head-to-head honest wherever it is read (including the CI summary):
+// single-op numbers move with thread placement, and moodycamel's block-based
+// design wins single-op by design. See the README "head-to-head" section.
+void compare_note()
+{
+    if (markdown)
+        std::printf("\n> _Single-op SPSC is placement-sensitive (swings severalfold run to run); "
+                    "MPMC and the batched paths are stable. moodycamel wins single-op by design "
+                    "(block-based vs our slot/per-cell atomics). We match it in batch and offer "
+                    "moveability it does not. Full context in the README._\n");
+    else
+        std::printf("  (note: single-op SPSC is placement-sensitive; moodycamel wins single-op "
+                    "by design; we match in batch and add moveability - see README)\n");
+}
+
 void bench_compare_spsc()
 {
     // Ours: bounded SPSC ring
@@ -454,26 +469,7 @@ void bench_compare_spsc()
             producer.join();
             sink = sum;
         });
-        report_compare("SPSC", "snicholls::circular_buffer (checked)", s, total_items);
-    }
-    // Ours in performance mode: move-check compiled out - the fair fight against
-    // an immovable specialist queue
-    {
-        const double s = best_seconds([] {
-            circular_buffer<std::int64_t, 0, false> ring{1024};
-            std::thread producer([&] {
-                for (std::int64_t i = 0; i < total_items;)
-                    if (ring.try_push(i)) ++i;
-            });
-            std::int64_t sum = 0;
-            for (std::int64_t got = 0; got < total_items;) {
-                std::int64_t v;
-                if (ring.try_pop(v)) { sum += v; ++got; }
-            }
-            producer.join();
-            sink = sum;
-        });
-        report_compare("SPSC", "snicholls::circular_buffer (unchecked)", s, total_items);
+        report_compare("SPSC", "snicholls::circular_buffer", s, total_items);
     }
     // moodycamel: ReaderWriterQueue with try_enqueue (bounded, no growth)
     {
@@ -574,9 +570,28 @@ void bench_compare_mpmc()
 
 int main(int argc, char** argv)
 {
-    for (int i = 1; i < argc; ++i)
+    bool compare_only = false;
+    for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--markdown") == 0)
             markdown = true;
+        else if (std::strcmp(argv[i], "--compare-only") == 0)
+            compare_only = true;
+    }
+
+#if defined(TS_BENCH_COMPARE)
+    if (compare_only) {
+        if (markdown)
+            std::printf("| Case | Implementation | Throughput | Per op |\n|---|---|---|---|\n");
+        else
+            std::printf("head-to-head vs moodycamel (same harness):\n");
+        bench_compare_spsc();
+        bench_compare_mpmc();
+        compare_note();
+        return 0;
+    }
+#else
+    (void)compare_only;
+#endif
 
     if (markdown) {
         std::printf("### `make bench` - SPSC, %lldM items, 1 producer + 1 consumer thread, best of %d\n\n",
@@ -621,6 +636,7 @@ int main(int argc, char** argv)
         std::printf("\nhead-to-head vs moodycamel (same harness):\n");
     bench_compare_spsc();
     bench_compare_mpmc();
+    compare_note();
 #endif
 
     if (!markdown)

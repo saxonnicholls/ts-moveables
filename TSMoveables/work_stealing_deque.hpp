@@ -71,11 +71,16 @@ namespace snicholls
             const std::int64_t t = top_.load(std::memory_order_acquire);
             if (b - t >= static_cast<std::int64_t>(mask_ + 1))
                 return false;                   // full
-            slots_[static_cast<std::size_t>(b) & mask_].store(x, std::memory_order_relaxed);
-            // Release: the element pointer is visible before bottom advances,
-            // pairing with the seq_cst fence in steal()
-            std::atomic_thread_fence(std::memory_order_release);
-            bottom_.store(b + 1, std::memory_order_relaxed);
+            // Publish the element with release on the slot AND on bottom,
+            // rather than a standalone release fence. ThreadSanitizer does not
+            // model std::atomic_thread_fence (GCC even warns -Wtsan), so a
+            // fence-based handoff makes it false-positive on the element a
+            // producer wrote and a thief later runs. Release/acquire on the
+            // actual atomics carries the identical happens-before and TSan
+            // understands it - and a release fence before a relaxed store is,
+            // by the memory model, exactly a release store.
+            slots_[static_cast<std::size_t>(b) & mask_].store(x, std::memory_order_release);
+            bottom_.store(b + 1, std::memory_order_release);
             return true;
         }
 
@@ -112,7 +117,10 @@ namespace snicholls
             std::atomic_thread_fence(std::memory_order_seq_cst);
             const std::int64_t b = bottom_.load(std::memory_order_acquire);
             if (t < b) {
-                T* x = slots_[static_cast<std::size_t>(t) & mask_].load(std::memory_order_relaxed);
+                // Acquire pairs with push()'s release on the slot, so the
+                // element the producer built happens-before we return and run
+                // it (the synchronisation TSan can actually see).
+                T* x = slots_[static_cast<std::size_t>(t) & mask_].load(std::memory_order_acquire);
                 if (!top_.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst,
                                                   std::memory_order_relaxed)) {
                     lost = true;
