@@ -322,7 +322,7 @@ void bench_thread_pools()
     }
     // std::async yardstick - launches a thread per task, so a tiny count only
     {
-        constexpr std::int64_t async_tasks = 20'000;
+        static constexpr std::int64_t async_tasks = 20'000;    // static: not captured (MSVC C3493)
         const double s = best_seconds([] {
             std::atomic<std::int64_t> acc{0};
             std::vector<std::future<void>> futs;

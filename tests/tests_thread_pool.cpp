@@ -106,8 +106,10 @@ void test_work_stealing_forkjoin()
     // Exercises local push + injector + stealing paths together.
     work_stealing_task_pool pool{4};
     std::atomic<long long> leaves{0};
-    constexpr int spreaders = 8;
-    constexpr int per_spreader = 5000;
+    // static: read inside lambdas, so not captured (MSVC C3493) yet still a
+    // constant expression there
+    static constexpr int spreaders = 8;
+    static constexpr int per_spreader = 5000;
 
     for (int s = 0; s < spreaders; ++s)
         pool.submit([&pool, &leaves] {
@@ -121,8 +123,8 @@ void test_work_stealing_forkjoin()
     // combined through atomics. Deep local-deque nesting plus stealing.
     work_stealing_task_pool pool2{4};
     std::atomic<long long> total{0};
-    constexpr int n = 100000;
-    constexpr int chunk = 500;
+    static constexpr int n = 100000;
+    static constexpr int chunk = 500;
     for (int start = 0; start < n; start += chunk)
         pool2.submit([&total, start] {
             long long partial = 0;
