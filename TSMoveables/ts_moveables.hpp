@@ -25,6 +25,7 @@
 #include "disruptor.hpp"                    // IWYU pragma: export
 #include "moveable_signal.hpp"              // IWYU pragma: export
 #include "thread_pool.hpp"                  // IWYU pragma: export
+#include "event_loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 #include "synchronized.hpp"                 // IWYU pragma: export
 #include "synchronized_heterogeneous.hpp"   // IWYU pragma: export
 

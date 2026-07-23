@@ -28,6 +28,7 @@ void run_disruptor_tests();
 void run_signal_tests();
 void run_mpmc_queue_tests();
 void run_thread_pool_tests();
+void run_event_loop_tests();
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -852,6 +853,7 @@ int main()
     run_signal_tests();
     run_mpmc_queue_tests();
     run_thread_pool_tests();
+    run_event_loop_tests();
 
     test_once_flag();
 

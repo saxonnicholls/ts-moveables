@@ -56,7 +56,8 @@ if(TS_MOVEABLES_BUILD_TESTS)
         tests/tests_disruptor.cpp
         tests/tests_signal.cpp
         tests/tests_mpmc_queue.cpp
-        tests/tests_thread_pool.cpp)
+        tests/tests_thread_pool.cpp
+        tests/tests_event_loop.cpp)
     target_link_libraries(ts_moveables_tests PRIVATE snicholls::ts_moveables)
     add_test(NAME unit_tests COMMAND ts_moveables_tests)
 

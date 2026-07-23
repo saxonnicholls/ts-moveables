@@ -23,6 +23,9 @@ graph TD
     P --> Q[bounded mpmc_queue]
     Q --> WS[work-stealing pool]
     TP -.-> WS
+    G --> EL[event_loop]
+    Q --> EL
+    TP -.-> EL
 ```
 
 ---
@@ -177,6 +180,42 @@ The blocker is structural and worth stating precisely: our `circular_buffer` is 
 
 ---
 
+## 7. `event_loop` — a clean, typed, honest reactor
+
+**What.** A small readiness-based (reactor) event loop whose dispatch layer is `moveable_signal`, whose handles are moveable RAII objects, and whose internals are this library's own components. Most event loops are pattern soup — reactor and proactor mixed ad hoc, raw callbacks with manual lifetimes, portability bolted on per OS. There is a real gap for a *small, typed, portable-core* loop with lifetimes that are safe by construction.
+
+```cpp
+snicholls::event_loop loop;
+auto w = loop.watch(fd, fd_interest::read);
+auto c = w.on_readable().connect([&] { /* typed, ordered, lifetime-safe */ });
+auto t = loop.every(10ms);                    // t.on_fire() is a signal too
+loop.post([] { /* from any thread */ });      // mpmc_queue + self-pipe wakeup
+loop.run();
+```
+
+**The edge — why this library specifically:**
+
+- **Dispatch is `moveable_signal`.** fd readable / timer fired / task posted all flow through typed signal emission: weak-ptr lifetime tracking (no use-after-free when a handler's object dies), guaranteed connection order, reentrancy already proven (handlers may add/remove watches mid-dispatch — snapshot semantics), RAII teardown. This kills the #1 event-loop bug class *structurally*.
+- **Moveable handles — our signature, applied where nobody has it.** libuv handles are pinned; Asio objects are entangled with their `io_context`. An `fd_watch` or `timer` that is a moveable member of a session object — rule of zero, lives in a `std::vector` — is exactly this library's story.
+- **A replayable loop.** Because everything dispatches through signals, a journal tap (`on_dispatch`) can record the lot, and replay is re-emission into the same handler graph — the capture/replay discipline already proven bit-exact in the demos. A deterministic, replayable event loop is something essentially no mainstream loop offers.
+- **The economics finally favour elegance.** `epoll_wait`/`read` syscalls cost ~1 µs+; typed-signal dispatch costs tens of ns — measurably negligible here, unlike the queue head-to-head. The clean abstraction is free at this altitude, and the bench will show it.
+
+**Prior art, honestly.** Asio is the powerful everything-machine (and famously baroque: io_context, strands, work guards, executors); libuv/libevent/libev are C with baton-passing lifetimes; Qt's loop is welded to QObject; glib is C; C++26 got `std::execution` but standard IO integration did not land. None offers typed lifetime-safe dispatch or moveable handles. We complement Asio, not replace it — and say so.
+
+**The hard part, refused up front: Windows.** IOCP is a *proactor* — completion-based, structurally different — and bridging the two models is precisely why Asio is complicated. We do not sign up for that swamp: phase 1 is POSIX (epoll / kqueue / `poll()` fallback); the header self-disables on Windows; phase 2 may add a sockets-only `WSAPoll` backend. For IOCP-grade Windows IO, use Asio — stated plainly, same honesty as the moodycamel section.
+
+**Shape.**
+
+- **Phase 1 — POSIX reactor:** a tiny `poller` backend (epoll on Linux, kqueue on macOS/BSD, `poll()` fallback, forceable via macro); `event_loop` with a heap-stable core (the handle moves freely, disruptor-style); `fd_watch` with `on_readable`/`on_writable`/`on_error` signals; one-shot and periodic timers (min-heap, loop-thread-owned, no locks); `post()` from any thread (`mpmc_queue` + non-blocking self-pipe wakeup); `run` / `run_once` / `stop`; the `on_dispatch` journal tap. **Threading contract, named honestly:** one thread runs the loop; watches and timers are created on the loop thread (or before `run`); violations throw `std::logic_error`; cross-thread `post` is the one door in; cross-thread watch destruction marshals itself through `post`. Level-triggered semantics throughout.
+- **Phase 2 — comfort:** POSIX signals (signalfd / kqueue `EVFILT_SIGNAL`) as signal emissions; Windows sockets-only `WSAPoll` backend; a backpressure-aware write helper.
+- **Non-goals:** no proactor/IOCP, no SSL or protocol stacks, no filesystem watching, no general async model — Asio exists.
+
+**Bar to clear.** TSan-green across the matrix; a self-verifying **replayable-loop demo** (journal a scripted session over socketpairs, replay into a fresh handler graph, assert identical output hashes); a bench row measuring dispatch overhead against a raw epoll/kqueue loop, publishing the "syscall dominates, elegance is free" number honestly.
+
+**Effort.** Large-ish but bounded: the poller backends are ~50 lines each; the loop core is the careful part; the tests and the replay demo are where the honesty lives.
+
+---
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:
@@ -196,4 +235,5 @@ Written down so nobody — including us — spends a busy week on them:
 | 4 | Disruptor phase 1 | Large | **Shipped** |
 | 5 | `thread_pool` interface + mutex / sharded / dispatch impls | Medium | **Shipped** |
 | 6 | `mpmc_queue` + work-stealing pool | Large ×2 | **Shipped** |
-| 7 | Disruptor phase 2 (multi-producer) | Large | Only after phase 1 has miles on it |
+| 7 | `event_loop` phase 1 (POSIX reactor, replayable) | Large | **In progress** |
+| 8 | Disruptor phase 2 (multi-producer) | Large | Only after phase 1 has miles on it |

@@ -49,4 +49,15 @@ bool throws_runtime_error(F&& f)
     return false;
 }
 
+template <typename F>
+bool throws_logic(F&& f)
+{
+    try {
+        f();
+    } catch (const std::logic_error&) {
+        return true;
+    }
+    return false;
+}
+
 #endif /* ts_moveables_test_helpers_hpp */
