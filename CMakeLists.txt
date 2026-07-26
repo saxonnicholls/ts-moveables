@@ -58,7 +58,9 @@ if(TS_MOVEABLES_BUILD_TESTS)
         tests/tests_mpmc_queue.cpp
         tests/tests_thread_pool.cpp
         tests/tests_event_loop.cpp
-        tests/tests_http_server.cpp)
+        tests/tests_http_server.cpp
+        tests/tests_websocket.cpp
+        tests/tests_ws_deflate.cpp)
     target_link_libraries(ts_moveables_tests PRIVATE snicholls::ts_moveables)
     add_test(NAME unit_tests COMMAND ts_moveables_tests)
 

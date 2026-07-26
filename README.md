@@ -11,7 +11,9 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[`disruptor`](#disruptor)** — the LMAX pattern: pre-allocated events, consumer dependency graphs, batch consumption; ~1 ns/event batched
 - **[`moveable_signal`](#moveable_signal)** — thread-safe signal/slot whose connections survive moves, with no lock held while slots run
 - **[`event_loop`](#event_loop)** — a clean, typed POSIX reactor (epoll / kqueue) whose dispatch is signals: handler lifetimes safe by construction, moveable watches and timers, replayable by design
-- **[`http_server`](#http_server)** — a non-blocking HTTP/1.1 server on that reactor, with runtime delegates instead of `#ifdef`s and handlers that can answer *later*: 10,000 concurrent connections on one thread, available as a single drop-in header
+- **[`time_master`](#time_master)** — the legendary periodic scheduler, rebuilt on the loop: drift-free *and* burst-free timers, events added and cancelled from any thread while running, and the whole scheduler is a moveable value
+- **[`websocket`](#websocket)** — RFC 6455 as a protocol delegate swapped onto a live connection: **all 517 Autobahn cases clean, including permessage-deflate**, and `wss` for free
+- **[`http_server`](#http_server)** — a non-blocking HTTP/1.1 server (plus [WebSocket](#websocket) and TLS) on that reactor, with runtime delegates instead of `#ifdef`s and handlers that can answer *later*: 10,000 concurrent connections on one thread, available as a single drop-in header
 - **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs
 
 One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rule: every type keeps the **integrity of its state** across a move — a move happens on a quiescent object or fails loudly — which hands classes composed from these types the [rule of zero](https://en.cppreference.com/cpp/language/rule_of_three) back: write no special member functions, and the compiler generates correct moves. The overhead: composition wrappers are the same size as what they wrap (the tests `static_assert` it), the safety checks are a `try_lock` probe or a relaxed flag, and everything is header-only, C++17 and later, dependency-free, `cassert`-tested, and ThreadSanitizer-verified across the CI matrix.
@@ -46,6 +48,8 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | **run tasks on a pool** | [`task_pool`](#thread_pool) — `work_stealing_` for fork-join, `mpmc_` for general submit, `dispatch_` for a single feed |
 | an **event loop** for fds and timers without the usual scars | [`event_loop`](#event_loop) — POSIX reactor, typed dispatch, loud contracts |
 | an **HTTP server** that does not park a thread per connection | [`http_server`](#http_server) — routes, async responders, or one drop-in header |
+| **WebSockets**, or `wss` | [`websocket`](#websocket) — Autobahn-clean, one route handler |
+| to **run closures on a schedule** | [`time_master`](#time_master) — periodic and one-shot, cancellable, moveable |
 | the **fastest possible raw single-op queue** | honestly? [moodycamel](#which-should-you-use). We tell you when *not* to pick us. |
 
 Build and test locally: `make test` (or `cmake -B build && ctest --test-dir build --output-on-failure`). Pick the standard with `make test STD=c++17`. That's it.
@@ -498,6 +502,69 @@ The economics are why elegance is affordable here: an `epoll_wait` or `read` sys
 
 Phase 1 is POSIX-only and says so: on Windows the header self-disables (`SNICHOLLS_HAS_EVENT_LOOP` is 0) rather than shipping a pretend port — IOCP is a *proactor*, a structurally different model, and bridging the two badly is precisely how loops get baroque. For IOCP-grade Windows IO, use Asio; that's the same honesty as the moodycamel section. The remaining phases are in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md).
 
+## time_master
+
+The legendary TimeMaster — a workhorse through decades of trading — rebuilt on the [event loop](#event_loop). Register closures at intervals, call `run()`, and the right things happen at the right times:
+
+```cpp
+snicholls::time_master tm;
+tm.add_event(1000ms, [] { heartbeat(); });          // periodic
+tm.add_once(5s,      [] { warm_up_done(); });       // one-shot
+const auto id = tm.add_event(50ms, [] { poll(); });
+tm.cancel(id);                                      // from any thread, while running
+tm.run();                                           // stop() from anywhere
+```
+
+Its Boost.Asio ancestor carried the scars of its era, and each one is now closed by construction rather than by hope:
+
+- **The scheduler is a value.** Heap-stable core, so a fully wired `time_master` can be built in a factory, parked in a `std::vector`, and moved into an engine. `io_context` is immovable, so the original was welded to wherever it was constructed.
+- **No raw `this` in a handler.** Events are signal slots with RAII connections; cancelling one cannot leave a dangling callback behind.
+- **Drift-free *and* burst-free.** Periodic events reschedule from the previous deadline so they never drift — but clamp to now after a stall, so waking a laptop from sleep produces one tick rather than four hundred queued catch-up ticks. The original's `expires_at() + interval` was drift-free and burst-prone; the demo asserts both properties rather than claiming them.
+- **Open while running.** Events are added and cancelled from any thread mid-run, marshalled through the loop's `post()`. The original's add-then-run was a fixed menu, and it could only stop the world.
+- **Teardown is immediate** — measured at ~0.06 ms. The original's destructor called `io.stop()` and then slept for a hard-coded second, hoping the loop had noticed.
+
+`make demo-timemaster` runs the original's own test at 1/100th the intervals and verifies every claim above.
+
+## websocket
+
+RFC 6455, as a **protocol delegate swapped onto a live connection**. A WebSocket *is* an HTTP connection that changed protocol mid-flight, so that is exactly what happens — `responder::upgrade()` hands the socket over and a `websocket_protocol` owns every byte after. Nothing in the server had to learn what a WebSocket is:
+
+```cpp
+srv.get("/chat", snicholls::http::websocket_route([](auto ws) {
+    auto c = ws.on_message().connect([ws = ws.share()](const auto& m) {
+        ws.send_text("echo: " + m.data);
+    });
+    ws.keep(std::move(c));
+}));
+```
+
+**Graded by [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite), the external RFC 6455 conformance suite — `make autobahn`:**
+
+| Result | Cases |
+|---|---|
+| OK | 510 |
+| NON-STRICT (accepted) | 4 |
+| INFORMATIONAL | 3 |
+| UNIMPLEMENTED | 0 |
+| **FAILED** | **0** |
+| **Total** | **517** |
+
+That is the whole suite, including groups 12 and 13 — `permessage-deflate` compression, all 216 cases. The 4 NON-STRICT are UTF-8 cases where we validate the *assembled* message rather than closing mid-fragment the instant a bad byte appears; Autobahn accepts both, and validating the whole message is what makes multi-byte sequences split across frames come out right.
+
+Finding the bugs took the suite doing its job. It caught that we echoed back *invalid* close codes (1004, 1005, 1006, 2000 …) instead of rejecting them with 1002 — precisely the class of defect a hand-written suite cannot find, because the tests and the implementation share the author's assumption.
+
+**Compression is a third delegate axis** ([`websocket_deflate.hpp`](TSMoveables/websocket_deflate.hpp), opt-in, needs zlib). Transport decides how bytes arrive, protocol decides what they mean, and an extension transforms the message payload — and it needed no new machinery, because RFC 7692 is a byte transformer with negotiated state, the same shape as the TLS engine:
+
+```cpp
+snicholls::http::ws_config ws;
+ws.extension_factory = snicholls::http::deflate_factory();   // per connection
+srv.get("/chat", snicholls::http::websocket_route(on_open, ws));
+```
+
+Context takeover, both `no_context_takeover` flags and both window-bits parameters are negotiated per connection. A `server_max_window_bits` of 8 is **declined** rather than silently widened to 9 — zlib cannot do a raw 8-bit window, and claiming 8 while using 9 would be an interop lie. There is a decompression-bomb cap, because a few compressed bytes can expand without limit.
+
+And because transport and protocol are separate axes, **`wss://` needed no code at all** — it is this over the [TLS transport](#https-tls), and the two never meet. That is asserted by a test, not assumed.
+
 ## http_server
 
 The reactor's first real customer, and the component that composes everything else in the library. Phase 1 is a **non-blocking HTTP/1.1 server**: routes, keep-alive, chunked bodies, `Expect: 100-continue`, backpressure, timeouts — with the ergonomics of [cpp-httplib](https://github.com/yhirose/cpp-httplib), which set the standard for "drop in one header and it works".
@@ -551,21 +618,41 @@ Honest framing on those numbers: the load generator shares the machine with the 
 
 ### Head-to-head vs cpp-httplib
 
-`make bench-http` runs the **same load generator** against both servers, one at a time, in one binary, on the same machine. httplib is measured twice — exactly as it ships, and tuned with a 1024-thread pool and raised keep-alive limits, which is the best case its design allows. Its listen backlog is raised to match ours, because losing on a backlog constant would say nothing about the design. 32 hardware threads, figures stable within a few percent across runs:
+`make bench-http` runs the **same load generator** against both servers, one at a time, in one binary. httplib is measured twice — as it ships, and tuned with a 1024-thread pool and raised keep-alive limits, which is the best case its design allows. Its listen backlog is raised to match ours, because losing on a backlog constant would say nothing about the design.
 
-| Scenario | ts-moveables (**1 thread**) | cpp-httplib (as shipped) | cpp-httplib (tuned, 1024 threads) |
+**The headline is not "we are faster". It is that the two designs fail in different places, and the throughput answer flips depending on the platform.**
+
+Linux, 4-core CI runner, GCC:
+
+| Scenario | ts-moveables (1 thread) | httplib (as shipped) | httplib (tuned) |
+|---|---|---|---|
+| keep-alive, 16 connections | 64,853 req/s | **95,101 req/s** | **102,161 req/s** |
+| keep-alive, 256 connections | 63,421 req/s | **94,073 req/s** | **94,591 req/s** |
+| 1 KiB payloads | 62,693 req/s | **92,865 req/s** | **100,083 req/s** |
+| 1,000 held open | **all 1,000 in 14 ms** | 32 of 1,000, rest unserved at 20 s | all 1,000 in 25 ms |
+| 10,000 held open | **all 10,000 in 156 ms** | 32 of 10,000, rest unserved at 20 s | 3,391 of 10,000, rest unserved at 20 s |
+
+macOS, 32-core laptop, Apple Clang:
+
+| Scenario | ts-moveables (1 thread) | httplib (as shipped) | httplib (tuned) |
 |---|---|---|---|
 | keep-alive, 16 connections | **~98,000 req/s** | ~8,100 req/s | ~8,600 req/s |
 | keep-alive, 256 connections | **~98,000 req/s** | ~6,500 req/s | ~6,500 req/s |
-| 1 KiB payloads, 16 connections | **~94,000 req/s** | ~9,000 req/s | ~8,800 req/s |
-| 1,000 connections held open | **all 1,000 served in 11 ms** | 496 of 1,000, rest unserved at 20 s | 286 of 1,000, rest unserved at 20 s |
-| 10,000 connections held open | **all 10,000 served in 177 ms** | 124 of 10,000, rest unserved at 20 s | only 1,417 could even *connect* in 20 s; 245 served |
+| 1 KiB payloads | **~94,000 req/s** | ~9,000 req/s | ~8,800 req/s |
+| 1,000 held open | **all 1,000 in 11 ms** | 496 of 1,000 | 286 of 1,000 |
+| 10,000 held open | **all 10,000 in 177 ms** | 124 of 10,000 | only 1,417 could *connect* in 20 s |
 
-Roughly **10–15× on throughput and a different category entirely on concurrency** — and the concurrency rows are the ones that matter, because they are structural rather than incidental. A blocking server pins a thread for the lifetime of a keep-alive connection, so the number of connections it can *hold* is the number of threads it has; adding threads moves the wall without removing it, and past a point makes throughput worse (note the tuned column losing to the default one). A reactor holds connections in a hash map. That is not a tuning difference, and no amount of tuning closes it.
+Read those together, because either one alone would mislead you:
 
-**What this does not say, stated plainly.** httplib is a mature, feature-rich library and this is a phase-1 server: it does *less per request* — no compression negotiation, no multipart, no range requests, no static-file serving, no regex routing — and some of that gap is surely feature cost rather than architecture. It is also loopback on a single box with the load generator competing for the same cores, and it is one machine, one OS, one compiler. The throughput multiple is the number to treat with suspicion; the concurrency behaviour is the number to believe, because it follows directly from thread-per-connection and reproduces exactly as theory predicts. Run it yourself: `make bench-http` fetches httplib on demand — nothing third-party is committed here, and the library stays dependency-free.
+- **On raw throughput at low concurrency, httplib beats us on Linux by about 1.5×.** That is a real result and we are not going to dress it up. It is also the expected one: a reactor pays a `epoll_wait` syscall and an extra wakeup hop per readiness event, while a blocking thread parked in `read()` is woken directly by the kernel with the data already there. When connections are few and threads are cheap, blocking I/O is genuinely the faster path. This is exactly the "low-concurrency run where their blocking pool is at its best" the plan said to measure, and it came out the way the plan feared rather than the way we hoped.
+- **On concurrency, the gap is categorical on both platforms.** 10,000 held-open connections: 156 ms for us on Linux, versus 32 served by httplib as shipped and 3,391 by httplib with a thousand threads. That is not a tuning difference. A blocking server pins a thread per live keep-alive connection, so the connections it can hold is the threads it has, and adding threads eventually costs more than it buys.
+- **The macOS httplib numbers are anomalous and we do not claim them.** httplib measures ~8–9k req/s on macOS and ~95k on Linux — a 10× platform gap in *their* numbers, with our client and our machine constant. Something in their macOS path is pathological, and until it is understood the honest position is that the macOS throughput comparison proves nothing about either design. The Linux row is the one to trust.
 
-**Next opponent: nginx.** httplib is a *different* architecture (thread-per-connection), so beating it demonstrates the architecture, not the implementation. nginx is the same architecture done extremely well — a mature multi-process reactor with years of tuning — so it is the opponent that actually grades our code rather than our design. The expectation going in is that we lose on raw throughput, and that result is worth publishing exactly as much as this one. It needs a different harness shape (an external process rather than an in-process server), which is tracked in [FUTURE_DIRECTIONS](FUTURE_DIRECTIONS.md).
+So the fair summary: **choose a reactor for connection count, not for request rate.** If you serve a few dozen busy connections, a good blocking server is at least as fast and simpler to reason about — and cpp-httplib is a good blocking server. If you need to *hold* thousands of mostly-idle connections (WebSockets, long polling, streaming, IoT fleets), the blocking model runs out of threads and this one does not notice.
+
+Two honest caveats on all of the above: our server does less per request than theirs — no compression negotiation, multipart, ranges or static files — so some of any throughput difference is feature cost rather than architecture. And every number here is loopback on a single box with the load generator competing for the same cores. A two-machine run is owed, and is tracked in [FUTURE_DIRECTIONS](FUTURE_DIRECTIONS.md).
+
+**Next opponent: nginx.** httplib is a *different* architecture, so these numbers grade the design rather than the code. nginx is the same architecture done extremely well — a mature multi-process reactor with two decades of tuning — so it is the opponent that grades our implementation. Expect to lose; the gap size is the useful number. Run it all yourself with `make bench-http`, which fetches httplib on demand: nothing third-party is committed here, and the library stays dependency-free.
 
 ### What benchmarking found
 
@@ -590,6 +677,26 @@ The plateau is the *load generator*, not the server — it lives on the same box
 A portability note worth having: `SO_REUSEPORT` load-balances accepts on **Linux**, but on macOS and the BSDs it only permits the duplicate bind — delivery still goes to one socket, so N reactors silently become 1. The benchmark reports per-reactor connection counts precisely to catch that, and did: the first run showed 31 of 32 reactors never receiving a single connection. `listen_shared()` works everywhere. (FreeBSD's balancing flag is `SO_REUSEPORT_LB`, used automatically where it exists.)
 
 **Phase 1 scope, plainly.** HTTP/1.1 only, plaintext only, POSIX only (it follows the [event loop](#event_loop); `SNICHOLLS_HAS_HTTP_SERVER` is 0 on Windows). No TLS, HTTP/2, HTTP/3 or WebSocket *yet* — all four are designed in [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md) with the interfaces already carrying the stream ids they need, and each has an external grader it must pass before it ships: h2spec, Autobahn, the QUIC interop runner.
+
+## HTTPS (TLS)
+
+The other axis. A protocol delegate turns bytes into requests; a **transport delegate** decides how those bytes arrive — and TLS is just a transport:
+
+```cpp
+#include "tls_openssl.hpp"
+
+snicholls::http::openssl_context tls;
+tls.use_certificate_file("cert.pem");
+tls.use_private_key_file("key.pem");
+tls.set_alpn({"http/1.1"});
+
+srv.transport_factory(tls.factory());       // chosen at run time, not by #ifdef
+srv.listen("0.0.0.0", 8443);
+```
+
+The engine is deliberately **transport-agnostic**: OpenSSL is driven through a pair of memory BIOs, so it never sees a socket, never calls `read()` or `write()`, and never blocks. The reactor keeps all I/O; this is a byte transformer with a handshake. Three things follow, and they are the whole argument for the shape — every backend becomes testable without a network; the `WANT_READ`/`WANT_WRITE` dance is explicit rather than buried in a blocking call, which is what makes non-blocking TLS tractable at all; and **nothing above knows TLS exists**. ALPN is negotiated and reported here too, because that is the selector a later phase uses to choose between h2 and http/1.1 per connection.
+
+This is the **one opt-in part of the library** — the only file that needs a third party. Nothing includes it unless you do, `make test-tls` builds and runs it separately, and the core keeps its no-dependencies promise. A second backend (BoringSSL, wolfSSL or mbedTLS) is owed, because one implementation behind an interface proves nothing.
 
 ## The bigger picture: the host side of accelerated systems
 

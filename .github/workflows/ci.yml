@@ -79,6 +79,19 @@ jobs:
             ./build/http_server_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Autobahn|Testsuite: the external RFC 6455 grader. Linux only, since it
+      # needs Docker with --network host to reach the echo server.
+      - name: Autobahn WebSocket conformance
+        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        run: |
+          make build/ws_echo_server CXX=${{ matrix.cxx }}
+          ./scripts/run_autobahn.sh
+
+      # TLS is the one opt-in part of the library; it links OpenSSL, so it
+      # builds and runs on its own rather than inside the dependency-free suite
+      - name: TLS tests (OpenSSL)
+        run: make test-tls CXX=${{ matrix.cxx }} STD=c++20
+
       # The single-file drop-in must build, run, and match the source headers -
       # a stale committed amalgamation is a broken promise, so fail on drift
       - name: Single-header amalgamation

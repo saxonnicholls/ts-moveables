@@ -20,8 +20,10 @@
 //    - the destructor called io.stop() and then *slept for a full second*,
 //      hoping the loop had noticed.
 //
-//  This is the same tool rebuilt on snicholls::event_loop in ~60 lines, with
-//  each scar closed by construction rather than by hope:
+//  The scheduler itself now lives in TSMoveables/time_master.hpp, so it is a
+//  component you can use rather than demo code you would have to copy. This
+//  file is what remains: proof that each of the original's scars is closed by
+//  construction rather than by hope.
 //
 //    - moveable: heap-stable core, so a fully-wired time_master is a value -
 //      built in a factory, stored in a vector, moved into an engine;
@@ -40,12 +42,13 @@
 //  runs it as an integration test on every push.
 //
 
-#include "../TSMoveables/ts_moveables.hpp"
+#include "../TSMoveables/time_master.hpp"
+#include "../TSMoveables/moveable_mutex.hpp"
 
 #include <cstdio>
 #include <cstring>
 
-#if SNICHOLLS_HAS_EVENT_LOOP
+#if SNICHOLLS_HAS_TIME_MASTER
 
 #include <atomic>
 #include <chrono>
@@ -57,87 +60,6 @@
 using namespace std::chrono_literals;
 
 namespace {
-
-// ---------------------------------------------------------------- time_master
-//
-// The whole scheduler. Events are added before run() from any thread, or
-// while running from any thread (marshalled through post onto the loop
-// thread). Each event owns its timer and its slot connection; cancelling an
-// id kills exactly that event. The core lives on the heap, so time_master
-// itself is a moveable value.
-
-class time_master {
-    struct entry {
-        std::uint64_t id{};
-        snicholls::event_loop::timer t;
-        snicholls::scoped_connection c;
-    };
-    struct core {
-        snicholls::event_loop loop;
-        std::vector<entry> entries;                 // pre-run or loop thread only
-        std::atomic<std::uint64_t> next_id{1};
-    };
-    std::shared_ptr<core> c_ = std::make_shared<core>();
-
-    template <typename F>
-    void on_loop(F&& f)
-    {
-        // While running, the loop enforces its thread contract loudly - so
-        // mutation marshals through post(); before run(), setup is direct
-        if (c_->loop.running())
-            c_->loop.post(std::forward<F>(f));
-        else
-            f();
-    }
-
-    std::uint64_t add(std::chrono::milliseconds interval, bool periodic,
-                      std::function<void()> fn)
-    {
-        const std::uint64_t id = c_->next_id.fetch_add(1, std::memory_order_relaxed);
-        auto c = c_;
-        on_loop([c, id, interval, periodic, fn = std::move(fn)]() mutable {
-            auto t = periodic ? c->loop.every(interval) : c->loop.after(interval);
-            snicholls::scoped_connection sc{t.on_fire().connect(std::move(fn))};
-            c->entries.push_back({id, std::move(t), std::move(sc)});
-        });
-        return id;
-    }
-
-public:
-    time_master() = default;
-    time_master(time_master&&) noexcept = default;
-    time_master& operator=(time_master&&) noexcept = default;
-    ~time_master()
-    {
-        if (c_)
-            c_->loop.stop();        // returns immediately; no one-second nap
-    }
-
-    std::uint64_t add_event(std::chrono::milliseconds interval, std::function<void()> fn)
-    {
-        return add(interval, true, std::move(fn));
-    }
-    std::uint64_t add_once(std::chrono::milliseconds delay, std::function<void()> fn)
-    {
-        return add(delay, false, std::move(fn));
-    }
-
-    void cancel(std::uint64_t id)
-    {
-        auto c = c_;
-        on_loop([c, id] {
-            for (auto& e : c->entries)
-                if (e.id == id) {
-                    e.t.cancel();
-                    e.c.disconnect();
-                }
-        });
-    }
-
-    void run() { c_->loop.run(); }                  // blocks; stop() from anywhere
-    void stop() { c_->loop.stop(); }
-    bool running() const noexcept { return c_->loop.running(); }
-};
 
 // --------------------------------------------------------------------- helpers
 
@@ -184,7 +106,7 @@ int main(int argc, char** argv)
     // The classic setup - six periodic closures - at 1/100th of the original
     // intervals so the whole demo runs in under a second
     {
-        time_master tm;
+        snicholls::time_master tm;
 
         std::atomic<int> f10{0}, f20{0}, f30{0}, f10b{0}, f70{0}, f110{0};
         std::vector<std::chrono::steady_clock::time_point> fires;   // loop thread only
@@ -278,14 +200,14 @@ int main(int argc, char** argv)
     {
         auto counter = std::make_shared<std::atomic<int>>(0);
         auto make_metronome = [&counter] {
-            time_master tm;
+            snicholls::time_master tm;
             tm.add_event(10ms, [counter] { counter->fetch_add(1, std::memory_order_relaxed); });
             return tm;                              // moves out, fully wired
         };
 
-        std::vector<time_master> shelf;
+        std::vector<snicholls::time_master> shelf;
         shelf.push_back(make_metronome());
-        time_master tm = std::move(shelf.back());   // and out again
+        snicholls::time_master tm = std::move(shelf.back());   // and out again
         shelf.clear();
 
         std::thread runner([&] { tm.run(); });
@@ -306,7 +228,7 @@ int main(int argc, char** argv)
     return 0;
 }
 
-#else // !SNICHOLLS_HAS_EVENT_LOOP
+#else // !SNICHOLLS_HAS_TIME_MASTER
 
 int main()
 {

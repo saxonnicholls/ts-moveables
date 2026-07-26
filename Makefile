@@ -74,6 +74,28 @@ build/http_server_demo: demos/http_server_demo.cpp $(HEADERS) | build
 test: build/tests
 	./build/tests
 
+# TLS is the one opt-in part of the library: it needs OpenSSL, so it builds
+# and runs separately and the core stays dependency-free.
+OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null || echo /usr)
+
+build/tests_tls: tests/tls/tests_tls.cpp $(HEADERS) | build
+	$(CXX) $(CXXFLAGS) -pthread -I$(OPENSSL_PREFIX)/include tests/tls/tests_tls.cpp -o $@ \
+	    -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto $(LDLIBS)
+
+test-tls: build/tests_tls
+	./build/tests_tls
+
+# Autobahn|Testsuite - the external RFC 6455 grader. The echo server is ours;
+# the fuzzing client comes from the suite (venv or Docker, see the script).
+# The echo server is built with permessage-deflate wired in (zlib), so the
+# Autobahn compression groups are graded rather than skipped
+build/ws_echo_server: tests/autobahn/ws_echo_server.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O2 -pthread -DSNICHOLLS_AUTOBAHN_DEFLATE \
+	    tests/autobahn/ws_echo_server.cpp -o $@ -lz $(LDLIBS)
+
+autobahn: build/ws_echo_server
+	./scripts/run_autobahn.sh
+
 tsan: build/tests_tsan
 	TSAN_OPTIONS="suppressions=tests/tsan.supp" ./build/tests_tsan
 
@@ -140,4 +162,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http bench-http bench-scale amalgamate check-amalgamate clean
+.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http test-tls autobahn bench-http bench-scale amalgamate check-amalgamate clean

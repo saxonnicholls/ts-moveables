@@ -2263,6 +2263,8 @@ public:
     }
 };
 
+class protocol_delegate;
+
 // What a protocol delegate is allowed to ask of its connection
 class connection_host {
 public:
@@ -2273,6 +2275,11 @@ public:
     virtual const server_config& config() const noexcept = 0;
     virtual const char* http_date() = 0;
     virtual bool live() const noexcept = 0;
+
+    // Hand this connection to a different protocol - the Upgrade path. The
+    // swap is deferred until the current delegate's consume() has returned,
+    // because a delegate cannot safely be destroyed from inside its own call.
+    virtual void switch_protocol(std::unique_ptr<protocol_delegate> next) = 0;
 };
 
 // Protocol: how bytes become requests. The stream id is always 0 for
@@ -2305,7 +2312,7 @@ public:
     {
         // One request in flight at a time: HTTP/1.1 responses must come back
         // in request order, so pipelining is serialised rather than raced
-        while (!in.empty() && !in_flight_ && !close_) {
+        while (!in.empty() && !in_flight_ && !close_ && !handed_off_) {
             std::size_t used = 0;
             const auto st = parser_.parse(in.data(), in.size(), used);
             if (used)
@@ -2346,7 +2353,9 @@ public:
         host.write_app(out.data(), out.size());
         last_bytes_ = out.size();
         in_flight_ = false;
-        if (!keep_alive_)
+        if (res.status == 101)
+            handed_off_ = true;                 // another protocol owns the bytes now
+        else if (!keep_alive_)
             close_ = true;
     }
 
@@ -2375,12 +2384,13 @@ public:
             detail::append_sanitised(out, host.config().server_name);
             out += "\r\n";
         }
-        if (!res.headers.has("content-length")) {
+        const bool switching = (res.status == 101);
+        if (!switching && !res.headers.has("content-length")) {
             out += "Content-Length: ";
             detail::append_uint(out, res.body.size());
             out += "\r\n";
         }
-        if (!res.headers.has("connection"))
+        if (!switching && !res.headers.has("connection"))
             out += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
         for (const auto& h : res.headers) {
             detail::append_sanitised(out, h.first);
@@ -2402,6 +2412,7 @@ private:
     bool keep_alive_ = true;
     bool close_ = false;
     bool sent_continue_ = false;
+    bool handed_off_ = false;
 };
 
 // ------------------------------------------------------------------- routing
@@ -2445,8 +2456,21 @@ public:
     void send(int status, std::string content_type, std::string body);
     void send_status(int status);
 
+    // Answer this request by handing the connection to another protocol: the
+    // handshake response goes out, then `next` owns every byte that follows.
+    // This is the Upgrade path (WebSocket today, h2c later) and it is why
+    // protocol is a delegate rather than a hard-wired parser.
+    void upgrade(response handshake, std::unique_ptr<protocol_delegate> next);
+
     bool answered() const noexcept { return answered_; }
     std::uint64_t stream() const noexcept { return stream_; }
+
+    // For a protocol that outlives this request (the Upgrade path): a weak
+    // reference to the connection, and the handle for getting work back onto
+    // its loop thread. Weak on purpose - the client may vanish first, and a
+    // send on a dead connection should be a quiet false, not a crash.
+    std::weak_ptr<detail::session_core> session() const noexcept { return s_; }
+    event_loop::poster session_poster() const;
     bool connected() const noexcept { return !s_.expired(); }
     explicit operator bool() const noexcept { return !answered_ && connected(); }
 
@@ -2601,6 +2625,7 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
 
     std::unique_ptr<transport_delegate> transport;
     std::unique_ptr<protocol_delegate> protocol;
+    std::unique_ptr<protocol_delegate> pending_protocol;
 
     std::string app_in;                 // plaintext awaiting the parser
     std::string out;                    // wire bytes awaiting the socket
@@ -2635,6 +2660,22 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     {
         if (!transport->app_out(data, n, out))
             close_now();
+    }
+
+    void switch_protocol(std::unique_ptr<protocol_delegate> next) override
+    {
+        pending_protocol = std::move(next);
+    }
+
+    // Send application bytes outside a request/response exchange - what a
+    // protocol needs once it owns the connection (a WebSocket frame, say).
+    // Loop thread only; the public handles marshal for their callers.
+    void push_app(const char* data, std::size_t n)
+    {
+        if (!live_)
+            return;
+        write_app(data, n);
+        flush();
     }
 
     // ---- reactor plumbing
@@ -2950,7 +2991,14 @@ inline void session_core::drive()
     if (driving || !live_)
         return;
     driving = true;
-    protocol->consume(app_in, *this);
+    for (;;) {
+        protocol->consume(app_in, *this);
+        if (!pending_protocol || !live_)
+            break;
+        // The Upgrade completed: the old delegate has returned, so replacing
+        // it is safe, and the new one gets whatever bytes are already buffered
+        protocol = std::move(pending_protocol);
+    }
     driving = false;
 }
 
@@ -3137,6 +3185,40 @@ inline void responder::send(response res)
         // The loop is gone: the connection cannot be answered, and saying so
         // quietly beats crashing on the way down
     }
+}
+
+inline event_loop::poster responder::session_poster() const
+{
+    auto s = s_.lock();
+    return s ? s->poster : event_loop::poster{};
+}
+
+inline void responder::upgrade(response res, std::unique_ptr<protocol_delegate> next)
+{
+    if (answered_)
+        throw std::logic_error("http::responder: already answered");
+    if (!next)
+        throw std::invalid_argument("http::responder: upgrade needs a protocol");
+    answered_ = true;
+    auto s = s_.lock();
+    if (!s)
+        return;
+
+    if (s->poster.on_loop_thread()) {
+        s->switch_protocol(std::move(next));
+        s->complete(stream_, std::move(res));
+        return;
+    }
+    // Upgrading from a worker thread (after an async authentication, say).
+    // A unique_ptr cannot be captured into a std::function, so it travels
+    // inside a shared_ptr and is moved back out on the loop thread.
+    auto carrier = std::make_shared<std::unique_ptr<protocol_delegate>>(std::move(next));
+    auto keep = s;
+    const std::uint64_t stream = stream_;
+    keep->poster.post([keep, stream, carrier, r = std::move(res)]() mutable {
+        keep->switch_protocol(std::move(*carrier));
+        keep->complete(stream, std::move(r));
+    });
 }
 
 inline void responder::send(int status, std::string content_type, std::string body)

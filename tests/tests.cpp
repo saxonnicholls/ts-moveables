@@ -30,6 +30,8 @@ void run_mpmc_queue_tests();
 void run_thread_pool_tests();
 void run_event_loop_tests();
 void run_http_server_tests();
+void run_websocket_tests();
+void run_ws_deflate_tests();
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -856,6 +858,8 @@ int main()
     run_thread_pool_tests();
     run_event_loop_tests();
     run_http_server_tests();
+    run_websocket_tests();
+    run_ws_deflate_tests();
 
     test_once_flag();
 
