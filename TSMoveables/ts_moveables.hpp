@@ -26,6 +26,7 @@
 #include "moveable_signal.hpp"              // IWYU pragma: export
 #include "thread_pool.hpp"                  // IWYU pragma: export
 #include "event_loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
+#include "http_server.hpp"                  // IWYU pragma: export (follows the event loop)
 #include "synchronized.hpp"                 // IWYU pragma: export
 #include "synchronized_heterogeneous.hpp"   // IWYU pragma: export
 

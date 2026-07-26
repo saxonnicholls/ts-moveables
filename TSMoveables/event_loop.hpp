@@ -570,6 +570,39 @@ namespace snicholls
             }
         };
 
+        // A copyable, loop-outliving handle for exactly one thing: getting work
+        // onto the loop thread. Hand it to a subsystem that must call back in
+        // (an HTTP response completed on a worker thread, say) without handing
+        // over the loop itself. post() returns false when the loop is already
+        // gone, so a completion that arrives after shutdown is a no-op rather
+        // than a crash - the usual house rule, applied to teardown races.
+        class poster {
+            friend class event_loop;
+            std::weak_ptr<core> c_;
+            explicit poster(std::weak_ptr<core> c) noexcept : c_(std::move(c)) {}
+
+        public:
+            poster() = default;
+
+            bool post(std::function<void()> task) const {
+                auto c = c_.lock();
+                if (!c)
+                    return false;
+                c->enqueue_task(std::move(task));
+                return true;
+            }
+
+            // True when it is safe to touch loop-owned state directly from
+            // this thread: the loop is not running, or this is its thread
+            bool on_loop_thread() const noexcept {
+                auto c = c_.lock();
+                return c && (!c->running.load(std::memory_order_acquire) || c->on_loop_thread());
+            }
+
+            bool valid() const noexcept { return !c_.expired(); }
+            explicit operator bool() const noexcept { return valid(); }
+        };
+
         explicit event_loop(std::size_t post_capacity = 4096)
             : c_(std::make_shared<core>(post_capacity != 0 ? post_capacity : 4096)) {}
 
@@ -643,6 +676,14 @@ namespace snicholls
         bool running() const noexcept {
             return c_ && c_->running.load(std::memory_order_acquire);
         }
+
+        // See poster::on_loop_thread()
+        bool on_loop_thread() const noexcept {
+            return c_ && (!c_->running.load(std::memory_order_acquire) || c_->on_loop_thread());
+        }
+
+        // A copyable handle for posting work in from elsewhere
+        poster make_poster() const noexcept { return poster(c_); }
 
         // The journal tap: every delivery (task, timer, fd event) is announced
         // here before it is dispatched - subscribe to record, re-drive handler

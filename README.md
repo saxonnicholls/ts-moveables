@@ -11,6 +11,7 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[`disruptor`](#disruptor)** — the LMAX pattern: pre-allocated events, consumer dependency graphs, batch consumption; ~1 ns/event batched
 - **[`moveable_signal`](#moveable_signal)** — thread-safe signal/slot whose connections survive moves, with no lock held while slots run
 - **[`event_loop`](#event_loop)** — a clean, typed POSIX reactor (epoll / kqueue) whose dispatch is signals: handler lifetimes safe by construction, moveable watches and timers, replayable by design
+- **[`http_server`](#http_server)** — a non-blocking HTTP/1.1 server on that reactor, with runtime delegates instead of `#ifdef`s and handlers that can answer *later*: 10,000 concurrent connections on one thread, available as a single drop-in header
 - **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs
 
 One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rule: every type keeps the **integrity of its state** across a move — a move happens on a quiescent object or fails loudly — which hands classes composed from these types the [rule of zero](https://en.cppreference.com/cpp/language/rule_of_three) back: write no special member functions, and the compiler generates correct moves. The overhead: composition wrappers are the same size as what they wrap (the tests `static_assert` it), the safety checks are a `try_lock` probe or a relaxed flag, and everything is header-only, C++17 and later, dependency-free, `cassert`-tested, and ThreadSanitizer-verified across the CI matrix.
@@ -44,6 +45,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | a **pipeline** with consumer dependency graphs | [`disruptor<T>`](#disruptor) |
 | **run tasks on a pool** | [`task_pool`](#thread_pool) — `work_stealing_` for fork-join, `mpmc_` for general submit, `dispatch_` for a single feed |
 | an **event loop** for fds and timers without the usual scars | [`event_loop`](#event_loop) — POSIX reactor, typed dispatch, loud contracts |
+| an **HTTP server** that does not park a thread per connection | [`http_server`](#http_server) — routes, async responders, or one drop-in header |
 | the **fastest possible raw single-op queue** | honestly? [moodycamel](#which-should-you-use). We tell you when *not* to pick us. |
 
 Build and test locally: `make test` (or `cmake -B build && ctest --test-dir build --output-on-failure`). Pick the standard with `make test STD=c++17`. That's it.
@@ -435,6 +437,7 @@ Working programs, not snippets. Each builds and runs with one make target; the l
 | [capture_replay_demo](demos/capture_replay_demo.cpp) | `make demo-capture` | the HFT discipline: journal every ingress event (~13 ns/event), replay through a fresh multi-hop topology, and prove the egress stream hash reproduces exactly — ordering asserted at every hop, live and replayed, single-threaded and across four partitioned pipelines |
 | [pcap_replay_demo](demos/pcap_replay_demo.cpp) | `make demo-pcap` | the same discipline over real network captures: a dependency-free classic-pcap reader, packets travelling zero-copy by `const&` through decode and flow-partition nodes, a journal of 4-byte offsets, and a bit-exact replay |
 | [taskflow_style_demo](demos/taskflow_style_demo.cpp) | `make demo-taskflow` | [Taskflow](https://taskflow.github.io)-style dependency graphs on signals: diamonds, 1→64→1 fan-in joins, graph reuse, concurrent pipelines and computation-as-event — with no scheduler, so no thread starvation: a task runs inline on the thread that completes its last dependency |
+| [http_server_demo](demos/http_server_demo.cpp) | `make demo-http` | the [HTTP server](#http_server) under load, with every response verified: keep-alive and pipelined throughput, 1 KiB payload bandwidth, async responders answered off the loop thread, 2 MiB bodies round-tripped — and **10,000 simultaneous connections held open and served by a single loop on a single thread** |
 | [time_master_demo](demos/time_master_demo.cpp) | `make demo-timemaster` | a production periodic-event scheduler (TimeMaster) rebuilt on [`event_loop`](#event_loop) in ~60 lines: closures at intervals, add-while-running from any thread, cancel by id, drift-free *and* burst-free cadence asserted, teardown measured in microseconds — and the whole scheduler is a moveable value, which its Boost.Asio ancestor never was |
 
 For the pcap demo, bring your own data — `./build/pcap_replay_demo capture.pcap` — or capture live traffic with [scripts/capture_pcap.sh](scripts/capture_pcap.sh), which auto-detects your default interface (`en0` on macOS, `eth0`-style on Linux), runs `sudo tcpdump -s 0 -w`, and prints the replay command. Public capture files to experiment with are indexed at [netresec.com/?page=PcapFiles](https://www.netresec.com/?page=PcapFiles) — note that many are pcapng or gzipped, and the reader takes classic pcap, so convert first: `tcpdump -r in.pcapng -w out.pcap`. Without any file, the demo synthesises a capture, so it always runs.
@@ -461,7 +464,7 @@ We do **not** claim to beat the work-stealing greats (Taskflow, TBB, Tokio) — 
 
 The two lock-free building blocks stand alone too: `mpmc_queue<T>` is a bounded Vyukov MPMC ring (moveable when quiescent), and `work_stealing_deque<T>` is a bounded Chase-Lev deque with the memory-model-verified orderings from Le et al. (2013).
 
-The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Most of it has now shipped; what remains is disruptor phase 2 (multi-producer), the event loop's later phases, and an HTTP/HTTPS server built from delegates on the event loop (§8 there — designed, not yet built).
+The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Most of it has now shipped; what remains is disruptor phase 2 (multi-producer), the event loop's later phases, and the [HTTP server](#http_server)'s roadmap beyond phase 1 — TLS delegates, WebSocket, HTTP/2, and QUIC/HTTP/3 (§8 there).
 
 ## event_loop
 
@@ -494,6 +497,59 @@ And the library's signature applies where nobody else has it: watches, timers, a
 The economics are why elegance is affordable here: an `epoll_wait` or `read` syscall costs a microsecond-plus, typed signal dispatch costs tens of nanoseconds — at this altitude the clean abstraction is free, unlike in the [queue head-to-head](#head-to-head-vs-moodycamel) where every nanosecond showed.
 
 Phase 1 is POSIX-only and says so: on Windows the header self-disables (`SNICHOLLS_HAS_EVENT_LOOP` is 0) rather than shipping a pretend port — IOCP is a *proactor*, a structurally different model, and bridging the two badly is precisely how loops get baroque. For IOCP-grade Windows IO, use Asio; that's the same honesty as the moodycamel section. The remaining phases are in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md).
+
+## http_server
+
+The reactor's first real customer, and the component that composes everything else in the library. Phase 1 is a **non-blocking HTTP/1.1 server**: routes, keep-alive, chunked bodies, `Expect: 100-continue`, backpressure, timeouts — with the ergonomics of [cpp-httplib](https://github.com/yhirose/cpp-httplib), which set the standard for "drop in one header and it works".
+
+```cpp
+snicholls::http::server srv;
+
+srv.get("/hello/:name", [](const auto& req, auto res) {
+    res.send(200, "text/plain", "hello " + req.param("name"));
+});
+srv.post("/echo", [](const auto& req, auto res) {
+    res.send(200, "application/octet-stream", req.body);
+});
+
+srv.listen("0.0.0.0", 8080);
+srv.run();
+```
+
+**Single file, if you want one.** `make amalgamate` flattens the headers into `single_include/ts_http_server.hpp` — copy that one file into your project, `#include` it, link pthreads, done. CI compiles *and runs* the amalgamated header on every push, so the drop-in claim cannot quietly rot.
+
+Three things make it different from the blocking servers it resembles:
+
+**1. Handlers can answer later.** A handler is given a moveable, complete-once `responder`. Answer inline, or move it into a queue, a thread pool, or another loop and answer from any thread — the completion marshals itself back onto the loop. That is the thing a blocking server structurally cannot do, and it is *why* a thread-per-request pool's ceiling is its thread count. Dropping a responder without answering sends 500 rather than leaving the client hanging: loud failure over undefined behaviour, applied to HTTP.
+
+```cpp
+srv.get("/slow", [&pool](const auto& req, auto res) {
+    pool.submit([res = std::move(res)]() mutable {   // no thread parked on the loop
+        res.send(200, "application/json", expensive());
+    });
+});
+```
+
+**2. Policy is a runtime delegate, not a `#ifdef`.** The design separates two axes that servers usually conflate — the **transport** (how bytes arrive: plaintext today; TLS engines and QUIC later) and the **protocol** (how bytes become requests: HTTP/1.1 today; h2, h3, WebSocket later). Both are chosen per connection at run time, which is what lets one binary serve `http/1.1` and `h2` by ALPN, or swap a live connection's protocol delegate to speak WebSocket after an `Upgrade`. TLS engines are transport-agnostic byte transformers that never touch a socket, so the reactor owns all IO and every backend is testable without a network. The full plan — HTTP/2 with HPACK, WebSocket, QUIC and HTTP/3, and why we will **wrap** a QUIC stack rather than write one — is [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md).
+
+**3. The parser is deliberately strict.** Request smuggling is a parsing-leniency bug, so `Content-Length` with `Transfer-Encoding`, conflicting duplicate `Content-Length`, whitespace before a colon, obsolete line folding, and bare-LF line endings are all **rejected with 400**, not guessed at. Every one of those is a unit test, and every test input is replayed one byte at a time so no fragment boundary can change the verdict.
+
+Cross-cutting concerns are signals — `on_open`, `on_access`, `on_close`, `on_error` — so logging and metrics attach without touching the hot path. The `EMFILE` trap gets the classic reserve-descriptor treatment rather than a 100%-CPU spin. And the server itself is moveable: build it configured in a factory, move it into place, run it.
+
+`make demo-http` runs a load generator against it and verifies every byte it gets back. On an Apple M-series laptop, one loop on **one thread**:
+
+| Scenario | Result |
+|---|---|
+| keep-alive throughput, 4-byte bodies | ~93,000 req/s over 16 connections |
+| 1 KiB payloads | ~87,000 req/s, ~85 MiB/s of response body |
+| pipelined on one connection (depth 64) | ~135,000 req/s |
+| **simultaneous connections** | **10,000 held open and all served in 175 ms** |
+| async responders | 200 in flight, all answered off-loop |
+| large bodies | 2 MiB up and back in 10 ms |
+
+Honest framing on those numbers: the load generator shares the machine with the server, so they are single-box figures — good for tracking regressions and comparing designs on identical hardware, not a substitute for the head-to-head against cpp-httplib at 10k+ connections across a real network, which is [phase 6 of the plan](FUTURE_DIRECTIONS.md) and will be published whichever way it goes. The number that already means something is the fourth row: ten thousand simultaneous connections, one thread, no thread pool, 175 ms to serve them all.
+
+**Phase 1 scope, plainly.** HTTP/1.1 only, plaintext only, POSIX only (it follows the [event loop](#event_loop); `SNICHOLLS_HAS_HTTP_SERVER` is 0 on Windows). No TLS, HTTP/2, HTTP/3 or WebSocket *yet* — all four are designed in [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md) with the interfaces already carrying the stream ids they need, and each has an external grader it must pass before it ships: h2spec, Autobahn, the QUIC interop runner.
 
 ## The bigger picture: the host side of accelerated systems
 

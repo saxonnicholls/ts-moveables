@@ -57,7 +57,8 @@ if(TS_MOVEABLES_BUILD_TESTS)
         tests/tests_signal.cpp
         tests/tests_mpmc_queue.cpp
         tests/tests_thread_pool.cpp
-        tests/tests_event_loop.cpp)
+        tests/tests_event_loop.cpp
+        tests/tests_http_server.cpp)
     target_link_libraries(ts_moveables_tests PRIVATE snicholls::ts_moveables)
     add_test(NAME unit_tests COMMAND ts_moveables_tests)
 
@@ -72,7 +73,8 @@ if(TS_MOVEABLES_BUILD_TESTS)
     target_link_libraries(ts_moveables_signal_slot_demo PRIVATE snicholls::ts_moveables)
     target_compile_definitions(ts_moveables_signal_slot_demo PRIVATE NDEBUG)
 
-    foreach(demo capture_replay_demo pcap_replay_demo taskflow_style_demo time_master_demo)
+    foreach(demo capture_replay_demo pcap_replay_demo taskflow_style_demo time_master_demo
+                 http_server_demo)
         add_executable(ts_moveables_${demo} demos/${demo}.cpp)
         target_link_libraries(ts_moveables_${demo} PRIVATE snicholls::ts_moveables)
         target_compile_definitions(ts_moveables_${demo} PRIVATE NDEBUG)

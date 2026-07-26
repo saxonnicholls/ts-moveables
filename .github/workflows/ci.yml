@@ -66,7 +66,7 @@ jobs:
       - name: Demos (self-verifying)
         run: |
           set -o pipefail
-          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo CXX=${{ matrix.cxx }}
+          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo build/http_server_demo CXX=${{ matrix.cxx }}
           {
             ./build/capture_replay_demo --markdown
             echo ""
@@ -75,7 +75,19 @@ jobs:
             ./build/taskflow_style_demo --markdown
             echo ""
             ./build/time_master_demo --markdown
+            echo ""
+            ./build/http_server_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The single-file drop-in must build, run, and match the source headers -
+      # a stale committed amalgamation is a broken promise, so fail on drift
+      - name: Single-header amalgamation
+        run: |
+          make check-amalgamate CXX=${{ matrix.cxx }}
+          git diff --exit-code -- single_include/ || {
+            echo "::error::single_include/ is stale - run 'make amalgamate' and commit"
+            exit 1
+          }
 
       # Head-to-head vs moodycamel. Best-effort: fetches third-party headers on
       # demand, so a network hiccup must never gate the build.
@@ -140,6 +152,8 @@ jobs:
             run_exe ts_moveables_taskflow_style_demo
             echo ""
             run_exe ts_moveables_time_master_demo
+            echo ""
+            run_exe ts_moveables_http_server_demo
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   msvc:

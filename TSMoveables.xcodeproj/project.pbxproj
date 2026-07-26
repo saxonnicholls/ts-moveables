@@ -43,6 +43,7 @@
 		DFA1000E29CE00010000AA0E /* mpmc_queue.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = mpmc_queue.hpp; sourceTree = "<group>"; };
 		DFA1000F29CE00010000AA0F /* work_stealing_deque.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = work_stealing_deque.hpp; sourceTree = "<group>"; };
 		DFA1001029CE00010000AA10 /* event_loop.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = event_loop.hpp; sourceTree = "<group>"; };
+		DFA1001129CE00010000AA11 /* http_server.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = http_server.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -94,6 +95,7 @@
 				DFA1000E29CE00010000AA0E /* mpmc_queue.hpp */,
 				DFA1000F29CE00010000AA0F /* work_stealing_deque.hpp */,
 				DFA1001029CE00010000AA10 /* event_loop.hpp */,
+				DFA1001129CE00010000AA11 /* http_server.hpp */,
 			);
 			path = TSMoveables;
 			sourceTree = "<group>";

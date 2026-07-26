@@ -228,28 +228,103 @@ loop.run();
 
 **The design insight — moveable delegates.** This is the whole library folded back on itself. A server is a bundle of strategies (TLS engine, compressor, router, logger) plus thousands of per-connection sessions (socket, parser state, buffers, watch, timers). Classically none of that moves: sessions pin themselves the moment they contain a mutex, an Asio object, or a self-referential callback, so servers end up as graphs of `shared_ptr` spaghetti. Here, **delegates and sessions are moveable objects**: a `session` holding its `fd_watch`, its timers, its TLS delegate and its half-parsed request is a plain moveable value — it lives in a flat container, migrates between event loops (the multi-reactor `SO_REUSEPORT` sharding pattern falls out for free), and obeys the rule of zero. That is the capability that did not exist before this library, and the server is its showcase.
 
-**Delegate architecture.**
+### Two axes, not one — the shape the whole design hangs on
 
-- **TLS delegates** — one pure-virtual `tls_delegate` interface, chosen *at runtime*: `openssl_tls`, `boringssl_tls`, `wolfssl_tls`, `mbedtls_tls`. Crucially the engine is **transport-agnostic** (memory-BIO style: ciphertext bytes in, plaintext bytes out, and the reverse) so TLS never touches a socket — the reactor owns all IO, the delegate is a pure byte transformer. That makes every backend testable without a network, makes the WANT_READ/WANT_WRITE dance explicit, and means the plaintext path is the TLS path with an identity delegate.
-- **Compression delegates** — `identity`, `gzip`, `brotli` (zstd later), negotiated per-request from `Accept-Encoding`; same byte-transformer shape as TLS, so they compose.
-- **Routing** — `server.get("/users/:id", handler)`, `server.post(...)`; handlers are delegates bound to the caller's live objects.
-- **Signals for the cross-cutting** — `on_request`, `on_response`, `on_accept`, `on_error` are `moveable_signal` taps: logging and metrics attach without touching the hot path, and — because the loop already has its dispatch tap — **HTTP session capture and replay comes for free**, the same discipline as the demos.
-- **Leverage [BaseEncodeDecode](https://github.com/saxonnicholls/BaseEncodeDecode)** — base64 for Basic auth (and WebSocket accept keys, if that day comes), percent/URL decoding, and its `openssl_raii.hpp` for leak-proof TLS handle ownership.
+Every HTTP server conflates two independent questions. Separating them is what makes one delegate architecture cover HTTP/1.1 through HTTP/3 without a rewrite:
 
-**`moveable_function` — the honest verdict.** `std::function` is already moveable, so a bare rename adds nothing. The gap is *lifetime*: a route handler bound to a service object must stop firing when that object dies — today that is a dangling `this` and a core dump. A `moveable_function<R(Args...)>` worth building is the single-slot, return-valued sibling of `moveable_signal`: same weak-`shared_ptr` target tracking (an expired target makes the call a no-op or a loud error, caller's choice), same quiescent-move contract, small-buffer storage. Essentially `moveable_signal` with one slot and a return value. Small, real, and exactly what the router stores. Build it when the server needs it, as `moveable_function.hpp` — not before.
+- **Transport delegate** — *how bytes reach us.* `tcp_plain`, `tcp_tls` (OpenSSL / BoringSSL / wolfSSL / mbedTLS), `quic` (UDP with TLS 1.3 welded in). It owns encryption and, for QUIC, ordering and loss recovery.
+- **Protocol delegate** — *how bytes become requests.* `http1` (text, one message at a time), `http2` (binary framing + HPACK, multiplexed), `http3` (binary framing + QPACK, multiplexed over QUIC streams).
 
-**The hard parts, named up front.**
+They compose as a matrix, and every cell is chosen **at run time**:
 
-- **HTTP/1.1 parsing correctness.** This is where httplib's bug history lives, and where ours would too. The parser must be incremental and resumable (a request arrives in arbitrary fragments), strict on framing (Content-Length vs chunked, smuggling-adjacent edge cases), and tortured by a dedicated test corpus from day one. This is the real cost of the project; the architecture is the easy part.
-- **TLS handshakes in a non-blocking world.** The memory-BIO engine makes the state machine explicit, but renegotiation, close-notify, and half-closed connections still have to be walked carefully.
-- **Backpressure and abuse.** Bounded write queues per session, slow-client (slowloris) timeouts on the loop's own timers, connection caps.
-- **Scope held tight.** HTTP/1.1 + keep-alive + chunked only. No HTTP/2, no HTTP/3, no client (initially), no WebSocket in phase 1 — each is a separate decision later, not scope creep now.
+| Transport | Protocol | Selected by |
+|---|---|---|
+| TCP, plaintext | HTTP/1.1 | default |
+| TCP, plaintext | HTTP/2 (h2c) | prior knowledge / `Upgrade` |
+| TCP + TLS | HTTP/1.1 | ALPN `http/1.1` |
+| TCP + TLS | HTTP/2 | ALPN `h2` |
+| QUIC (UDP) | HTTP/3 | ALPN `h3`, advertised via `Alt-Svc` |
 
-**Bar to clear.** A head-to-head against cpp-httplib at **10,000+ concurrent connections** (plus a plain-throughput run at low concurrency, where their blocking pool is at its best), published honestly whichever way it goes — the structural expectation is that a reactor holds the C10K line and a thread-per-request pool cannot, but expectations are not numbers. Plus: parser torture suite green, TSan green, and at least two TLS delegates proving the interface isn't a monoculture in disguise.
+ALPN is the selector: the TLS delegate reports the negotiated protocol and the server constructs the matching protocol delegate for that connection. **This is the thing a `#ifdef` architecture structurally cannot do** — if your TLS backend is a compile-time constant, so is your protocol matrix, and you cannot serve h2 and http/1.1 from one binary chosen per connection without hand-wiring it. Runtime delegates make it a two-line factory.
 
-**Phases.** 1: plaintext HTTP/1.1 server on `event_loop` (parser, router, keep-alive, chunked, compression delegates). 2: TLS delegates (OpenSSL first, memory-BIO engine; then a second backend to keep the interface honest). 3: the 10k+ head-to-head harness and numbers. 4: verdicts on client / WebSocket / zstd.
+**The stream-shape decision, made now, on purpose.** HTTP/1.1 and HTTP/2 both ride a single ordered byte stream. HTTP/3 does not — QUIC hands you *many* independent streams and does per-stream ordering itself. So the protocol/host interfaces carry a `stream_id` from day one; it is always `0` for HTTP/1.x, real for h2, and a QUIC stream number for h3. That is an integer parameter, not speculative machinery, and it is the difference between HTTP/3 slotting in and HTTP/3 forcing a rewrite. We are explicit that this is the *one* piece of forward design we pay for up front.
 
-**Effort.** Large ×2, dominated by parser correctness — and worth it: this is the first component that composes *everything* below it.
+**Async responders — the moveability payoff, and the reason we scale.** A handler receives `(const request&, responder)` where `responder` is a **moveable, complete-once** handle. Answer inline, or move it into a queue, a thread pool, or another event loop and answer later from any thread (completion marshals back through `post()`). This is precisely what a blocking server cannot do — httplib holds a whole thread per in-flight request, which is *why* its ceiling is its pool size — and it is only safe here because the handle moves safely. Dropping a responder without answering sends 500 rather than hanging the client: loud failure over undefined behaviour, the house rule, applied to HTTP. It is also what makes HTTP/2 tractable: multiplexed streams complete out of order by nature.
+
+### Delegate architecture
+
+- **TLS delegates** — one pure-virtual interface, chosen at runtime: `openssl_tls`, `boringssl_tls`, `wolfssl_tls`, `mbedtls_tls`. The engine is **transport-agnostic** (memory-BIO style: ciphertext in, plaintext out, and the reverse) so TLS never touches a socket — the reactor owns all IO, the delegate is a pure byte transformer. Every backend becomes testable without a network, the WANT_READ/WANT_WRITE dance is explicit, and the plaintext path is the TLS path with an identity delegate. TLS backends live in *separate opt-in headers* so the core stays dependency-free.
+- **Compression delegates** — `identity`, `gzip`, `brotli`, `zstd`: registered per content-coding and negotiated per request from `Accept-Encoding`; same byte-transformer shape as TLS, so they compose.
+- **Routing** — `server.get("/users/:id", handler)`, `server.post(...)`; segment patterns with `:param` captures and a trailing `*`.
+- **Signals for everything cross-cutting** — `on_open`, `on_access`, `on_close`, `on_error` are `moveable_signal` taps: logging, metrics and tracing attach without touching the hot path, and because the loop already has its dispatch tap, **HTTP session capture and replay comes for free** — the same discipline the demos already prove bit-exact.
+- **Leverage [base-encode-decode](https://github.com/saxonnicholls/base-encode-decode)** — base64 for Basic auth and for the WebSocket accept key, and its `openssl_raii.hpp` for leak-proof TLS handle ownership.
+
+**Packaging: genuinely one file.** `http_server.hpp` is a single header that includes `event_loop.hpp` and `moveable_signal.hpp` from the same directory. For true httplib-style drop-in, `scripts/amalgamate.sh` emits `single_include/ts_http_server.hpp` — one self-contained file, no include path, no build system, nothing to link but pthreads.
+
+### WebSocket — the delegate architecture's cleanest win
+
+WebSocket (RFC 6455) is where the two-axis split stops being theory and starts paying rent. A WebSocket connection *is* an HTTP connection that changed protocol mid-flight — which in this design is one line: after the `Upgrade` handshake, **swap the protocol delegate on a live connection**, `http1_protocol` → `websocket_protocol`, leaving the transport, the session, the buffers and the fd watch exactly where they are. `wss://` needs no work at all: it is `ws` over the TLS transport delegate, and the two axes never knew about each other. Frameworks that hard-wire HTTP into the connection object have to grow a parallel WebSocket stack; here it is a delegate, and the server is already a reactor, which is what a protocol of long-lived idle connections actually wants. Ten thousand mostly-idle sockets is the *bad* case for a thread-per-connection server and the *normal* case for us.
+
+What it takes, concretely:
+
+- **Handshake** — validate `Upgrade: websocket`, `Connection: Upgrade`, `Sec-WebSocket-Version: 13` and `Sec-WebSocket-Key`, then answer 101 with `Sec-WebSocket-Accept` = base64(SHA-1(key + the RFC's magic GUID)). Base64 comes from [base-encode-decode](https://github.com/saxonnicholls/base-encode-decode); SHA-1 here is a fixed ritual rather than a security primitive, so a small local implementation keeps the plaintext build dependency-free (and the TLS delegate can supply one when present).
+- **Framing** — FIN/RSV/opcode, the mask bit, 7 / 7+16 / 7+64 payload lengths, the 4-byte masking key, continuation frames for fragmented messages, and control frames (close, ping, pong) that are never fragmented and never exceed 125 bytes. Client-to-server frames **must** be masked and unmasked ones are a protocol error; server-to-client frames must not be.
+- **Correctness details that bite** — UTF-8 validation on text frames (strictly, including split-across-frames sequences), the two-way close handshake with status codes, ping/pong keepalive on the loop's own timers, and hard caps on frame and message size. `permessage-deflate` (RFC 7692) is not new work: it is the **compression delegate** again, with context-takeover rules.
+- **The grader** — the [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite) is the external, unarguable bar, exactly like h2spec and the QUIC interop runner. Green Autobahn or it does not ship.
+- **Later versions** — WebSocket over HTTP/2 is extended CONNECT (RFC 8441) and over HTTP/3 is RFC 9220. Both are *transport-and-protocol* plumbing rather than a new WebSocket, which is the point of keeping the axes apart.
+
+The API should stay in the house style — signals, moveable handles:
+
+```cpp
+srv.websocket("/ws", [](websocket ws) {              // ws is a moveable handle
+    ws.on_message().connect([&ws](const ws_message& m) { ws.send_text(m.text()); });
+    ws.on_close().connect([] { /* ... */ });
+});
+```
+
+### HTTP/2 — tractable, and worth doing natively
+
+Framing (RFC 9113) is a bounded problem: a 9-byte frame header, a dozen frame types, per-stream and connection flow-control windows, and a stream state machine. **HPACK** (RFC 7541) is the real work — a 61-entry static table, a dynamic table with eviction, and canonical Huffman coding — mechanical but unforgiving, and the source of most h2 CVEs elsewhere (including HPACK-bomb style decompression amplification, which needs an explicit decoded-size cap).
+
+The choice is implement natively or wrap nghttp2 as a protocol delegate. **Recommendation: native**, because it keeps the zero-dependency promise for cleartext h2c, it is bounded work, and there is an external grader — [h2spec](https://github.com/summerwind/h2spec) — so the claim can be *measured* rather than asserted. Wrapping nghttp2 stays available as a second delegate if native h2 proves more expensive than it looks; the interface makes that a swap, not a rewrite. Also required: `Alt-Svc` advertisement so browsers can upgrade to h3, and rejection of the h2 header-flood / RST-flood patterns (the 2023 "Rapid Reset" class) with per-connection limits.
+
+### QUIC and HTTP/3 — we wrap, we do not write
+
+Said plainly, because the alternative is the single biggest way this project could destroy itself: **implementing QUIC is not on the table.** QUIC (RFC 9000/9001/9002) is loss detection and congestion control, three packet-number spaces, stream *and* connection flow control, connection migration across paths, 0-RTT with replay defence, anti-amplification limits, path validation, retry tokens, key updates, and version negotiation — a multi-year, security-critical codebase. Every credible QUIC is a dedicated project with a team: [ngtcp2](https://github.com/ngtcp2/ngtcp2), [quiche](https://github.com/cloudflare/quiche) (Cloudflare), [msquic](https://github.com/microsoft/msquic) (Microsoft), [lsquic](https://github.com/litespeedtech/lsquic), [picoquic](https://github.com/private-octopus/picoquic), [s2n-quic](https://github.com/aws/s2n-quic) (AWS). Our value-add is not another QUIC stack; it is the clean reactor and delegate architecture *around* one.
+
+So `quic_transport` wraps a QUIC library exactly as `tls_delegate` wraps OpenSSL — same pattern, same honesty, same opt-in header. The reactor's job is the part we are actually good at: own the UDP socket, watch it readable, feed datagrams in, pull datagrams out, and drive the library's timers off `event_loop` timers instead of the ad-hoc timer wheel these integrations usually grow.
+
+Three consequences worth writing down before anyone is surprised by them:
+
+- **UDP changes the loop's shape.** One UDP socket serves *all* connections, demultiplexed by QUIC connection ID rather than by fd — so the "one fd per connection" assumption baked into the phase-1 session map does not hold for h3. The session lookup must be keyed by an opaque connection key, with fd as the phase-1 instantiation. Cheap now, expensive later. Also: `recvmmsg`/`sendmmsg` batching and GSO/GRO are where real h3 throughput comes from, and both want the reactor to hand the library *many* datagrams per wake — worth designing for, not retrofitting.
+- **QUIC constrains the TLS backend.** QUIC needs a TLS API that exports handshake secrets rather than encrypting a byte stream. BoringSSL has had that API for years (which is why quiche and ngtcp2 target it); OpenSSL added client-side QUIC in 3.2 and server-side QUIC in 3.5 (the LTS line); wolfSSL supports the ngtcp2 integration; mbedTLS has no QUIC handshake API. So the h3 cell of the matrix is not available on every TLS delegate, and the factory must say so out loud rather than fail mysteriously.
+- **HTTP/3 itself is the tractable part.** Once QUIC streams exist, h3 is framing (RFC 9114) plus **QPACK** (RFC 9204) — HPACK's cousin, redesigned so header compression survives out-of-order stream delivery, with its own encoder/decoder streams and a blocked-streams limit. Native is plausible; [nghttp3](https://github.com/ngtcp2/nghttp3) is the ready-made alternative and pairs with ngtcp2. Decide with measurements, not taste. The external grader here is the [QUIC interop runner](https://interop.seemann.io/).
+
+### The hard parts, named up front
+
+- **HTTP/1.1 parsing correctness.** This is where httplib's bug history lives and where ours would too. The parser must be incremental and resumable (a request arrives in arbitrary fragments), and *strict*: reject `Content-Length` together with `Transfer-Encoding`, conflicting duplicate `Content-Length`, whitespace before the colon, obsolete line folding, and bare LF line endings — every one of those is a documented request-smuggling vector, and leniency is how servers become gadgets in someone else's attack chain. Torture corpus from day one, not later.
+- **TLS handshakes in a non-blocking world.** The memory-BIO engine makes the state machine explicit, but renegotiation, close-notify and half-closed connections still have to be walked carefully.
+- **Abuse and backpressure.** Bounded write buffers with read-pause at high water, slowloris timeouts on the loop's own timers, header/body size caps, connection caps — and the classic reactor trap: **`EMFILE`**. When the process runs out of file descriptors, `accept()` fails forever on a level-triggered loop and the server spins at 100% CPU serving nobody. The fix (hold a reserved fd, close it, accept-and-close the excess connection, reopen the reserve) is fifteen lines and belongs in phase 1, not in a post-mortem.
+- **Scope discipline.** No client (initially), and no static-file server until the path-traversal story is written down. Each is a separate decision later, not scope creep now.
+
+### `moveable_function` — the honest verdict
+
+`std::function` is already moveable, so a bare rename adds nothing. The gap is *lifetime*: a route handler bound to a service object must stop firing when that object dies — today that is a dangling `this` and a core dump. A `moveable_function<R(Args...)>` worth building is the single-slot, return-valued sibling of `moveable_signal`: same weak-`shared_ptr` target tracking (an expired target makes the call a no-op or a loud error, caller's choice), same quiescent-move contract, small-buffer storage so the common case does not allocate. Small, real, and exactly what the router should store. Phase 1 uses `std::function` and says so; `moveable_function.hpp` lands when the tracking is wanted, not before.
+
+### Phases, and the bar each must clear
+
+| Phase | Scope | Bar |
+|---|---|---|
+| **1** | Plaintext HTTP/1.1 reactor: strict incremental parser, router, keep-alive, chunked, async responders, backpressure, `EMFILE` guard, signal taps | parser torture suite green, TSan green, end-to-end tests over real sockets |
+| **2** | TLS delegates: OpenSSL memory-BIO engine first, then a second backend to prove the interface | HTTPS end-to-end, ALPN reported, two backends passing the same tests |
+| **3** | WebSocket: handshake, framing, masking, close/ping/pong, UTF-8 validation — as a protocol-delegate swap, with `permessage-deflate` reusing the compression delegate | [Autobahn](https://github.com/crossbario/autobahn-testsuite) green |
+| **4** | HTTP/2: framing, HPACK, h2c and h2-over-ALPN, flow control, flood limits | [h2spec](https://github.com/summerwind/h2spec) green |
+| **5** | QUIC transport delegate (wrapping ngtcp2 or quiche) + HTTP/3 with QPACK, `Alt-Svc`, datagram batching | [QUIC interop runner](https://interop.seemann.io/) handshake/transfer/retry cases |
+| **6** | The head-to-head: **10,000+ concurrent connections** vs cpp-httplib, plus a low-concurrency run where their blocking pool is at its best, plus an idle-WebSocket fan-out where the reactor should win biggest | numbers published whichever way they go |
+
+The structural expectation for the head-to-head is that a reactor holds the C10K line and a thread-per-request pool cannot — but expectations are not numbers, and this project's rule is that a concurrency claim without a benchmark is a rumour.
+
+**Effort.** Large ×2 for phases 1–2, dominated by parser correctness; large again for h2; phase 4 is mostly integration, which is exactly why we wrap rather than write. Worth it: this is the first component that composes *everything* below it — loop, signals, queues, moveables — into something a stranger can drop into a project and use in one line.
 
 ---
 

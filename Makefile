@@ -68,6 +68,9 @@ build/taskflow_style_demo: demos/taskflow_style_demo.cpp $(HEADERS) | build
 build/time_master_demo: demos/time_master_demo.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/time_master_demo.cpp -o $@ $(LDLIBS)
 
+build/http_server_demo: demos/http_server_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/http_server_demo.cpp -o $@ $(LDLIBS)
+
 test: build/tests
 	./build/tests
 
@@ -101,7 +104,22 @@ demo-taskflow: build/taskflow_style_demo
 demo-timemaster: build/time_master_demo
 	./build/time_master_demo
 
+demo-http: build/http_server_demo
+	./build/http_server_demo
+
+# One self-contained file per entry header, for drop-in use
+amalgamate:
+	python3 scripts/amalgamate.py http_server.hpp
+	python3 scripts/amalgamate.py ts_moveables.hpp
+
+# The amalgamated header must always still compile - and run - on its own,
+# so the single-file drop-in claim can never quietly drift
+check-amalgamate: amalgamate | build
+	printf '#include "ts_http_server.hpp"\nint main(){ snicholls::http::server s; s.get("/", [](const auto&, auto r){ r.send(200, "text/plain", "ok"); }); return s.listen("127.0.0.1", 0) ? 0 : 1; }\n' > build/amalgam_check.cpp
+	$(CXX) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include build/amalgam_check.cpp -o build/amalgam_check
+	./build/amalgam_check && echo "single-header drop-in: builds and runs"
+
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster clean
+.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http amalgamate check-amalgamate clean
