@@ -66,13 +66,15 @@ jobs:
       - name: Demos (self-verifying)
         run: |
           set -o pipefail
-          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo CXX=${{ matrix.cxx }}
+          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo CXX=${{ matrix.cxx }}
           {
             ./build/capture_replay_demo --markdown
             echo ""
             ./build/pcap_replay_demo --markdown
             echo ""
             ./build/taskflow_style_demo --markdown
+            echo ""
+            ./build/time_master_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Head-to-head vs moodycamel. Best-effort: fetches third-party headers on
@@ -136,6 +138,8 @@ jobs:
             run_exe ts_moveables_pcap_replay_demo
             echo ""
             run_exe ts_moveables_taskflow_style_demo
+            echo ""
+            run_exe ts_moveables_time_master_demo
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   msvc:

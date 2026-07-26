@@ -10,6 +10,7 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[`circular_buffer`](#circular_buffer)** — a wait-free SPSC ring with two honest cache-line-separated atomics; ~2 ns/op batched
 - **[`disruptor`](#disruptor)** — the LMAX pattern: pre-allocated events, consumer dependency graphs, batch consumption; ~1 ns/event batched
 - **[`moveable_signal`](#moveable_signal)** — thread-safe signal/slot whose connections survive moves, with no lock held while slots run
+- **[`event_loop`](#event_loop)** — a clean, typed POSIX reactor (epoll / kqueue) whose dispatch is signals: handler lifetimes safe by construction, moveable watches and timers, replayable by design
 - **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs
 
 One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rule: every type keeps the **integrity of its state** across a move — a move happens on a quiescent object or fails loudly — which hands classes composed from these types the [rule of zero](https://en.cppreference.com/cpp/language/rule_of_three) back: write no special member functions, and the compiler generates correct moves. The overhead: composition wrappers are the same size as what they wrap (the tests `static_assert` it), the safety checks are a `try_lock` probe or a relaxed flag, and everything is header-only, C++17 and later, dependency-free, `cassert`-tested, and ThreadSanitizer-verified across the CI matrix.
@@ -42,6 +43,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | **broadcast an event** to many typed listeners | [`moveable_signal`](#moveable_signal) |
 | a **pipeline** with consumer dependency graphs | [`disruptor<T>`](#disruptor) |
 | **run tasks on a pool** | [`task_pool`](#thread_pool) — `work_stealing_` for fork-join, `mpmc_` for general submit, `dispatch_` for a single feed |
+| an **event loop** for fds and timers without the usual scars | [`event_loop`](#event_loop) — POSIX reactor, typed dispatch, loud contracts |
 | the **fastest possible raw single-op queue** | honestly? [moodycamel](#which-should-you-use). We tell you when *not* to pick us. |
 
 Build and test locally: `make test` (or `cmake -B build && ctest --test-dir build --output-on-failure`). Pick the standard with `make test STD=c++17`. That's it.
@@ -109,6 +111,7 @@ Moved-from objects are always left valid and usable.
 | `disruptor.hpp` | `disruptor<T, WaitStrategy>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
 | `moveable_signal.hpp` | `moveable_signal<Args...>` + `connection` / `scoped_connection` | Boost.Signals2 / sigslot | — | connections survive the move |
 | `thread_pool.hpp` | `task_pool` interface + `mutex_` / `sharded_` / `dispatch_` / `mpmc_` / `work_stealing_task_pool` | Taskflow / TBB / `std::async` | — | moveable handle (heap core) |
+| `event_loop.hpp` | `event_loop` + `fd_watch` / `timer` (POSIX; self-disables on Windows) | Asio / libuv / libevent | — | moveable handles, loop handle moves mid-run |
 | `ts_moveables.hpp` | umbrella header — includes everything | | | |
 
 Two implementation strategies are used:
@@ -432,6 +435,7 @@ Working programs, not snippets. Each builds and runs with one make target; the l
 | [capture_replay_demo](demos/capture_replay_demo.cpp) | `make demo-capture` | the HFT discipline: journal every ingress event (~13 ns/event), replay through a fresh multi-hop topology, and prove the egress stream hash reproduces exactly — ordering asserted at every hop, live and replayed, single-threaded and across four partitioned pipelines |
 | [pcap_replay_demo](demos/pcap_replay_demo.cpp) | `make demo-pcap` | the same discipline over real network captures: a dependency-free classic-pcap reader, packets travelling zero-copy by `const&` through decode and flow-partition nodes, a journal of 4-byte offsets, and a bit-exact replay |
 | [taskflow_style_demo](demos/taskflow_style_demo.cpp) | `make demo-taskflow` | [Taskflow](https://taskflow.github.io)-style dependency graphs on signals: diamonds, 1→64→1 fan-in joins, graph reuse, concurrent pipelines and computation-as-event — with no scheduler, so no thread starvation: a task runs inline on the thread that completes its last dependency |
+| [time_master_demo](demos/time_master_demo.cpp) | `make demo-timemaster` | a production periodic-event scheduler (TimeMaster) rebuilt on [`event_loop`](#event_loop) in ~60 lines: closures at intervals, add-while-running from any thread, cancel by id, drift-free *and* burst-free cadence asserted, teardown measured in microseconds — and the whole scheduler is a moveable value, which its Boost.Asio ancestor never was |
 
 For the pcap demo, bring your own data — `./build/pcap_replay_demo capture.pcap` — or capture live traffic with [scripts/capture_pcap.sh](scripts/capture_pcap.sh), which auto-detects your default interface (`en0` on macOS, `eth0`-style on Linux), runs `sudo tcpdump -s 0 -w`, and prints the replay command. Public capture files to experiment with are indexed at [netresec.com/?page=PcapFiles](https://www.netresec.com/?page=PcapFiles) — note that many are pcapng or gzipped, and the reader takes classic pcap, so convert first: `tcpdump -r in.pcapng -w out.pcap`. Without any file, the demo synthesises a capture, so it always runs.
 
@@ -457,7 +461,39 @@ We do **not** claim to beat the work-stealing greats (Taskflow, TBB, Tokio) — 
 
 The two lock-free building blocks stand alone too: `mpmc_queue<T>` is a bounded Vyukov MPMC ring (moveable when quiescent), and `work_stealing_deque<T>` is a bounded Chase-Lev deque with the memory-model-verified orderings from Le et al. (2013).
 
-The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Most of it has now shipped; what remains is disruptor phase 2 (multi-producer) and a signal/slot refinement.
+The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Most of it has now shipped; what remains is disruptor phase 2 (multi-producer), the event loop's later phases, and an HTTP/HTTPS server built from delegates on the event loop (§8 there — designed, not yet built).
+
+## event_loop
+
+Most event loops age you. The failure modes have not changed in thirty years: a handler fires after its object died, a cross-thread mutation races the poll, a timer drifts — or your laptop wakes from sleep and four hundred "periodic" ticks fire in a burst — teardown deadlocks on a lost wakeup, and none of it reproduces in a debugger. The incumbents don't help much: Asio is the powerful everything-machine (famously baroque — io_context, strands, work guards, and an asynchronous model or three before your first socket); libuv and libevent are C, so lifetime management is baton-passing by hand; Qt's loop is welded to QObject and a meta-compiler; and C++26 standardised `std::execution` but standard IO integration didn't land. Between the giants and the hand-rolled `poll()` loop, most C++ programs still run on a callback and a prayer.
+
+`event_loop` is a small, typed POSIX reactor — epoll on Linux, kqueue on macOS/BSD, `poll()` fallback — built visibly from this library's own parts, with each classic failure addressed *by construction*:
+
+```cpp
+snicholls::event_loop loop;
+
+auto w = loop.watch(fd, snicholls::fd_interest::read);
+auto c = w.on_readable().connect([&] { /* drain fd */ });   // a signal, not a raw callback
+
+auto t = loop.every(10ms);                                  // drift-free periodic
+auto ct = t.on_fire().connect([&] { /* tick */ });
+
+loop.post([&] { /* runs on the loop thread — callable from any thread */ });
+loop.run();                                                 // stop() from anywhere
+```
+
+- **Use-after-free** — dispatch is [`moveable_signal`](#moveable_signal): let the `scoped_connection` die and the handler can never fire again; slots can be `weak_ptr`-tracked so a dead object silently unsubscribes. The #1 event-loop bug class is closed structurally, not by documentation.
+- **Cross-thread races** — the loop has a single-thread contract and *enforces* it: touching watches or timers from a foreign thread while the loop runs throws `std::logic_error` instead of racing. `post()` is the one sanctioned door in, backed by the lock-free `mpmc_queue` and a self-pipe, so cross-thread wakeups are never lost. `stop()` and `timer::cancel()` are safe from any thread.
+- **Reentrancy** — handlers may create and destroy watches and timers mid-dispatch; the classic corruption case is a unit test here, not a footnote.
+- **Timer drift and bursts** — periodic timers reschedule from the *previous deadline* (no cumulative drift) but clamp to now after a stall, so the wake-from-sleep burst is one tick, not four hundred.
+- **Teardown** — destroying a watch from a foreign thread marshals itself through `post()`; `run()` keeps the core alive, so handles can be dropped while the loop runs and it winds down cleanly on `stop()`.
+- **Irreproducibility** — `on_dispatch()` is a tap that announces every delivery (task, timer, fd event): the same journal-and-replay discipline as the [capture demos](#demos), available at the loop itself.
+
+And the library's signature applies where nobody else has it: watches, timers, and the loop handle are all moveable (heap-stable core — libuv handles are pinned, Asio objects are entangled with their `io_context`). An `fd_watch` can be a plain member of a session object that lives in a `std::vector`; the rule of zero holds.
+
+The economics are why elegance is affordable here: an `epoll_wait` or `read` syscall costs a microsecond-plus, typed signal dispatch costs tens of nanoseconds — at this altitude the clean abstraction is free, unlike in the [queue head-to-head](#head-to-head-vs-moodycamel) where every nanosecond showed.
+
+Phase 1 is POSIX-only and says so: on Windows the header self-disables (`SNICHOLLS_HAS_EVENT_LOOP` is 0) rather than shipping a pretend port — IOCP is a *proactor*, a structurally different model, and bridging the two badly is precisely how loops get baroque. For IOCP-grade Windows IO, use Asio; that's the same honesty as the moodycamel section. The remaining phases are in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md).
 
 ## The bigger picture: the host side of accelerated systems
 

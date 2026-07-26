@@ -26,6 +26,10 @@ graph TD
     G --> EL[event_loop]
     Q --> EL
     TP -.-> EL
+    EL --> H[http_server]
+    G --> H
+    P --> MF[moveable_function]
+    MF -.-> H
 ```
 
 ---
@@ -216,6 +220,39 @@ loop.run();
 
 ---
 
+## 8. HTTP/HTTPS server — delegates all the way down
+
+**What.** A drop-in, header-only HTTP/HTTPS server in the [cpp-httplib](https://github.com/yhirose/cpp-httplib) mould — same one-include ergonomics, same `get`/`post` routing feel — but built as a *reactor* on `event_loop`, with every policy decision (TLS backend, compression, logging, routing) expressed as a **delegate object** rather than a compile-time `#ifdef` or a hard-wired member.
+
+**Why cpp-httplib leaves the door open — said with respect.** httplib earned its popularity: one header, zero setup, it just works. But its own README is candid about the ceiling: it uses *blocking* socket IO on a thread pool (default ~8 to 4× cores) — "if you are looking for a server which handles requests in a non-blocking manner, this is not the one that you want" — and large simultaneous connection counts are outside its design target. Its TLS story is real (OpenSSL 3.0+, mbedTLS, wolfSSL, best-effort BoringSSL) but chosen by preprocessor forest (`CPPHTTPLIB_OPENSSL_SUPPORT`, …): one backend per binary, decided at compile time, tested combinatorially or not at all. And the single ~10k-line header has grown ad hoc, which is where its long bug tail — overwhelmingly in protocol parsing — comes from. None of this is a criticism of intent; it is a list of things a second-generation design gets to fix.
+
+**The design insight — moveable delegates.** This is the whole library folded back on itself. A server is a bundle of strategies (TLS engine, compressor, router, logger) plus thousands of per-connection sessions (socket, parser state, buffers, watch, timers). Classically none of that moves: sessions pin themselves the moment they contain a mutex, an Asio object, or a self-referential callback, so servers end up as graphs of `shared_ptr` spaghetti. Here, **delegates and sessions are moveable objects**: a `session` holding its `fd_watch`, its timers, its TLS delegate and its half-parsed request is a plain moveable value — it lives in a flat container, migrates between event loops (the multi-reactor `SO_REUSEPORT` sharding pattern falls out for free), and obeys the rule of zero. That is the capability that did not exist before this library, and the server is its showcase.
+
+**Delegate architecture.**
+
+- **TLS delegates** — one pure-virtual `tls_delegate` interface, chosen *at runtime*: `openssl_tls`, `boringssl_tls`, `wolfssl_tls`, `mbedtls_tls`. Crucially the engine is **transport-agnostic** (memory-BIO style: ciphertext bytes in, plaintext bytes out, and the reverse) so TLS never touches a socket — the reactor owns all IO, the delegate is a pure byte transformer. That makes every backend testable without a network, makes the WANT_READ/WANT_WRITE dance explicit, and means the plaintext path is the TLS path with an identity delegate.
+- **Compression delegates** — `identity`, `gzip`, `brotli` (zstd later), negotiated per-request from `Accept-Encoding`; same byte-transformer shape as TLS, so they compose.
+- **Routing** — `server.get("/users/:id", handler)`, `server.post(...)`; handlers are delegates bound to the caller's live objects.
+- **Signals for the cross-cutting** — `on_request`, `on_response`, `on_accept`, `on_error` are `moveable_signal` taps: logging and metrics attach without touching the hot path, and — because the loop already has its dispatch tap — **HTTP session capture and replay comes for free**, the same discipline as the demos.
+- **Leverage [BaseEncodeDecode](https://github.com/saxonnicholls/BaseEncodeDecode)** — base64 for Basic auth (and WebSocket accept keys, if that day comes), percent/URL decoding, and its `openssl_raii.hpp` for leak-proof TLS handle ownership.
+
+**`moveable_function` — the honest verdict.** `std::function` is already moveable, so a bare rename adds nothing. The gap is *lifetime*: a route handler bound to a service object must stop firing when that object dies — today that is a dangling `this` and a core dump. A `moveable_function<R(Args...)>` worth building is the single-slot, return-valued sibling of `moveable_signal`: same weak-`shared_ptr` target tracking (an expired target makes the call a no-op or a loud error, caller's choice), same quiescent-move contract, small-buffer storage. Essentially `moveable_signal` with one slot and a return value. Small, real, and exactly what the router stores. Build it when the server needs it, as `moveable_function.hpp` — not before.
+
+**The hard parts, named up front.**
+
+- **HTTP/1.1 parsing correctness.** This is where httplib's bug history lives, and where ours would too. The parser must be incremental and resumable (a request arrives in arbitrary fragments), strict on framing (Content-Length vs chunked, smuggling-adjacent edge cases), and tortured by a dedicated test corpus from day one. This is the real cost of the project; the architecture is the easy part.
+- **TLS handshakes in a non-blocking world.** The memory-BIO engine makes the state machine explicit, but renegotiation, close-notify, and half-closed connections still have to be walked carefully.
+- **Backpressure and abuse.** Bounded write queues per session, slow-client (slowloris) timeouts on the loop's own timers, connection caps.
+- **Scope held tight.** HTTP/1.1 + keep-alive + chunked only. No HTTP/2, no HTTP/3, no client (initially), no WebSocket in phase 1 — each is a separate decision later, not scope creep now.
+
+**Bar to clear.** A head-to-head against cpp-httplib at **10,000+ concurrent connections** (plus a plain-throughput run at low concurrency, where their blocking pool is at its best), published honestly whichever way it goes — the structural expectation is that a reactor holds the C10K line and a thread-per-request pool cannot, but expectations are not numbers. Plus: parser torture suite green, TSan green, and at least two TLS delegates proving the interface isn't a monoculture in disguise.
+
+**Phases.** 1: plaintext HTTP/1.1 server on `event_loop` (parser, router, keep-alive, chunked, compression delegates). 2: TLS delegates (OpenSSL first, memory-BIO engine; then a second backend to keep the interface honest). 3: the 10k+ head-to-head harness and numbers. 4: verdicts on client / WebSocket / zstd.
+
+**Effort.** Large ×2, dominated by parser correctness — and worth it: this is the first component that composes *everything* below it.
+
+---
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:
@@ -235,5 +272,6 @@ Written down so nobody — including us — spends a busy week on them:
 | 4 | Disruptor phase 1 | Large | **Shipped** |
 | 5 | `thread_pool` interface + mutex / sharded / dispatch impls | Medium | **Shipped** |
 | 6 | `mpmc_queue` + work-stealing pool | Large ×2 | **Shipped** |
-| 7 | `event_loop` phase 1 (POSIX reactor, replayable) | Large | **In progress** |
+| 7 | `event_loop` phase 1 (POSIX reactor, replayable) | Large | **In progress** — core + tests + TimeMaster demo landed; replay demo and dispatch bench remain |
 | 8 | Disruptor phase 2 (multi-producer) | Large | Only after phase 1 has miles on it |
+| 9 | HTTP/HTTPS server on delegates (§8) — with `moveable_function` when needed | Large ×2 | After event_loop phase 1 clears its bar |
