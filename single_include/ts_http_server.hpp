@@ -1289,7 +1289,32 @@ namespace http {
 
 // ---------------------------------------------------------------- status codes
 
-inline const char* status_text(int code) noexcept
+// The complete status line for the codes a server actually emits in volume.
+// Serialising a response otherwise costs five appends and an integer format
+// for a string that was knowable at compile time; this makes the common case
+// a single append of a literal. Returns null for anything not worth a slot,
+// and the general path handles those.
+constexpr const char* status_line(int code) noexcept
+{
+    switch (code) {
+    case 200: return "HTTP/1.1 200 OK\r\n";
+    case 201: return "HTTP/1.1 201 Created\r\n";
+    case 204: return "HTTP/1.1 204 No Content\r\n";
+    case 301: return "HTTP/1.1 301 Moved Permanently\r\n";
+    case 302: return "HTTP/1.1 302 Found\r\n";
+    case 304: return "HTTP/1.1 304 Not Modified\r\n";
+    case 400: return "HTTP/1.1 400 Bad Request\r\n";
+    case 401: return "HTTP/1.1 401 Unauthorized\r\n";
+    case 403: return "HTTP/1.1 403 Forbidden\r\n";
+    case 404: return "HTTP/1.1 404 Not Found\r\n";
+    case 405: return "HTTP/1.1 405 Method Not Allowed\r\n";
+    case 500: return "HTTP/1.1 500 Internal Server Error\r\n";
+    case 503: return "HTTP/1.1 503 Service Unavailable\r\n";
+    default:  return nullptr;
+    }
+}
+
+constexpr const char* status_text(int code) noexcept
 {
     switch (code) {
     case 100: return "Continue";
@@ -1391,30 +1416,59 @@ inline bool iequals(const std::string& a, const char* b) noexcept
     return iequals(a.data(), a.size(), b, std::strlen(b));
 }
 
-inline bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
+constexpr bool is_digit(char c) noexcept { return c >= '0' && c <= '9'; }
 
-// RFC 9110 token characters - anything else in a field name or method is a
-// hard error, which is also what keeps "Content-Length : 5" out
+// Character classification, resolved at compile time.
+//
+// Every byte of every method and every header field name is classified, and
+// every byte of a chunk size and percent escape is hex-decoded - so these are
+// the hottest predicates in the parser. Built as 256-entry tables by a
+// constexpr function, the run-time cost becomes one indexed load instead of a
+// chain of comparisons, and the tables land in .rodata rather than being
+// assembled at startup.
+//
+// constexpr, not consteval: this library is C++17, where consteval does not
+// exist. It would express "compile time or fail" more exactly, but generates
+// identical code, so it is not worth a version fence.
+
+struct char_tables {
+    bool token[256]{};
+    signed char hex[256]{};
+};
+
+constexpr char_tables make_char_tables() noexcept
+{
+    char_tables t{};
+    for (int i = 0; i < 256; ++i) {
+        t.token[i] = false;
+        t.hex[i] = -1;
+    }
+    for (int c = 'a'; c <= 'z'; ++c) t.token[c] = true;
+    for (int c = 'A'; c <= 'Z'; ++c) t.token[c] = true;
+    for (int c = '0'; c <= '9'; ++c) t.token[c] = true;
+    // RFC 9110 tchar. Anything outside this in a field name is a hard error,
+    // which is what keeps "Content-Length : 5" - and its desync - out
+    const char extra[] = {'!', '#', '$', '%', '&', '\'', '*',
+                          '+', '-', '.', '^', '_', '`', '|', '~'};
+    for (char c : extra)
+        t.token[static_cast<unsigned char>(c)] = true;
+
+    for (int c = '0'; c <= '9'; ++c) t.hex[c] = static_cast<signed char>(c - '0');
+    for (int c = 'a'; c <= 'f'; ++c) t.hex[c] = static_cast<signed char>(c - 'a' + 10);
+    for (int c = 'A'; c <= 'F'; ++c) t.hex[c] = static_cast<signed char>(c - 'A' + 10);
+    return t;
+}
+
+inline constexpr char_tables kChars = make_char_tables();
+
 inline bool is_token_char(char c) noexcept
 {
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_digit(c))
-        return true;
-    switch (c) {
-    case '!': case '#': case '$': case '%': case '&': case '\'': case '*':
-    case '+': case '-': case '.': case '^': case '_': case '`': case '|':
-    case '~':
-        return true;
-    default:
-        return false;
-    }
+    return kChars.token[static_cast<unsigned char>(c)];
 }
 
 inline int hex_value(char c) noexcept
 {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
+    return kChars.hex[static_cast<unsigned char>(c)];
 }
 
 // Strict: a malformed escape is a 400, not a literal '%'
@@ -2302,11 +2356,15 @@ public:
                           connection_host& host, std::string& out)
     {
         out.reserve(192 + res.body.size());
-        out += "HTTP/1.1 ";
-        detail::append_uint(out, static_cast<unsigned long long>(res.status));
-        out += ' ';
-        out += status_text(res.status);
-        out += "\r\n";
+        if (const char* line = status_line(res.status)) {
+            out += line;                        // the common codes, pre-baked
+        } else {
+            out += "HTTP/1.1 ";
+            detail::append_uint(out, static_cast<unsigned long long>(res.status));
+            out += ' ';
+            out += status_text(res.status);
+            out += "\r\n";
+        }
         if (!res.headers.has("date")) {
             out += "Date: ";
             out += host.http_date();
@@ -3040,11 +3098,18 @@ inline void session_core::complete(std::uint64_t stream, response&& res)
         s->on_access(pending);
     }
 
-    flush();
-    if (live_)
-        drive();                                // a pipelined request may be waiting
-    if (live_)
+    // Coalesce. While we are still inside the read loop (driving), more
+    // pipelined requests may follow, and on_readable() flushes once at the
+    // end - so a batch of N pipelined requests costs one write() instead of
+    // N. Answering off-thread lands here with driving false and must go out
+    // immediately, since no read loop is coming back to do it.
+    if (!driving) {
         flush();
+        if (live_)
+            drive();                            // a pipelined request may be waiting
+        if (live_)
+            flush();
+    }
 }
 
 } // namespace detail
@@ -3181,10 +3246,16 @@ public:
                 continue;
             const int on = 1;
             ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
-#ifdef SO_REUSEPORT
-            if (c.cfg.reuse_port)
+            if (c.cfg.reuse_port) {
+                // SO_REUSEPORT_LB (FreeBSD) actually load-balances; plain
+                // SO_REUSEPORT does so on Linux but not on macOS/BSD, where it
+                // only permits the duplicate bind. See listen_shared().
+#ifdef SO_REUSEPORT_LB
+                ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT_LB, &on, sizeof on);
+#elif defined(SO_REUSEPORT)
                 ::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof on);
 #endif
+            }
             if (a->ai_family == AF_INET6) {
                 const int v6only = 0;
                 ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof v6only);
@@ -3202,22 +3273,43 @@ public:
         detail::suppress_sigpipe(fd);
         c.listen_fd = fd;
         c.bound_port = actual_port(fd);
-
-        auto weak = std::weak_ptr<detail::server_core>(c_);
-        c.listen_watch = c.loop.watch(fd, fd_interest::read);
-        c.listen_conn = c.listen_watch.on_readable().connect([weak] {
-            if (auto s = weak.lock())
-                s->accept_ready();
-        });
-
-        c.sweeper = c.loop.every(c.cfg.sweep_interval);
-        c.sweep_conn = c.sweeper.on_fire().connect([weak] {
-            if (auto s = weak.lock())
-                s->sweep();
-        });
-
+        arm_listener();
         return c.bound_port;
     }
+
+    // Accept from a listening socket someone else already bound - the portable
+    // way to run several reactors, each with its own loop and thread, on one
+    // port. The descriptor is duplicated so this server owns its own and can
+    // be shut down independently.
+    //
+    // Why this exists: SO_REUSEPORT load-balances incoming connections on
+    // Linux, but on macOS and the BSDs it only permits the duplicate bind -
+    // delivery still goes to a single socket, so N reactors silently become 1.
+    // (FreeBSD's balancing flag is SO_REUSEPORT_LB, used automatically below
+    // where it exists.) Sharing one listener works everywhere: every loop
+    // watches it and whichever wakes first wins the non-blocking accept.
+    std::uint16_t listen_shared(int listening_fd)
+    {
+        auto& c = *c_;
+        if (c.listen_fd >= 0)
+            throw std::logic_error("http::server: already listening");
+        if (listening_fd < 0)
+            throw std::invalid_argument("http::server: bad listening descriptor");
+
+        const int fd = ::dup(listening_fd);
+        if (fd < 0)
+            throw std::runtime_error("http::server: could not duplicate the listening socket");
+        detail::set_nonblocking(fd);
+        detail::suppress_sigpipe(fd);
+        c.listen_fd = fd;
+        c.bound_port = actual_port(fd);
+        arm_listener();
+        return c.bound_port;
+    }
+
+    // The listening descriptor, for handing to listen_shared() on sibling
+    // reactors. Owned by this server; do not close it.
+    int listener() const noexcept { return c_->listen_fd; }
 
     void run() { c_->loop.run(); }
     bool run_once(std::chrono::milliseconds max_wait = std::chrono::milliseconds{0})
@@ -3244,6 +3336,23 @@ public:
     moveable_signal<const char*, int>& on_error() noexcept { return c_->on_error; }
 
 private:
+    void arm_listener()
+    {
+        auto& c = *c_;
+        auto weak = std::weak_ptr<detail::server_core>(c_);
+        c.listen_watch = c.loop.watch(c.listen_fd, fd_interest::read);
+        c.listen_conn = c.listen_watch.on_readable().connect([weak] {
+            if (auto s = weak.lock())
+                s->accept_ready();
+        });
+
+        c.sweeper = c.loop.every(c.cfg.sweep_interval);
+        c.sweep_conn = c.sweeper.on_fire().connect([weak] {
+            if (auto s = weak.lock())
+                s->sweep();
+        });
+    }
+
     static std::uint16_t actual_port(int fd) noexcept
     {
         sockaddr_storage ss{};

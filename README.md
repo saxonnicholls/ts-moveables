@@ -540,14 +540,54 @@ Cross-cutting concerns are signals — `on_open`, `on_access`, `on_close`, `on_e
 
 | Scenario | Result |
 |---|---|
-| keep-alive throughput, 4-byte bodies | ~93,000 req/s over 16 connections |
+| keep-alive throughput, 4-byte bodies | ~94,000 req/s over 16 connections |
 | 1 KiB payloads | ~87,000 req/s, ~85 MiB/s of response body |
-| pipelined on one connection (depth 64) | ~135,000 req/s |
+| pipelined on one connection (depth 64) | ~370,000 req/s |
 | **simultaneous connections** | **10,000 held open and all served in 175 ms** |
 | async responders | 200 in flight, all answered off-loop |
 | large bodies | 2 MiB up and back in 10 ms |
 
-Honest framing on those numbers: the load generator shares the machine with the server, so they are single-box figures — good for tracking regressions and comparing designs on identical hardware, not a substitute for the head-to-head against cpp-httplib at 10k+ connections across a real network, which is [phase 6 of the plan](FUTURE_DIRECTIONS.md) and will be published whichever way it goes. The number that already means something is the fourth row: ten thousand simultaneous connections, one thread, no thread pool, 175 ms to serve them all.
+Honest framing on those numbers: the load generator shares the machine with the server, so they are single-box figures — good for tracking regressions and comparing designs on identical hardware. The number that already means something is the fourth row: ten thousand simultaneous connections, one thread, no thread pool, 175 ms to serve them all.
+
+### Head-to-head vs cpp-httplib
+
+`make bench-http` runs the **same load generator** against both servers, one at a time, in one binary, on the same machine. httplib is measured twice — exactly as it ships, and tuned with a 1024-thread pool and raised keep-alive limits, which is the best case its design allows. Its listen backlog is raised to match ours, because losing on a backlog constant would say nothing about the design. 32 hardware threads, figures stable within a few percent across runs:
+
+| Scenario | ts-moveables (**1 thread**) | cpp-httplib (as shipped) | cpp-httplib (tuned, 1024 threads) |
+|---|---|---|---|
+| keep-alive, 16 connections | **~98,000 req/s** | ~8,100 req/s | ~8,600 req/s |
+| keep-alive, 256 connections | **~98,000 req/s** | ~6,500 req/s | ~6,500 req/s |
+| 1 KiB payloads, 16 connections | **~94,000 req/s** | ~9,000 req/s | ~8,800 req/s |
+| 1,000 connections held open | **all 1,000 served in 11 ms** | 496 of 1,000, rest unserved at 20 s | 286 of 1,000, rest unserved at 20 s |
+| 10,000 connections held open | **all 10,000 served in 177 ms** | 124 of 10,000, rest unserved at 20 s | only 1,417 could even *connect* in 20 s; 245 served |
+
+Roughly **10–15× on throughput and a different category entirely on concurrency** — and the concurrency rows are the ones that matter, because they are structural rather than incidental. A blocking server pins a thread for the lifetime of a keep-alive connection, so the number of connections it can *hold* is the number of threads it has; adding threads moves the wall without removing it, and past a point makes throughput worse (note the tuned column losing to the default one). A reactor holds connections in a hash map. That is not a tuning difference, and no amount of tuning closes it.
+
+**What this does not say, stated plainly.** httplib is a mature, feature-rich library and this is a phase-1 server: it does *less per request* — no compression negotiation, no multipart, no range requests, no static-file serving, no regex routing — and some of that gap is surely feature cost rather than architecture. It is also loopback on a single box with the load generator competing for the same cores, and it is one machine, one OS, one compiler. The throughput multiple is the number to treat with suspicion; the concurrency behaviour is the number to believe, because it follows directly from thread-per-connection and reproduces exactly as theory predicts. Run it yourself: `make bench-http` fetches httplib on demand — nothing third-party is committed here, and the library stays dependency-free.
+
+**Next opponent: nginx.** httplib is a *different* architecture (thread-per-connection), so beating it demonstrates the architecture, not the implementation. nginx is the same architecture done extremely well — a mature multi-process reactor with years of tuning — so it is the opponent that actually grades our code rather than our design. The expectation going in is that we lose on raw throughput, and that result is worth publishing exactly as much as this one. It needs a different harness shape (an external process rather than an in-process server), which is tracked in [FUTURE_DIRECTIONS](FUTURE_DIRECTIONS.md).
+
+### What benchmarking found
+
+Two things, both worth stating because neither was visible from reading the code:
+
+- **Write coalescing — 2.7× on pipelined traffic.** Responses were flushed one at a time, so a batch of 32 pipelined requests cost 32 `send()` calls instead of one. The tell was a throughput ceiling with the machine 90% idle — not CPU-bound, not connection-bound, just too many small packets. Coalescing inside the read loop (while still flushing immediately for off-thread completions, which have no read loop coming back for them) took pipelined throughput from ~135,000 to ~370,000 req/s on one connection.
+- **`constexpr` character tables — 3% to 8%.** Every byte of every method and header name is classified, and every chunk size and percent escape is hex-decoded. Built as 256-entry tables by a `constexpr` function instead of a chain of comparisons, that is worth ~3% on a one-header request and ~8% on a realistic twelve-header one — measured A/B, five runs each, with the gain scaling with parsing work as you would expect. It also cut run-to-run variance from 14% to 2%, since a table lookup cannot mispredict. (`consteval` would express the intent more precisely but does not exist in C++17 and generates identical code, so it is not worth a version fence.)
+
+### Scaling across cores
+
+One reactor is one thread. For more, run several — each with its own loop, its own thread and its own sessions, sharing one listening socket (`listen_shared`), with **nothing shared between them**: no queue, no lock, no session table. `make bench-scale` sweeps it:
+
+| Reactors | Throughput | vs 1 | CPU in use |
+|---|---|---|---|
+| 1 | ~610,000 req/s | 1.00× | 1.4 of 32 cores |
+| 4 | ~1,880,000 req/s | ~2.9× | 4.3 of 32 cores |
+| 8 | ~2,890,000 req/s | ~4.8× | 7.5 of 32 cores |
+| 16–32 | ~2,900,000 req/s | ~4.8× | ~8 of 32 cores |
+
+The plateau is the *load generator*, not the server — it lives on the same box and the sweep reports CPU precisely so that ceiling is visible rather than implied. With 24 of 32 cores still idle at the top of the table, this measures how much load one machine can generate against itself, and the real scaling curve needs a second machine.
+
+A portability note worth having: `SO_REUSEPORT` load-balances accepts on **Linux**, but on macOS and the BSDs it only permits the duplicate bind — delivery still goes to one socket, so N reactors silently become 1. The benchmark reports per-reactor connection counts precisely to catch that, and did: the first run showed 31 of 32 reactors never receiving a single connection. `listen_shared()` works everywhere. (FreeBSD's balancing flag is `SO_REUSEPORT_LB`, used automatically where it exists.)
 
 **Phase 1 scope, plainly.** HTTP/1.1 only, plaintext only, POSIX only (it follows the [event loop](#event_loop); `SNICHOLLS_HAS_HTTP_SERVER` is 0 on Windows). No TLS, HTTP/2, HTTP/3 or WebSocket *yet* — all four are designed in [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md) with the interfaces already carrying the stream ids they need, and each has an external grader it must pass before it ships: h2spec, Autobahn, the QUIC interop runner.
 

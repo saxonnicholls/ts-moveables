@@ -107,6 +107,24 @@ demo-timemaster: build/time_master_demo
 demo-http: build/http_server_demo
 	./build/http_server_demo
 
+# Head to head vs cpp-httplib. Fetches their header on demand into
+# benchmarks/third_party/ (gitignored) - the library stays dependency-free.
+build/http_compare: benchmarks/http_compare.cpp $(HEADERS) | build
+	./scripts/fetch_bench_deps.sh
+	$(CXX) -std=$(STD) -Wall -Wextra -O3 -DNDEBUG -DCPPHTTPLIB_LISTEN_BACKLOG=1024 \
+	    -Ibenchmarks/third_party -pthread benchmarks/http_compare.cpp -o $@ $(LDLIBS)
+
+bench-http: build/http_compare
+	./build/http_compare
+
+# Multi-reactor scaling: N loops, N threads, one shared port (SO_REUSEPORT)
+build/http_scale: benchmarks/http_scale.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    benchmarks/http_scale.cpp -o $@ $(LDLIBS)
+
+bench-scale: build/http_scale
+	./build/http_scale
+
 # One self-contained file per entry header, for drop-in use
 amalgamate:
 	python3 scripts/amalgamate.py http_server.hpp
@@ -122,4 +140,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http amalgamate check-amalgamate clean
+.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http bench-http bench-scale amalgamate check-amalgamate clean

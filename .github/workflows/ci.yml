@@ -89,6 +89,32 @@ jobs:
             exit 1
           }
 
+      # Multi-reactor scaling sweep. Informational: CI runners are shared and
+      # noisy, and the load generator is co-resident, so this tracks shape
+      # rather than absolute numbers.
+      - name: Multi-reactor scaling (informational)
+        continue-on-error: true
+        run: |
+          make build/http_scale CXX=${{ matrix.cxx }}
+          {
+            echo "## HTTP multi-reactor scaling - ${{ matrix.name }}"
+            echo ""
+            ./build/http_scale --markdown 2>/dev/null
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Head-to-head vs cpp-httplib. Informational and best-effort, like the
+      # moodycamel comparison: it fetches a third-party header on demand, and
+      # CI runners are noisy shared machines, so it must never gate the build.
+      - name: Head-to-head vs cpp-httplib (informational)
+        continue-on-error: true
+        run: |
+          make build/http_compare CXX=${{ matrix.cxx }}
+          {
+            echo "## HTTP head-to-head vs cpp-httplib - ${{ matrix.name }}"
+            echo ""
+            ./build/http_compare --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       # Head-to-head vs moodycamel. Best-effort: fetches third-party headers on
       # demand, so a network hiccup must never gate the build.
       - name: Head-to-head vs moodycamel (informational)
