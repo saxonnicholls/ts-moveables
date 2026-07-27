@@ -116,13 +116,25 @@ void test_log_many_threads()
 
 void test_log_lanes_are_independent()
 {
-    // The reason lanes exist: a slow sink must not hold up a fast one
-    logger lg;
+    // The reason lanes exist: a slow sink must not hold up a fast one.
+    //
+    // Both counters are declared BEFORE the logger so that they are destroyed
+    // AFTER it. This test is the one place that deliberately leaves records in
+    // flight - it asserts the slow lane dropped some - so the slow lane's
+    // drain thread is still running at scope exit, and it is the logger's
+    // destructor that joins it. Declared the other way round, the counters
+    // would be destroyed first and that thread would touch dead stack. Which
+    // is exactly what happened: ASan caught it here, nowhere else, because
+    // every other test in this file flushes first. The rule this encodes is
+    // the one users need too - whatever a sink captures by reference must
+    // outlive the logger.
     std::atomic<int> fast{0};
+    std::atomic<int> slow{0};
+
+    logger lg;
     lg.add_sink([&](const record&) { fast.fetch_add(1, std::memory_order_relaxed); });
 
     auto slow_lane = lg.add_lane("slow", 8, overflow::drop_newest);
-    std::atomic<int> slow{0};
     slow_lane.add_sink([&](const record&) {
         std::this_thread::sleep_for(2ms);           // a database, a network hop
         slow.fetch_add(1, std::memory_order_relaxed);

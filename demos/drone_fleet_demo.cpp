@@ -549,6 +549,13 @@ int main(int argc, char** argv)
 
     ground_station ground;
 
+    // Anything a sink captures by reference is declared BEFORE the logger, so
+    // it is destroyed AFTER it. Lanes drain on their own threads and it is the
+    // logger's destructor that joins them; a counter declared after the logger
+    // dies while those threads may still be running. `ground` above follows the
+    // same rule - the stream sink holds a reference to it.
+    std::atomic<long long> console_lines{0};
+
     // ------------------------------------------------------- the three lanes
     log::logger_config cfg;
     cfg.name = "fleet";
@@ -559,7 +566,6 @@ int main(int argc, char** argv)
     log::logger fleet{cfg};
 
     // Five operator consoles, counting what they would have shown
-    std::atomic<long long> console_lines{0};
     for (int op = 0; op < kOperators; ++op)
         fleet.add_sink([&console_lines, op](const log::record& r) {
             // Each console watches two aircraft, so the team covers the fleet

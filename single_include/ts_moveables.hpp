@@ -2670,6 +2670,21 @@ namespace snicholls
 //  numeric value, so it reaches every sink you already have, and a metrics
 //  sink is just another slot.
 //
+//  **The one lifetime rule.** Connect-and-park guarantees the *sink* dies with
+//  the logger. It says nothing about what the sink points at. Sinks run on
+//  lane threads and it is the logger's destructor that joins them, so anything
+//  a sink captures by reference must outlive the logger - declare it before
+//  the logger, since destruction runs in reverse:
+//
+//      std::atomic<long long> lines{0};    // declared first, destroyed last
+//      logger lg;
+//      lg.add_sink([&lines](const record&) { ++lines; });
+//
+//  Backwards, and a lane thread can touch dead stack while it drains. Flushing
+//  first usually hides it, which is what makes it worth stating: the bug shows
+//  up only when records are still in flight at teardown. Capturing shared
+//  state by `shared_ptr` sidesteps the question entirely.
+//
 //  Honest positioning against [spdlog](https://github.com/gabime/spdlog):
 //  spdlog is faster at formatting and far more mature, and it has a
 //  battle-tested rotating-file story we do not. What this has instead is the
