@@ -2,7 +2,7 @@
 //  http/parser.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  The HTTP/1.1 request parser: incremental, resumable, and deliberately
 //  strict.

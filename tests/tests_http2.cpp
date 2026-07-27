@@ -2,7 +2,7 @@
 //  tests_http2.cpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - unit tests for HTTP/2 (RFC 9113) and HPACK (7541)
 //

@@ -2,7 +2,7 @@
 //  interfaces/protocol_delegate.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  How bytes become requests - the second of the two axes.
 //

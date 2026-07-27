@@ -3,7 +3,7 @@
 #  check_msvc_capture.py
 #  TSMoveables
 #
-#  Copyright 2026 Saxon Herschel Nicholls
+#  Copyright 2010-2026 Saxon Herschel Nicholls
 #
 #  Guards against MSVC C3493, which has now broken CI five times.
 #

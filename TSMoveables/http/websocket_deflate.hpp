@@ -2,7 +2,7 @@
 //  websocket_deflate.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - permessage-deflate (RFC 7692) as an extension delegate
 //

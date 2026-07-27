@@ -2,7 +2,7 @@
 //  tests_disruptor.cpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - unit tests for the disruptor
 //  (phase 1: single producer; phase 2: multi-producer)

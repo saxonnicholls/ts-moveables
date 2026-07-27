@@ -2,7 +2,7 @@
 //  loop_dispatch.cpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - what does typed dispatch actually cost?
 //

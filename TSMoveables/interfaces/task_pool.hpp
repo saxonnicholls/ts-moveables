@@ -2,7 +2,7 @@
 //  interfaces/task_pool.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Somewhere to submit work - the interface the thread pools share.
 //

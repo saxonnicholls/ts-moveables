@@ -2,7 +2,7 @@
 //  interfaces/transport_delegate.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  How bytes reach a connection - one of the two axes the server hangs on.
 //

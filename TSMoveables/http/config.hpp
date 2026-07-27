@@ -2,7 +2,7 @@
 //  http/config.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  The knobs, and what the observation taps carry.
 //

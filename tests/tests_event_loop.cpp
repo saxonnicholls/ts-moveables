@@ -2,7 +2,7 @@
 //  tests_event_loop.cpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - unit tests for the event loop (phase 1, POSIX)
 //

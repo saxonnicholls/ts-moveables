@@ -2,7 +2,7 @@
 //  interfaces/ws_extension.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  A WebSocket per-message extension (RFC 6455 §9) - the third delegate axis.
 //

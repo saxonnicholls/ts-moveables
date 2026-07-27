@@ -2,7 +2,7 @@
 //  logging.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - logging and telemetry, from any thread, anywhere
 //

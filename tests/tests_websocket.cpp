@@ -2,7 +2,7 @@
 //  tests_websocket.cpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - unit tests for the WebSocket protocol delegate
 //

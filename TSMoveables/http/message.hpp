@@ -2,7 +2,7 @@
 //  http/message.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  What an HTTP message is: status codes, methods, header lists, request and
 //  response - and the byte-level plumbing they are built from.

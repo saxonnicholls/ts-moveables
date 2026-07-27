@@ -2,7 +2,7 @@
 //  time_master.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - a periodic event scheduler on the event loop
 //

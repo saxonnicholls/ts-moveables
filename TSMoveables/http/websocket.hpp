@@ -2,7 +2,7 @@
 //  websocket.hpp
 //  TSMoveables
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables - WebSocket (RFC 6455) as a protocol delegate
 //

@@ -4,7 +4,7 @@
 //
 //  Created by Saxon Nicholls on 21/7/2026.
 //
-//  Copyright 2026 Saxon Herschel Nicholls
+//  Copyright 2010-2026 Saxon Herschel Nicholls
 //
 //  Thread Safe Moveables
 //
