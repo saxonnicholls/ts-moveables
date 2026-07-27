@@ -3376,7 +3376,11 @@ public:
 private:
     struct core {
         logger_config cfg;
-        std::atomic<level> level;
+        // Qualified: using unqualified `level` as a type and then declaring a
+        // member of that name changes its meaning inside this class, which
+        // GCC rejects outright (-Wchanges-meaning). `record` already does it
+        // this way; this one did not, and only GCC noticed.
+        std::atomic<log::level> level;
         std::vector<std::shared_ptr<detail::lane_state>> lanes;
 
         explicit core(logger_config c) : cfg(std::move(c)), level(cfg.level) {}

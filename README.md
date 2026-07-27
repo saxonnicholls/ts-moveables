@@ -13,7 +13,9 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[`event_loop`](#event_loop)** — a clean, typed POSIX reactor (epoll / kqueue) whose dispatch is signals: handler lifetimes safe by construction, moveable watches and timers, replayable by design
 - **[`time_master`](#time_master)** — the legendary periodic scheduler, rebuilt on the loop: drift-free *and* burst-free timers, events added and cancelled from any thread while running, and the whole scheduler is a moveable value
 - **[`websocket`](#websocket)** — RFC 6455 as a protocol delegate swapped onto a live connection: **all 517 Autobahn cases clean, including permessage-deflate**, and `wss` for free
+- **[`logging`](#logging)** — log and telemetry from any thread with no locks and no logger threaded through your call graph: bounded lock-free hand-off so producers never block, independent lanes so a slow sink cannot stall a fast one, and live JSON over the WebSocket
 - **[`http_server`](#http_server)** — a non-blocking HTTP/1.1 server (plus [WebSocket](#websocket) and TLS) on that reactor, with runtime delegates instead of `#ifdef`s and handlers that can answer *later*: 10,000 concurrent connections on one thread, available as a single drop-in header
+- **[`http2`](#http2)** — HTTP/2 as a protocol delegate: framing, HPACK with compile-time Huffman tables, flow control, multiplexing. **h2spec: 147 of 147**
 - **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs
 
 One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rule: every type keeps the **integrity of its state** across a move — a move happens on a quiescent object or fails loudly — which hands classes composed from these types the [rule of zero](https://en.cppreference.com/cpp/language/rule_of_three) back: write no special member functions, and the compiler generates correct moves. The overhead: composition wrappers are the same size as what they wrap (the tests `static_assert` it), the safety checks are a `try_lock` probe or a relaxed flag, and everything is header-only, C++17 and later, dependency-free, `cassert`-tested, and ThreadSanitizer-verified across the CI matrix.
@@ -23,7 +25,21 @@ One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rul
 Header-only, zero dependencies, C++17 or later — **nothing to build**. Drop the headers on your include path (or use CMake [FetchContent / `find_package`](#cmake)), then include the umbrella — or just the one header you need:
 
 ```cpp
-#include "ts_moveables.hpp"        // everything, or e.g. #include "moveable_mutex.hpp"
+#include "ts_moveables.hpp"        // everything, or just what you need:
+#include "moveable/mutex.hpp"
+#include "http/server.hpp"
+```
+
+Headers are organised by what they are, and one directory is worth knowing about: **`interfaces/`** holds the extension points. Writing a TLS backend means implementing `interfaces/transport_delegate.hpp` — about sixty lines that need only `<string>` — not including the server.
+
+```
+moveable/     the original rule: immovable made moveable
+concurrent/   lock-free containers, synchronized, thread pools
+event/        the reactor and what runs on it
+http/         server, HTTP/2, WebSocket, compression
+tls/          transport backends (opt-in — these link a library)
+logging/      records, lanes, sinks, replay
+interfaces/   the extension points you implement
 ```
 
 The whole point, in five lines — a concurrent class that just *moves*:
@@ -50,6 +66,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | an **HTTP server** that does not park a thread per connection | [`http_server`](#http_server) — routes, async responders, or one drop-in header |
 | **WebSockets**, or `wss` | [`websocket`](#websocket) — Autobahn-clean, one route handler |
 | to **run closures on a schedule** | [`time_master`](#time_master) — periodic and one-shot, cancellable, moveable |
+| to **log or emit telemetry** from anywhere | [`logging`](#logging) — `SN_LOG_INFO() << ...`, any thread, sinks in isolated lanes |
 | the **fastest possible raw single-op queue** | honestly? [moodycamel](#which-should-you-use). We tell you when *not* to pick us. |
 
 Build and test locally: `make test` (or `cmake -B build && ctest --test-dir build --output-on-failure`). Pick the standard with `make test STD=c++17`. That's it.
@@ -465,6 +482,8 @@ Working programs, not snippets. Each builds and runs with one make target; the l
 | [pcap_replay_demo](demos/pcap_replay_demo.cpp) | `make demo-pcap` | the same discipline over real network captures: a dependency-free classic-pcap reader, packets travelling zero-copy by `const&` through decode and flow-partition nodes, a journal of 4-byte offsets, and a bit-exact replay |
 | [taskflow_style_demo](demos/taskflow_style_demo.cpp) | `make demo-taskflow` | [Taskflow](https://taskflow.github.io)-style dependency graphs on signals: diamonds, 1→64→1 fan-in joins, graph reuse, concurrent pipelines and computation-as-event — with no scheduler, so no thread starvation: a task runs inline on the thread that completes its last dependency |
 | [http_server_demo](demos/http_server_demo.cpp) | `make demo-http` | the [HTTP server](#http_server) under load, with every response verified: keep-alive and pipelined throughput, 1 KiB payload bandwidth, async responders answered off the loop thread, 2 MiB bodies round-tripped — and **10,000 simultaneous connections held open and served by a single loop on a single thread** |
+| [drone_fleet_demo](demos/drone_fleet_demo.cpp) | `make demo-drones` | the shape this was built for: ten aircraft streaming telemetry, five operators on live consoles, fifteen flight logs, and one listener relaying to New York, London, San Francisco and Sydney — with a training replay paced by the original timestamps. Verifies that the flight record loses nothing, every office receives its stream **in order**, and logging never stalls an aircraft thread (0.041 ms worst case across 4,000 calls) |
+| [replay_loop_demo](demos/replay_loop_demo.cpp) | `make demo-replay` | determinism: a scripted session over sockets, timers and cross-thread posts is journalled through the loop's dispatch tap, replayed into a *fresh* handler graph with no sockets, timers, threads or clock, and the digests match bit for bit — with a negative control that drops one event and asserts they then diverge |
 | [time_master_demo](demos/time_master_demo.cpp) | `make demo-timemaster` | a production periodic-event scheduler (TimeMaster) rebuilt on [`event_loop`](#event_loop) in ~60 lines: closures at intervals, add-while-running from any thread, cancel by id, drift-free *and* burst-free cadence asserted, teardown measured in microseconds — and the whole scheduler is a moveable value, which its Boost.Asio ancestor never was |
 
 For the pcap demo, bring your own data — `./build/pcap_replay_demo capture.pcap` — or capture live traffic with [scripts/capture_pcap.sh](scripts/capture_pcap.sh), which auto-detects your default interface (`en0` on macOS, `eth0`-style on Linux), runs `sudo tcpdump -s 0 -w`, and prints the replay command. Public capture files to experiment with are indexed at [netresec.com/?page=PcapFiles](https://www.netresec.com/?page=PcapFiles) — note that many are pcapng or gzipped, and the reader takes classic pcap, so convert first: `tcpdump -r in.pcapng -w out.pcap`. Without any file, the demo synthesises a capture, so it always runs.
@@ -738,6 +757,53 @@ The plateau is the *load generator*, not the server — it lives on the same box
 A portability note worth having: `SO_REUSEPORT` load-balances accepts on **Linux**, but on macOS and the BSDs it only permits the duplicate bind — delivery still goes to one socket, so N reactors silently become 1. The benchmark reports per-reactor connection counts precisely to catch that, and did: the first run showed 31 of 32 reactors never receiving a single connection. `listen_shared()` works everywhere. (FreeBSD's balancing flag is `SO_REUSEPORT_LB`, used automatically where it exists.)
 
 **Phase 1 scope, plainly.** HTTP/1.1 only, plaintext only, POSIX only (it follows the [event loop](#event_loop); `SNICHOLLS_HAS_HTTP_SERVER` is 0 on Windows). No TLS, HTTP/2, HTTP/3 or WebSocket *yet* — all four are designed in [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md) with the interfaces already carrying the stream ids they need, and each has an external grader it must pass before it ships: h2spec, Autobahn, the QUIC interop runner.
+
+## http2
+
+HTTP/2 as a **protocol delegate** — the second axis of the same matrix TLS sits on. Enable it and ALPN picks per connection; nothing else about the server changes:
+
+```cpp
+snicholls::http::server srv;
+snicholls::http::enable_http2(srv);        // h2 by ALPN, h2c by prior knowledge
+```
+
+**Graded by [h2spec](https://github.com/summerwind/h2spec) — `make h2spec`: 147 tests, 147 passed, 0 failed.** Framing, HPACK, the stream state machine, bidirectional flow control, and the abuse limits from the start rather than after the first incident: header-list caps against HPACK bombs, concurrent-stream bounds, and RST/SETTINGS rate limits for the 2023 Rapid Reset class.
+
+Two things worth pulling out.
+
+**The `stream` parameter paid off.** `deliver`, `respond`, `begin_stream` and `stream_write` have carried a stream id since phase 1, always `0` for HTTP/1.x, specifically so a multiplexed protocol would need no interface change. Building HTTP/2 needed none — and async responders and streaming already complete out of order, which is most of what multiplexing wants. That was the one piece of forward design paid for up front, and it was worth it.
+
+**The Huffman tables are compile-time**, like the parser's character tables: a 4-bit-nibble DFA built by a `constexpr` function, landing 14 KiB in `.rodata` with **zero startup initialisers** — verified with `nm`, not assumed. HPACK is graded against the RFC 7541 Appendix C vectors including the C.5/C.6 series the RFC sets to a 256-octet table specifically to force evictions, because that is the check that catches a decoder which merely agrees with its own encoder.
+
+Deliberately not done, and said plainly: `Upgrade: h2c` (RFC 9113 removed it), server push (we advertise `ENABLE_PUSH=0`), CONNECT, and PRIORITY beyond parse-and-ignore (RFC 9113 deprecates the scheme). One known limit: **outbound buffering is unbounded** if a client stalls its flow-control window mid-stream, and `response_stream::pending()` reports socket backlog rather than the h2 queue, so backpressure is invisible to a streaming producer. Fine for buffered responses, a real limit for large streamed ones.
+
+## logging
+
+Log and emit telemetry from any thread, any function, any destructor, without threading a logger through your call graph:
+
+```cpp
+SN_LOG_INFO() << "order " << id << " filled at " << px;
+SN_LOG_WARN().channel(7).field("venue", "XLON") << "reject: " << why;
+```
+
+**The architecture is one decision.** `moveable_signal` runs its slots on the emitting thread, so a logger that emitted straight from `LOG()` would run every sink there too — a Postgres round trip or a WebSocket write to another continent, on whatever thread happened to log. That is worse than no logging library, because it couples your latency to your slowest observer. So `LOG()` does not emit: it stamps a record, pushes it to a bounded lock-free `mpmc_queue`, and returns.
+
+**Sinks live in lanes**, because one drain thread would mean a slow sink holding up a fast one. Each lane is a queue and a thread with its own policy:
+
+```cpp
+lg.add_sink(console_sink());                       // default lane
+lg.add_sink(file_sink("app.log"));                 // same lane, still fast
+lg.add_lane("postgres").add_sink(pg_sink());       // its own thread
+lg.add_ordered_lane("relay").add_sink(json_sink(broadcast));
+```
+
+The policies *are* the design: `block` for a flight record that must lose nothing, `drop_newest` for consoles where a missed line hurts nobody, `drop_oldest` for a live view where **stale data is worse than missing data** — an operator wants where the aircraft *is*, not a backlog of where it was. Drops are counted, never silent.
+
+**Ordering needed more than a timestamp.** Two threads can read the same clock, and a thread can be descheduled between stamping and queueing, so records do not arrive in creation order. Every record carries a `seq` from a single atomic — the number an investigator sorts by, and gaps in which prove nothing was lost. An *ordered lane* puts a bounded reordering window in front of its sinks, and flushes it when the stream ends so nobody has to remember to. For sequence numbers that survive a restart, `persistent_sequence` reserves blocks: numbers are skipped, never reused, because a gap means "we restarted" and a repeat would make the ordering a lie.
+
+**Replay** falls out: a `journal` is just another sink, and `replayer` re-emits at the original pace, so a trainee sees an incident unfold the way the operator did. Nothing downstream can tell a replayed record from a live one — the training console *is* the production console.
+
+Honest positioning against [spdlog](https://github.com/gabime/spdlog): it is faster at formatting, far more mature, and has a battle-tested rotating-file story we do not. What this has is the fabric — one pipeline, any thread, sinks that are ordinary signal slots with lifetime tracking, and a live WebSocket sink that falls out of composition rather than a plugin API. See [`make demo-drones`](#demos) for the whole thing under load.
 
 ## HTTPS (TLS)
 

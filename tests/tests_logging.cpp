@@ -95,7 +95,9 @@ void test_log_many_threads()
     lg.add_sink([&](const record&) { got.fetch_add(1, std::memory_order_relaxed); });
 
     constexpr int threads = 8;
-    constexpr int per_thread = 2000;
+    // static, because the producer lambda below captures explicitly and has no
+    // default capture mode - see the note in test_helpers.hpp
+    static constexpr int per_thread = 2000;
     std::vector<std::thread> ts;
     for (int t = 0; t < threads; ++t)
         ts.emplace_back([&lg] {

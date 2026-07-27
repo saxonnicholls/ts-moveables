@@ -85,6 +85,10 @@ demo-replay: build/replay_loop_demo
 build/http_server_demo: demos/http_server_demo.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/http_server_demo.cpp -o $@ $(LDLIBS)
 
+# A static check for the one MSVC rule this repository keeps tripping over
+check-msvc:
+	python3 scripts/check_msvc_capture.py
+
 test: build/tests
 	./build/tests
 
@@ -218,4 +222,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-replay demo-drones test-tls autobahn h2spec bench-http bench-scale bench-request bench-dispatch amalgamate check-amalgamate clean
+.PHONY: all test check-msvc tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-replay demo-drones test-tls autobahn h2spec bench-http bench-scale bench-request bench-dispatch amalgamate check-amalgamate clean
