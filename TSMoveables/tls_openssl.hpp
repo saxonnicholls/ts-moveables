@@ -119,7 +119,7 @@ public:
 
     const char* alpn() const noexcept override
     {
-        return alpn_.empty() ? "http/1.1" : alpn_.c_str();
+        return alpn_.c_str();               // empty means nothing was negotiated
     }
 
     bool wire_in(const char* data, std::size_t n,

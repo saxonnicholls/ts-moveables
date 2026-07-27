@@ -2326,7 +2326,13 @@ public:
     virtual bool app_out(const char* data, std::size_t n, std::string& wire_out) = 0;
 
     virtual bool established() const noexcept { return true; }
-    virtual const char* alpn() const noexcept { return "http/1.1"; }
+    // The protocol ALPN settled on, or an **empty string** when nothing was
+    // negotiated - a plaintext connection, or a client that offered no list.
+    // Those two cases must stay distinguishable: choosing the protocol
+    // delegate by ALPN means "the client asked for h2" and "the client said
+    // nothing, so default to http/1.1" are different answers, and collapsing
+    // them into the literal "http/1.1" throws away the only bit that matters.
+    virtual const char* alpn() const noexcept { return ""; }
     virtual void shutdown(std::string& /*wire_out*/) {}
 };
 
