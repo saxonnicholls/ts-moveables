@@ -5815,6 +5815,37 @@ public:
 #define NI_MAXSERV 32
 #endif
 
+// (inlined) #include "message.hpp"
+// ----------------------------------------------------------------------
+// begin message.hpp
+// ----------------------------------------------------------------------
+//
+//  http/message.hpp
+//  TSMoveables
+//
+//  Copyright 2026 Saxon Herschel Nicholls
+//
+//  What an HTTP message is: status codes, methods, header lists, request and
+//  response - and the byte-level plumbing they are built from.
+//
+//  Separated because none of it touches IO, a socket, or a loop. That is what
+//  makes the parser testable with a string and the router benchmarkable
+//  without a kernel, and it is why this file can be read on its own.
+//
+
+#ifndef http_message_hpp
+#define http_message_hpp
+
+
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 namespace snicholls {
 namespace http {
 
@@ -6240,6 +6271,47 @@ public:
         return type(std::move(content_type));
     }
 };
+
+} // namespace http
+} // namespace snicholls
+
+#endif /* http_message_hpp */
+// end message.hpp
+// (inlined) #include "parser.hpp"
+// ----------------------------------------------------------------------
+// begin parser.hpp
+// ----------------------------------------------------------------------
+//
+//  http/parser.hpp
+//  TSMoveables
+//
+//  Copyright 2026 Saxon Herschel Nicholls
+//
+//  The HTTP/1.1 request parser: incremental, resumable, and deliberately
+//  strict.
+//
+//  Bytes may arrive one at a time and no split changes the outcome. Content-
+//  Length with Transfer-Encoding, conflicting duplicate Content-Length,
+//  whitespace before a colon, obsolete line folding and bare-LF line endings
+//  are all rejected - every one is a documented request-smuggling vector, and
+//  leniency is how a server becomes a gadget in someone else's attack chain.
+//
+//  No IO here either: hand it a buffer, ask what it made of it.
+//
+
+#ifndef http_parser_hpp
+#define http_parser_hpp
+
+// (inlined) #include "message.hpp"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+namespace snicholls {
+namespace http {
 
 // ---------------------------------------------------------------- the parser
 //
@@ -6763,6 +6835,37 @@ private:
     const char* err_reason_ = nullptr;
 };
 
+} // namespace http
+} // namespace snicholls
+
+#endif /* http_parser_hpp */
+// end parser.hpp
+// (inlined) #include "config.hpp"
+// ----------------------------------------------------------------------
+// begin config.hpp
+// ----------------------------------------------------------------------
+//
+//  http/config.hpp
+//  TSMoveables
+//
+//  Copyright 2026 Saxon Herschel Nicholls
+//
+//  The knobs, and what the observation taps carry.
+//
+
+#ifndef http_config_hpp
+#define http_config_hpp
+
+// (inlined) #include "parser.hpp"
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
+namespace snicholls {
+namespace http {
+
 // ------------------------------------------------------------------ the knobs
 
 struct server_config {
@@ -6801,6 +6904,44 @@ struct access_entry {
     int fd = -1;
     std::uint64_t stream = 0;
 };
+
+} // namespace http
+} // namespace snicholls
+
+#endif /* http_config_hpp */
+// end config.hpp
+// (inlined) #include "../interfaces/protocol_delegate.hpp"
+// ----------------------------------------------------------------------
+// begin protocol_delegate.hpp
+// ----------------------------------------------------------------------
+//
+//  interfaces/protocol_delegate.hpp
+//  TSMoveables
+//
+//  Copyright 2026 Saxon Herschel Nicholls
+//
+//  How bytes become requests - the second of the two axes.
+//
+//  A protocol delegate owns a connection's bytes: HTTP/1.1, WebSocket after an
+//  Upgrade, HTTP/2 after ALPN. connection_host is the other half of the
+//  contract - what a delegate may ask of the connection it is running on.
+//
+//  The stream id on every method is always 0 for HTTP/1.x and exists so that
+//  multiplexed protocols need no interface change. It was paid for before
+//  HTTP/2 was written, and HTTP/2 needed nothing added.
+//
+
+#ifndef interfaces_protocol_delegate_hpp
+#define interfaces_protocol_delegate_hpp
+
+// (inlined) #include "../http/message.hpp"
+// (inlined) #include "../http/config.hpp"
+
+#include <cstdint>
+#include <memory>
+
+namespace snicholls {
+namespace http {
 
 // ------------------------------------------------------------------ delegates
 //
@@ -6861,6 +7002,15 @@ public:
                               std::size_t /*n*/, connection_host& /*host*/) {}
     virtual void end_stream(std::uint64_t /*stream*/, connection_host& /*host*/) {}
 };
+
+} // namespace http
+} // namespace snicholls
+
+#endif /* interfaces_protocol_delegate_hpp */
+// end protocol_delegate.hpp
+
+namespace snicholls {
+namespace http {
 
 // ------------------------------------------------------------------ HTTP/1.1
 

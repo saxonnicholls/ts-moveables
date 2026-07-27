@@ -675,15 +675,17 @@ Linux, 4-core CI runner, GCC:
 | 1,000 held open | **all 1,000 in 14 ms** | 32 of 1,000, rest unserved at 20 s | all 1,000 in 25 ms |
 | 10,000 held open | **all 10,000 in 156 ms** | 32 of 10,000, rest unserved at 20 s | 3,391 of 10,000, rest unserved at 20 s |
 
-macOS, 32-core laptop, Apple Clang:
+macOS, 32-core laptop, Apple Clang — measured on an idle machine after the request-path work:
 
-| Scenario | ts-moveables (1 thread) | httplib (as shipped) | httplib (tuned) |
+| Scenario | ts-moveables (**1 thread**) | cpp-httplib (as shipped) | cpp-httplib (tuned) |
 |---|---|---|---|
-| keep-alive, 16 connections | **~98,000 req/s** | ~8,100 req/s | ~8,600 req/s |
-| keep-alive, 256 connections | **~98,000 req/s** | ~6,500 req/s | ~6,500 req/s |
-| 1 KiB payloads | **~94,000 req/s** | ~9,000 req/s | ~8,800 req/s |
-| 1,000 held open | **all 1,000 in 11 ms** | 496 of 1,000 | 286 of 1,000 |
-| 10,000 held open | **all 10,000 in 177 ms** | 124 of 10,000 | only 1,417 could *connect* in 20 s |
+| keep-alive, 16 connections | **~104,000 req/s** | ~11,300 req/s | ~11,700 req/s |
+| keep-alive, 256 connections | **~108,000 req/s** | ~7,200 req/s | ~7,200 req/s |
+| 1 KiB payloads | **~99,000 req/s** | ~11,600 req/s | ~11,900 req/s |
+| 1,000 connections held open | **all 1,000 in 11 ms** | 496 of 1,000 | 294 of 1,000 |
+| 10,000 connections held open | **all 10,000 in 175 ms** | 124 of 10,000 | only 1,711 could *connect* in 20 s |
+
+The Linux table above **predates the 40% request-path cut** and is the one to re-read, not this one: on the ARM CI runner the same optimisation took keep-alive from ~64,900 to ~127,400 req/s, against httplib's ~95,100. `bench-http` now runs in CI on every push, so the current figure is in the job summary rather than in a table someone has to remember to update.
 
 Read those together, because either one alone would mislead you:
 
