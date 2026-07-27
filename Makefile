@@ -74,13 +74,29 @@ build/http_server_demo: demos/http_server_demo.cpp $(HEADERS) | build
 test: build/tests
 	./build/tests
 
-# TLS is the one opt-in part of the library: it needs OpenSSL, so it builds
-# and runs separately and the core stays dependency-free.
+# TLS is the one opt-in part of the library: it needs a third-party library, so
+# it builds and runs separately and the core stays dependency-free.
+#
+# There are two backends and one test binary. Every test body runs against both,
+# which is what keeps "the backend is a run-time choice" an observation rather
+# than a claim. OpenSSL is required - the test client is built from it either
+# way - and mbedTLS is optional: if its headers are not installed the second
+# backend is compiled out and that half of the suite reports itself skipped,
+# rather than breaking the build for anyone who only has OpenSSL.
 OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null || echo /usr)
+MBEDTLS_PREFIX ?= $(shell brew --prefix mbedtls 2>/dev/null || echo /usr)
+
+# build_info.h rather than ssl.h as the probe: it arrived in mbedTLS 3.0, so its
+# presence doubles as the version check the header needs anyway
+ifneq ($(wildcard $(MBEDTLS_PREFIX)/include/mbedtls/build_info.h),)
+  MBEDTLS_CPPFLAGS := -DSNICHOLLS_TEST_MBEDTLS -I$(MBEDTLS_PREFIX)/include
+  MBEDTLS_LDLIBS   := -L$(MBEDTLS_PREFIX)/lib -lmbedtls -lmbedx509 -lmbedcrypto
+endif
 
 build/tests_tls: tests/tls/tests_tls.cpp $(HEADERS) | build
-	$(CXX) $(CXXFLAGS) -pthread -I$(OPENSSL_PREFIX)/include tests/tls/tests_tls.cpp -o $@ \
-	    -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto $(LDLIBS)
+	$(CXX) $(CXXFLAGS) -pthread -I$(OPENSSL_PREFIX)/include $(MBEDTLS_CPPFLAGS) \
+	    tests/tls/tests_tls.cpp -o $@ \
+	    -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto $(MBEDTLS_LDLIBS) $(LDLIBS)
 
 test-tls: build/tests_tls
 	./build/tests_tls

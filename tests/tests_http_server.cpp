@@ -404,6 +404,51 @@ public:
         }
     }
 
+    // Read one chunked response, de-framing the body
+    bool read_chunked(int& status, std::string& head, std::string& body)
+    {
+        body.clear();
+        while (buf_.find("\r\n\r\n") == std::string::npos)
+            if (!pump())
+                return false;
+        const std::size_t hend = buf_.find("\r\n\r\n") + 4;
+        head = buf_.substr(0, hend);
+        status = std::atoi(head.c_str() + 9);
+        buf_.erase(0, hend);
+        if (ilower(head).find("transfer-encoding: chunked") == std::string::npos)
+            return false;                       // caller expected chunked
+        for (;;) {
+            const std::size_t nl = buf_.find("\r\n");
+            if (nl == std::string::npos) {
+                if (!pump())
+                    return false;
+                continue;
+            }
+            const std::size_t n = std::strtoul(buf_.substr(0, nl).c_str(), nullptr, 16);
+            if (buf_.size() < nl + 2 + n + 2) {
+                if (!pump())
+                    return false;
+                continue;
+            }
+            if (n == 0) {
+                buf_.erase(0, nl + 4);          // terminal chunk plus its CRLF
+                return true;
+            }
+            body.append(buf_, nl + 2, n);
+            buf_.erase(0, nl + 2 + n + 2);
+        }
+    }
+
+    bool pump()
+    {
+        char tmp[65536];
+        const ssize_t n = ::recv(fd_, tmp, sizeof tmp, 0);
+        if (n <= 0)
+            return false;
+        buf_.append(tmp, std::size_t(n));
+        return true;
+    }
+
     bool read_until_eof(std::string& out)
     {
         out = buf_;
@@ -739,6 +784,94 @@ void test_server_taps_and_moveability()
     pass("http server: signal taps, and the server itself moves");
 }
 
+void test_server_streaming()
+{
+    running_server s;
+    // A body written in pieces, length unknown when the headers go out
+    s.srv.get("/stream", [](const request&, responder r) {
+        auto out = r.stream(response(200).type("text/plain"));
+        for (int i = 0; i < 5; ++i)
+            out.write("piece" + std::to_string(i) + ";");
+        out.end();
+    });
+    // Dropping the handle without end() must still terminate the body
+    s.srv.get("/dropped", [](const request&, responder r) {
+        auto out = r.stream(response(200).type("text/plain"));
+        out.write("partial");
+    });
+    // A caller who knows the length gets it framed that way instead
+    s.srv.get("/sized", [](const request&, responder r) {
+        response h(200);
+        h.set("Content-Length", "9");
+        auto out = r.stream(std::move(h));
+        out.write("abc");
+        out.write("def");
+        out.write("ghi");
+        out.end();
+    });
+    // Large enough that the client cannot possibly have it all buffered
+    s.srv.get("/big", [](const request&, responder r) {
+        auto out = r.stream(response(200).type("application/octet-stream"));
+        for (int i = 0; i < 512; ++i)
+            out.write(std::string(4096, 'z'));
+        out.end();
+    });
+    s.start();
+
+    {   // chunked framing, reassembled by the client
+        client c(s.port);
+        c.send_raw("GET /stream HTTP/1.1\r\nHost: t\r\n\r\n");
+        int status = 0;
+        std::string head, body;
+        assert(c.read_chunked(status, head, body));
+        assert(status == 200);
+        assert(head.find("Transfer-Encoding: chunked") != std::string::npos);
+        assert(head.find("Content-Length") == std::string::npos);
+        assert(body == "piece0;piece1;piece2;piece3;piece4;");
+    }
+    {   // a dropped stream still terminates rather than hanging the client
+        client c(s.port);
+        c.send_raw("GET /dropped HTTP/1.1\r\nHost: t\r\n\r\n");
+        int status = 0;
+        std::string head, body;
+        assert(c.read_chunked(status, head, body));
+        assert(status == 200 && body == "partial");
+    }
+    {   // a known length is framed as Content-Length, not chunked
+        client c(s.port);
+        c.send_raw("GET /sized HTTP/1.1\r\nHost: t\r\n\r\n");
+        int status = 0;
+        std::string head, body;
+        assert(c.read_response(status, head, body));
+        assert(status == 200);
+        assert(head.find("Transfer-Encoding") == std::string::npos);
+        assert(body == "abcdefghi");
+    }
+    {   // 2 MiB streamed in 4 KiB pieces, arriving intact and in order
+        client c(s.port);
+        c.send_raw("GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        int status = 0;
+        std::string head, body;
+        assert(c.read_chunked(status, head, body));
+        assert(status == 200);
+        assert(body.size() == 512u * 4096);
+        assert(body.find_first_not_of('z') == std::string::npos);
+    }
+    {   // keep-alive survives a streamed response: the next request is served
+        client c(s.port);
+        c.send_raw("GET /stream HTTP/1.1\r\nHost: t\r\n\r\n");
+        int status = 0;
+        std::string head, body;
+        assert(c.read_chunked(status, head, body));
+        assert(body == "piece0;piece1;piece2;piece3;piece4;");
+        c.send_raw("GET /sized HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert(c.read_response(status, head, body));
+        assert(status == 200 && body == "abcdefghi");
+    }
+
+    pass("http server: streamed responses (chunked, sized, dropped, keep-alive)");
+}
+
 void test_server_timeouts()
 {
     server_config cfg;
@@ -777,6 +910,7 @@ void run_http_server_tests()
     test_server_bodies();
     test_server_async_responders();
     test_server_taps_and_moveability();
+    test_server_streaming();
     test_server_timeouts();
 }
 

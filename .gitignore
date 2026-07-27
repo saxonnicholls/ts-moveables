@@ -9,3 +9,6 @@ benchmarks/third_party/
 # Xcode user state
 xcuserdata/
 *.xcuserstate
+
+# Agent worktrees (git worktree metadata, never committed)
+.claude/

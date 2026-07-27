@@ -1144,6 +1144,16 @@ public:
     virtual bool busy() const noexcept = 0;         // a request is awaiting its response
     virtual bool receiving() const noexcept = 0;    // a partial request is buffered (slowloris)
     virtual std::size_t last_response_bytes() const noexcept { return 0; }
+
+    // Streamed responses: headers now, body in pieces, length unknown at the
+    // time of the headers. Without this a response must be complete in memory
+    // before any of it is sent, which is fine for JSON and hopeless for a
+    // file. Protocols that cannot stream leave begin_stream returning false.
+    virtual bool begin_stream(std::uint64_t /*stream*/, response&& /*headers*/,
+                              connection_host& /*host*/) { return false; }
+    virtual void stream_write(std::uint64_t /*stream*/, const char* /*data*/,
+                              std::size_t /*n*/, connection_host& /*host*/) {}
+    virtual void end_stream(std::uint64_t /*stream*/, connection_host& /*host*/) {}
 };
 
 // ------------------------------------------------------------------ HTTP/1.1
@@ -1185,6 +1195,7 @@ public:
             request& req = parser_.message();
             head_ = (req.method == method::head);
             keep_alive_ = req.keep_alive;
+            req_minor_ = req.http_minor;
             request_bytes_ = req.body.size();
             sent_continue_ = false;
             in_flight_ = true;
@@ -1214,10 +1225,86 @@ public:
 
     std::size_t last_request_bytes() const noexcept { return request_bytes_; }
 
+    bool begin_stream(std::uint64_t, response&& res, connection_host& host) override
+    {
+        // A caller who set Content-Length knows the size and wants it framed
+        // that way; everyone else gets chunked, which is what makes an
+        // unknown-length body possible at all on HTTP/1.1
+        chunked_ = !res.headers.has("content-length");
+        if (chunked_ && req_minor_ < 1) {
+            // HTTP/1.0 has no chunked coding. The honest framing is to close
+            // the connection at the end of the body and say so.
+            chunked_ = false;
+            close_on_end_ = true;
+            keep_alive_ = false;
+        }
+        if (chunked_)
+            res.set("Transfer-Encoding", "chunked");
+
+        std::string out;
+        serialise_head(res, keep_alive_ && !close_on_end_, host, out);
+        host.write_app(out.data(), out.size());
+        last_bytes_ = out.size();
+        streaming_ = true;                      // in_flight_ stays true until end_stream
+        return true;
+    }
+
+    void stream_write(std::uint64_t, const char* data, std::size_t n,
+                      connection_host& host) override
+    {
+        if (!streaming_ || n == 0 || head_)     // a HEAD response has no body
+            return;
+        if (chunked_) {
+            char hdr[24];
+            const int k = std::snprintf(hdr, sizeof hdr, "%zx\r\n", n);
+            host.write_app(hdr, std::size_t(k));
+            host.write_app(data, n);
+            host.write_app("\r\n", 2);
+            last_bytes_ += std::size_t(k) + n + 2;
+        } else {
+            host.write_app(data, n);
+            last_bytes_ += n;
+        }
+    }
+
+    void end_stream(std::uint64_t, connection_host& host) override
+    {
+        if (!streaming_)
+            return;
+        if (chunked_ && !head_) {
+            host.write_app("0\r\n\r\n", 5);   // terminal chunk, no trailers
+            last_bytes_ += 5;
+        }
+        streaming_ = false;
+        in_flight_ = false;
+        if (!keep_alive_ || close_on_end_)
+            close_ = true;
+    }
+
     static void serialise(const response& res, bool head_only, bool keep_alive,
                           connection_host& host, std::string& out)
     {
         out.reserve(192 + res.body.size());
+        serialise_prologue(res, keep_alive, host, out, /*with_length*/ true);
+        if (!head_only)
+            out += res.body;
+    }
+
+    // Status line and headers only - what a streamed response sends up front
+    static void serialise_head(const response& res, bool keep_alive,
+                               connection_host& host, std::string& out)
+    {
+        serialise_prologue(res, keep_alive, host, out, /*with_length*/ false);
+    }
+
+private:
+    // with_length adds Content-Length from the body size, which a streamed
+    // response must not do: its length is not known yet, which is the entire
+    // reason it is streamed.
+    static void serialise_prologue(const response& res, bool keep_alive,
+                                   connection_host& host, std::string& out,
+                                   bool with_length)
+    {
         if (const char* line = status_line(res.status)) {
             out += line;                        // the common codes, pre-baked
         } else {
@@ -1238,7 +1325,7 @@ public:
             out += "\r\n";
         }
         const bool switching = (res.status == 101);
-        if (!switching && !res.headers.has("content-length")) {
+        if (with_length && !switching && !res.headers.has("content-length")) {
             out += "Content-Length: ";
             detail::append_uint(out, res.body.size());
             out += "\r\n";
@@ -1252,8 +1339,6 @@ public:
             out += "\r\n";
         }
         out += "\r\n";
-        if (!head_only)
-            out += res.body;
     }
 
 private:
@@ -1266,6 +1351,10 @@ private:
     bool close_ = false;
     bool sent_continue_ = false;
     bool handed_off_ = false;
+    bool streaming_ = false;                    // a response body is still being written
+    bool chunked_ = false;                      // that body is chunk-framed
+    bool close_on_end_ = false;                 // HTTP/1.0 streaming: length is the close
+    int req_minor_ = 1;
 };
 
 // ------------------------------------------------------------------- routing
@@ -1274,6 +1363,8 @@ namespace detail {
 struct session_core;
 struct server_core;
 } // namespace detail
+
+class response_stream;
 
 // A moveable, complete-once handle to an unanswered request. Answer it now,
 // or move it anywhere - a queue, a thread pool, another loop - and answer it
@@ -1309,6 +1400,10 @@ public:
     void send(int status, std::string content_type, std::string body);
     void send_status(int status);
 
+    // Answer with a body written in pieces rather than all at once. The
+    // headers go out now; the body follows through the returned handle.
+    response_stream stream(response headers);
+
     // Answer this request by handing the connection to another protocol: the
     // handshake response goes out, then `next` owns every byte that follows.
     // This is the Upgrade path (WebSocket today, h2c later) and it is why
@@ -1334,6 +1429,67 @@ private:
     std::weak_ptr<detail::session_core> s_;
     std::uint64_t stream_ = 0;
     bool answered_ = true;              // a default-constructed responder is inert
+};
+
+// A response whose body is written in pieces, because its length is not known
+// when the headers go out - a file, a query result, a Server-Sent Events feed.
+// Moveable and completable from any thread, exactly like responder: park it on
+// a worker and feed it as the data arrives.
+//
+//     srv.get("/big", [](const auto&, auto res) {
+//         auto out = res.stream(snicholls::http::response(200).type("text/plain"));
+//         for (auto& chunk : source) out.write(chunk);
+//         out.end();
+//     });
+//
+// Backpressure is the point of pending() and on_drain(): a producer faster
+// than the client will otherwise queue the whole thing in memory, which is the
+// problem streaming exists to solve. Check pending() against a budget, and
+// resume from on_drain().
+class response_stream {
+public:
+    response_stream() = default;
+    response_stream(const response_stream&) = delete;
+    response_stream& operator=(const response_stream&) = delete;
+
+    response_stream(response_stream&& o) noexcept
+        : s_(std::move(o.s_)), stream_(o.stream_), open_(o.open_)
+    {
+        o.open_ = false;
+    }
+    response_stream& operator=(response_stream&& o) noexcept
+    {
+        if (this != &o) {
+            end();
+            s_ = std::move(o.s_);
+            stream_ = o.stream_;
+            open_ = o.open_;
+            o.open_ = false;
+        }
+        return *this;
+    }
+
+    // Dropping a stream ends it cleanly rather than leaving the client waiting
+    // on a chunked body that never terminates
+    ~response_stream() { end(); }
+
+    bool write(const char* data, std::size_t n);
+    bool write(std::string chunk) { return write(chunk.data(), chunk.size()); }
+    void end();
+
+    bool open() const noexcept { return open_ && !s_.expired(); }
+    explicit operator bool() const noexcept { return open(); }
+
+    // Bytes queued for this connection but not yet handed to the kernel
+    std::size_t pending() const;
+    // Fires on the loop thread when the queue empties
+    moveable_signal<>* on_drain() const;
+
+private:
+    friend class responder;
+    std::weak_ptr<detail::session_core> s_;
+    std::uint64_t stream_ = 0;
+    bool open_ = false;
 };
 
 using handler = std::function<void(const request&, responder)>;
@@ -1535,6 +1691,7 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     bool driving = false;
     bool peer_closed = false;
     bool logging_ = false;                  // is anything attached to on_access?
+    moveable_signal<> on_drain;             // the write queue emptied: see response_stream
 
     std::chrono::steady_clock::time_point last_activity{};
     std::chrono::steady_clock::time_point request_started{};
@@ -1557,7 +1714,7 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     void write_app(const char* data, std::size_t n) override
     {
         if (!transport->app_out(data, n, out))
-            close_now();
+            close_politely(false);              // the transport queued its alert
     }
 
     void switch_protocol(std::unique_ptr<protocol_delegate> next) override
@@ -1575,6 +1732,60 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
         write_app(data, n);
         flush();
     }
+
+    std::size_t pending_bytes() const noexcept { return out.size() - sent; }
+
+    // Close, but let the transport have its say first.
+    //
+    // A TLS transport queues bytes that explain the ending: an alert on a
+    // fatal error (handshake_failure, bad_certificate), a close_notify on a
+    // clean shutdown. Closing the descriptor without writing them leaves the
+    // peer with a bare FIN and no reason - which is exactly the sort of thing
+    // that gets diagnosed as a network fault for a week. One best-effort
+    // non-blocking write: we are closing regardless, so this takes whatever
+    // the socket will accept now rather than waiting for room.
+    //
+    // say_goodbye is false after a fatal transport error, because the
+    // transport has already queued its alert and asking a broken session to
+    // shut down cleanly is not meaningful.
+    void close_politely(bool say_goodbye)
+    {
+        if (live_ && fd >= 0) {
+            if (say_goodbye && transport)
+                transport->shutdown(out);
+            if (sent < out.size()) {
+                const ssize_t n = ::send(fd, out.data() + sent, out.size() - sent, send_flags());
+                if (n > 0)
+                    sent += std::size_t(n);
+            }
+        }
+        close_now();
+    }
+
+    // The streaming trio, all loop-thread only; the handles marshal for their
+    // callers. Writes coalesce inside the read loop for the same reason
+    // complete() does - one write() per batch rather than per piece.
+    bool begin_stream(std::uint64_t id, response&& headers)
+    {
+        if (!live_)
+            return false;
+        if (!protocol->begin_stream(id, std::move(headers), *this))
+            return false;
+        if (!driving)
+            flush();
+        return true;
+    }
+
+    void stream_write(std::uint64_t id, const char* data, std::size_t n)
+    {
+        if (!live_)
+            return;
+        protocol->stream_write(id, data, n, *this);
+        if (!driving)
+            flush();
+    }
+
+    void end_stream(std::uint64_t id);
 
     // ---- reactor plumbing
     void on_readable();
@@ -1799,7 +2010,7 @@ struct server_core : std::enable_shared_from_this<server_core> {
         for (auto& s : slow)
             s->send_timeout();
         for (auto& s : idle)
-            s->close_now();
+            s->close_politely(true);            // an idle timeout is still a clean close
     }
 };
 
@@ -1855,7 +2066,7 @@ inline void session_core::on_readable()
             if (!protocol->receiving())
                 request_started = last_activity;
             if (!transport->wire_in(s->readbuf.data(), std::size_t(n), app_in, out)) {
-                close_now();
+                close_politely(false);          // the transport queued its alert
                 return;
             }
             drive();
@@ -1921,15 +2132,20 @@ inline void session_core::flush()
         return;
     }
 
+    const bool had_backlog = !out.empty();
     out.clear();
     sent = 0;
     if (out.capacity() > 256u * 1024)
         std::string().swap(out);
     arm_write(false);
+    // Everything queued has reached the kernel. A streaming producer waiting
+    // on backpressure can send more now.
+    if (had_backlog)
+        on_drain();
     if (read_paused)
         pause_read(false);
     if (close_when_drained || protocol->close_after_flush())
-        close_now();
+        close_politely(true);                   // clean end: let TLS say close_notify
 }
 
 inline void session_core::close_now()
@@ -2037,6 +2253,29 @@ inline void session_core::deliver(request& req, std::uint64_t stream)
     }
 }
 
+inline void session_core::end_stream(std::uint64_t id)
+{
+    if (!live_)
+        return;
+    auto self = shared_from_this();
+    protocol->end_stream(id, *this);
+    if (logging_) {
+        if (auto s = srv.lock()) {
+            pending.response_bytes = protocol->last_response_bytes();
+            pending.duration_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - request_started).count();
+            s->on_access(pending);
+        }
+    }
+    if (!driving) {
+        flush();
+        if (live_)
+            drive();                            // a pipelined request may be waiting
+        if (live_)
+            flush();
+    }
+}
+
 inline void session_core::complete(std::uint64_t stream, response&& res)
 {
     if (!live_)
@@ -2128,6 +2367,75 @@ inline void responder::upgrade(response res, std::unique_ptr<protocol_delegate> 
         keep->switch_protocol(std::move(*carrier));
         keep->complete(stream, std::move(r));
     });
+}
+
+inline response_stream responder::stream(response headers)
+{
+    response_stream out;
+    if (answered_)
+        throw std::logic_error("http::responder: already answered");
+    answered_ = true;
+    auto s = s_.lock();
+    if (!s)
+        return out;                             // client gone: an inert stream
+    if (!s->poster.on_loop_thread())
+        throw std::logic_error("http::responder: stream() must start on the loop thread "
+                               "(answer with send() from a worker, or post() first)");
+    if (!s->begin_stream(stream_, std::move(headers)))
+        return out;                             // the protocol cannot stream this exchange
+    out.s_ = s_;
+    out.stream_ = stream_;
+    out.open_ = true;
+    return out;
+}
+
+inline bool response_stream::write(const char* data, std::size_t n)
+{
+    if (!open_ || n == 0)
+        return open_;
+    auto s = s_.lock();
+    if (!s)
+        return false;
+    if (s->poster.on_loop_thread()) {
+        s->stream_write(stream_, data, n);
+        return true;
+    }
+    // From a worker: the bytes must be copied, since the caller's buffer is
+    // not ours to hold on to across the hop
+    auto keep = s;
+    const std::uint64_t id = stream_;
+    return keep->poster.post([keep, id, chunk = std::string(data, n)] {
+        keep->stream_write(id, chunk.data(), chunk.size());
+    });
+}
+
+inline void response_stream::end()
+{
+    if (!open_)
+        return;
+    open_ = false;
+    auto s = s_.lock();
+    if (!s)
+        return;
+    if (s->poster.on_loop_thread()) {
+        s->end_stream(stream_);
+        return;
+    }
+    auto keep = s;
+    const std::uint64_t id = stream_;
+    keep->poster.post([keep, id] { keep->end_stream(id); });
+}
+
+inline std::size_t response_stream::pending() const
+{
+    auto s = s_.lock();
+    return s ? s->pending_bytes() : 0;
+}
+
+inline moveable_signal<>* response_stream::on_drain() const
+{
+    auto s = s_.lock();
+    return s ? &s->on_drain : nullptr;
 }
 
 inline void responder::send(int status, std::string content_type, std::string body)

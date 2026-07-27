@@ -620,9 +620,27 @@ srv.get("/slow", [&pool](const auto& req, auto res) {
 });
 ```
 
-**2. Policy is a runtime delegate, not a `#ifdef`.** The design separates two axes that servers usually conflate — the **transport** (how bytes arrive: plaintext today; TLS engines and QUIC later) and the **protocol** (how bytes become requests: HTTP/1.1 today; h2, h3, WebSocket later). Both are chosen per connection at run time, which is what lets one binary serve `http/1.1` and `h2` by ALPN, or swap a live connection's protocol delegate to speak WebSocket after an `Upgrade`. TLS engines are transport-agnostic byte transformers that never touch a socket, so the reactor owns all IO and every backend is testable without a network. The full plan — HTTP/2 with HPACK, WebSocket, QUIC and HTTP/3, and why we will **wrap** a QUIC stack rather than write one — is [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md).
+**2. Responses can stream.** `res.send()` needs the whole body in memory, which is fine for JSON and hopeless for a file, a query result or an events feed. `res.stream()` sends the headers now and the body in pieces:
 
-**3. The parser is deliberately strict.** Request smuggling is a parsing-leniency bug, so `Content-Length` with `Transfer-Encoding`, conflicting duplicate `Content-Length`, whitespace before a colon, obsolete line folding, and bare-LF line endings are all **rejected with 400**, not guessed at. Every one of those is a unit test, and every test input is replayed one byte at a time so no fragment boundary can change the verdict.
+```cpp
+srv.get("/download", [](const auto&, auto res) {
+    auto out = res.stream(snicholls::http::response(200).type("application/octet-stream"));
+    while (auto block = source.next()) {
+        if (out.pending() > 1 << 20)         // the client is behind: wait for room
+            break;
+        out.write(std::move(block));
+    }
+    out.end();
+});
+```
+
+Length unknown at header time means `Transfer-Encoding: chunked`; set `Content-Length` yourself and it is framed that way instead. On HTTP/1.0, which has no chunked coding, the body is delimited by closing the connection and the response says so rather than pretending. Dropping the handle without calling `end()` terminates the body cleanly instead of leaving the client waiting on a chunked stream that never finishes — the same "loud rather than hung" rule as the auto-500 responder.
+
+`pending()` and `on_drain()` are the backpressure surface, and they are the reason streaming is worth having: a producer faster than its client will otherwise queue the entire body in memory, which is precisely the problem streaming exists to solve. The write path already pauses reading at high water, so the machinery is shared.
+
+**3. Policy is a runtime delegate, not a `#ifdef`.** The design separates two axes that servers usually conflate — the **transport** (how bytes arrive: plaintext today; TLS engines and QUIC later) and the **protocol** (how bytes become requests: HTTP/1.1 today; h2, h3, WebSocket later). Both are chosen per connection at run time, which is what lets one binary serve `http/1.1` and `h2` by ALPN, or swap a live connection's protocol delegate to speak WebSocket after an `Upgrade`. TLS engines are transport-agnostic byte transformers that never touch a socket, so the reactor owns all IO and every backend is testable without a network. The full plan — HTTP/2 with HPACK, WebSocket, QUIC and HTTP/3, and why we will **wrap** a QUIC stack rather than write one — is [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md).
+
+**4. The parser is deliberately strict.** Request smuggling is a parsing-leniency bug, so `Content-Length` with `Transfer-Encoding`, conflicting duplicate `Content-Length`, whitespace before a colon, obsolete line folding, and bare-LF line endings are all **rejected with 400**, not guessed at. Every one of those is a unit test, and every test input is replayed one byte at a time so no fragment boundary can change the verdict.
 
 Cross-cutting concerns are signals — `on_open`, `on_access`, `on_close`, `on_error` — so logging and metrics attach without touching the hot path. The `EMFILE` trap gets the classic reserve-descriptor treatment rather than a 100%-CPU spin. And the server itself is moveable: build it configured in a factory, move it into place, run it.
 
