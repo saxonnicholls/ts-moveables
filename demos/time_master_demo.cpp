@@ -42,8 +42,8 @@
 //  runs it as an integration test on every push.
 //
 
-#include "../TSMoveables/time_master.hpp"
-#include "../TSMoveables/moveable_mutex.hpp"
+#include "../TSMoveables/event/time_master.hpp"
+#include "../TSMoveables/moveable/mutex.hpp"
 
 #include <cstdio>
 #include <cstring>

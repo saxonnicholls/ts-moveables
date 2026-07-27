@@ -82,8 +82,8 @@
 #ifndef logging_hpp
 #define logging_hpp
 
-#include "moveable_signal.hpp"
-#include "mpmc_queue.hpp"
+#include "../moveable/signal.hpp"
+#include "../concurrent/mpmc_queue.hpp"
 
 #include <atomic>
 #include <chrono>

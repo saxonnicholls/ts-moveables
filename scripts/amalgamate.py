@@ -10,9 +10,9 @@
 #  project the way cpp-httplib is: copy one file, include it, link pthreads,
 #  done. No include path, no build system, no submodule.
 #
-#      python3 scripts/amalgamate.py                       # http_server -> single_include/
+#      python3 scripts/amalgamate.py                       # the http server
 #      python3 scripts/amalgamate.py ts_moveables.hpp      # the whole library
-#      python3 scripts/amalgamate.py event_loop.hpp -o /tmp/loop.hpp
+#      python3 scripts/amalgamate.py event/loop.hpp -o /tmp/loop.hpp
 #
 #  Local #include "..." lines are replaced by the file's contents, each header
 #  expanded exactly once. Everything else - system includes, include guards,
@@ -31,14 +31,28 @@ SRC = os.path.join(ROOT, "TSMoveables")
 LOCAL_INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 
 
+def find_header(name):
+    """Headers live in subdirectories now, and an include may be written
+    relative to the including file, so resolve on basename across the tree."""
+    base = os.path.basename(name)
+    direct = os.path.join(SRC, name)
+    if os.path.isfile(direct):
+        return direct
+    for root, _dirs, files in os.walk(SRC):
+        if base in files:
+            return os.path.join(root, base)
+    return None
+
+
 def expand(name, seen, out, stack):
+    name = os.path.basename(name)
     if name in seen:
         return
     if name in stack:
         raise SystemExit("amalgamate: include cycle through " + name)
-    path = os.path.join(SRC, name)
-    if not os.path.isfile(path):
-        raise SystemExit("amalgamate: no such header: " + path)
+    path = find_header(name)
+    if not path:
+        raise SystemExit("amalgamate: no such header: " + name)
 
     seen.add(name)
     stack.append(name)
@@ -50,7 +64,7 @@ def expand(name, seen, out, stack):
             m = LOCAL_INCLUDE.match(line)
             if m:
                 out.append("// (inlined) " + line.rstrip("\n"))
-                expand(os.path.basename(m.group(1)), seen, out, stack)
+                expand(m.group(1), seen, out, stack)
             else:
                 out.append(line.rstrip("\n"))
     out.append("// end {}".format(name))
@@ -59,14 +73,14 @@ def expand(name, seen, out, stack):
 
 def main():
     ap = argparse.ArgumentParser(description="Amalgamate TSMoveables headers into one file")
-    ap.add_argument("header", nargs="?", default="http_server.hpp",
-                    help="entry header in TSMoveables/ (default: http_server.hpp)")
+    ap.add_argument("header", nargs="?", default="http/server.hpp",
+                    help="entry header, relative to TSMoveables/ (default: http/server.hpp)")
     ap.add_argument("-o", "--output", default=None,
                     help="output path (default: single_include/ts_<name>.hpp)")
     args = ap.parse_args()
 
-    entry = os.path.basename(args.header)
-    stem = os.path.splitext(entry)[0]
+    entry = args.header
+    stem = os.path.splitext(os.path.basename(entry))[0]
     name = stem if stem.startswith("ts_") else "ts_" + stem
     output = args.output or os.path.join(ROOT, "single_include", name + ".hpp")
 

@@ -117,7 +117,7 @@ Moved-from objects are always left valid and usable.
 | `disruptor.hpp` | `disruptor<T, WaitStrategy>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
 | `moveable_signal.hpp` | `moveable_signal<Args...>` + `connection` / `scoped_connection` | Boost.Signals2 / sigslot | — | connections survive the move |
 | `thread_pool.hpp` | `task_pool` interface + `mutex_` / `sharded_` / `dispatch_` / `mpmc_` / `work_stealing_task_pool` | Taskflow / TBB / `std::async` | — | moveable handle (heap core) |
-| `event_loop.hpp` | `event_loop` + `fd_watch` / `timer` (POSIX; self-disables on Windows) | Asio / libuv / libevent | — | moveable handles, loop handle moves mid-run |
+| `event/loop.hpp` | `event_loop` + `fd_watch` / `timer` (POSIX; self-disables on Windows) | Asio / libuv / libevent | — | moveable handles, loop handle moves mid-run |
 | `ts_moveables.hpp` | umbrella header — includes everything | | | |
 
 Two implementation strategies are used:
@@ -578,7 +578,7 @@ That is the whole suite, including groups 12 and 13 — `permessage-deflate` com
 
 Finding the bugs took the suite doing its job. It caught that we echoed back *invalid* close codes (1004, 1005, 1006, 2000 …) instead of rejecting them with 1002 — precisely the class of defect a hand-written suite cannot find, because the tests and the implementation share the author's assumption.
 
-**Compression is a third delegate axis** ([`websocket_deflate.hpp`](TSMoveables/websocket_deflate.hpp), opt-in, needs zlib). Transport decides how bytes arrive, protocol decides what they mean, and an extension transforms the message payload — and it needed no new machinery, because RFC 7692 is a byte transformer with negotiated state, the same shape as the TLS engine:
+**Compression is a third delegate axis** ([`http/websocket_deflate.hpp`](TSMoveables/http/websocket_deflate.hpp), opt-in, needs zlib). Transport decides how bytes arrive, protocol decides what they mean, and an extension transforms the message payload — and it needed no new machinery, because RFC 7692 is a byte transformer with negotiated state, the same shape as the TLS engine:
 
 ```cpp
 snicholls::http::ws_config ws;
@@ -742,7 +742,7 @@ A portability note worth having: `SO_REUSEPORT` load-balances accepts on **Linux
 The other axis. A protocol delegate turns bytes into requests; a **transport delegate** decides how those bytes arrive — and TLS is just a transport:
 
 ```cpp
-#include "tls_openssl.hpp"
+#include "tls/openssl.hpp"
 
 snicholls::http::openssl_context tls;
 tls.use_certificate_file("cert.pem");

@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-#include "../TSMoveables/moveable_signal.hpp"
+#include "../TSMoveables/moveable/signal.hpp"
 
 // ---------------------------------------------------------------------------
 // The typed publish/subscribe layer - the architecture, in ~60 lines.

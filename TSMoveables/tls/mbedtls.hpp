@@ -37,7 +37,7 @@
 //  you do. Both may be included in the same translation unit; they share no
 //  symbols beyond the interface.
 //
-//      #include "tls_mbedtls.hpp"
+//      #include "mbedtls.hpp"
 //
 //      snicholls::http::mbedtls_context tls;
 //      tls.use_certificate_file("cert.pem");
@@ -60,7 +60,7 @@
 #ifndef tls_mbedtls_hpp
 #define tls_mbedtls_hpp
 
-#include "http_server.hpp"
+#include "../http/server.hpp"
 
 #if !SNICHOLLS_HAS_HTTP_SERVER
 // Identical to the definition in tls_openssl.hpp on purpose: including both

@@ -44,8 +44,9 @@
 #ifndef http_server_hpp
 #define http_server_hpp
 
-#include "event_loop.hpp"
-#include "moveable_signal.hpp"
+#include "../event/loop.hpp"
+#include "../interfaces/transport_delegate.hpp"
+#include "../moveable/signal.hpp"
 
 #if !SNICHOLLS_HAS_EVENT_LOOP
 #define SNICHOLLS_HAS_HTTP_SERVER 0
@@ -1078,46 +1079,9 @@ struct access_entry {
 // the reactor owns all IO. That is what makes every backend testable without
 // a network, and what makes the backend a run-time choice.
 
-class transport_delegate {
-public:
-    virtual ~transport_delegate() = default;
-    virtual const char* name() const noexcept = 0;
-
-    // Wire bytes arrived: append application bytes to app_in, and any bytes
-    // the transport itself owes the peer (handshake, alerts) to wire_out
-    virtual bool wire_in(const char* data, std::size_t n,
-                         std::string& app_in, std::string& wire_out) = 0;
-
-    // The application wants to send bytes: append wire bytes to wire_out
-    virtual bool app_out(const char* data, std::size_t n, std::string& wire_out) = 0;
-
-    virtual bool established() const noexcept { return true; }
-    // The protocol ALPN settled on, or an **empty string** when nothing was
-    // negotiated - a plaintext connection, or a client that offered no list.
-    // Those two cases must stay distinguishable: choosing the protocol
-    // delegate by ALPN means "the client asked for h2" and "the client said
-    // nothing, so default to http/1.1" are different answers, and collapsing
-    // them into the literal "http/1.1" throws away the only bit that matters.
-    virtual const char* alpn() const noexcept { return ""; }
-    virtual void shutdown(std::string& /*wire_out*/) {}
-};
-
-class plain_transport final : public transport_delegate {
-public:
-    const char* name() const noexcept override { return "plain"; }
-
-    bool wire_in(const char* data, std::size_t n, std::string& app_in, std::string&) override
-    {
-        app_in.append(data, n);
-        return true;
-    }
-
-    bool app_out(const char* data, std::size_t n, std::string& wire_out) override
-    {
-        wire_out.append(data, n);
-        return true;
-    }
-};
+// transport_delegate and plain_transport now live in
+// interfaces/transport_delegate.hpp - implementing a transport should not
+// mean including the whole server.
 
 class protocol_delegate;
 

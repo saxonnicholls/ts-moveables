@@ -25,7 +25,7 @@
 
 #include "test_helpers.hpp"
 
-#include "../TSMoveables/http2.hpp"
+#include "../TSMoveables/http/http2.hpp"
 
 #if SNICHOLLS_HAS_HTTP2
 

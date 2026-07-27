@@ -58,8 +58,8 @@
 //  to have been stalled. Exits non-zero if any of that fails.
 //
 
-#include "../TSMoveables/logging.hpp"
-#include "../TSMoveables/websocket.hpp"
+#include "../TSMoveables/logging/logger.hpp"
+#include "../TSMoveables/http/websocket.hpp"
 
 #include <cstdio>
 #include <cstdlib>

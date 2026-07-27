@@ -37,7 +37,8 @@
 #ifndef websocket_hpp
 #define websocket_hpp
 
-#include "http_server.hpp"
+#include "server.hpp"
+#include "../interfaces/ws_extension.hpp"
 
 #if !SNICHOLLS_HAS_HTTP_SERVER
 #define SNICHOLLS_HAS_WEBSOCKET 0
@@ -201,20 +202,6 @@ enum ws_close : std::uint16_t {
 // single-consumer transform with a result, not a fan-out notification. A
 // signal would be the wrong tool; the value here is choosing the
 // implementation at run time, which is what a delegate is for.
-class ws_extension {
-public:
-    virtual ~ws_extension() = default;
-    virtual const char* name() const noexcept = 0;
-
-    // Given this extension's parameters from the client's offer, fill in the
-    // parameters to send back and return true to accept. Returning false
-    // declines the offer, and the connection proceeds uncompressed.
-    virtual bool negotiate(const std::string& offer_params, std::string& response_params) = 0;
-
-    virtual bool compress(const std::string& in, std::string& out) = 0;
-    virtual bool decompress(const std::string& in, std::string& out) = 0;
-};
-
 struct ws_config {
     std::size_t max_message = 8u * 1024 * 1024;
     std::size_t max_frame   = 8u * 1024 * 1024;

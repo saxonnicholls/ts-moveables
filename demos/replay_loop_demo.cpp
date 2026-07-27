@@ -33,8 +33,8 @@
 //  integration test on every push.
 //
 
-#include "../TSMoveables/event_loop.hpp"
-#include "../TSMoveables/http_server.hpp"
+#include "../TSMoveables/event/loop.hpp"
+#include "../TSMoveables/http/server.hpp"
 
 #include <cstdio>
 #include <cstdlib>

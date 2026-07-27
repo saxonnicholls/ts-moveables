@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "../TSMoveables/moveable_signal.hpp"
+#include "../TSMoveables/moveable/signal.hpp"
 
 using namespace snicholls;
 

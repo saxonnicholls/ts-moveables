@@ -29,8 +29,8 @@
 //  count is clamped to the process descriptor limit, and the limit is printed.
 //
 
-#include "../TSMoveables/http_server.hpp"
-#include "../TSMoveables/moveable_mutex.hpp"
+#include "../TSMoveables/http/server.hpp"
+#include "../TSMoveables/moveable/mutex.hpp"
 
 #include <cstdio>
 #include <cstdlib>

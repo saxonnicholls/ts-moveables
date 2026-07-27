@@ -28,7 +28,7 @@
 //  the only file in the library that needs a third-party library, and nothing
 //  includes it unless you do.
 //
-//      #include "tls_openssl.hpp"
+//      #include "openssl.hpp"
 //
 //      snicholls::http::openssl_context tls;
 //      tls.use_certificate_file("cert.pem");
@@ -52,7 +52,7 @@
 #ifndef tls_openssl_hpp
 #define tls_openssl_hpp
 
-#include "http_server.hpp"
+#include "../http/server.hpp"
 
 #if !SNICHOLLS_HAS_HTTP_SERVER
 #define SNICHOLLS_HAS_TLS 0

@@ -31,9 +31,9 @@
 #ifndef ts_moveables_hpp
 #define ts_moveables_hpp
 
-// (inlined) #include "moveable_atomic.hpp"              // IWYU pragma: export
+// (inlined) #include "moveable/atomic.hpp"              // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_atomic.hpp
+// begin atomic.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_atomic.hpp
@@ -239,10 +239,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_atomic_hpp */
-// end moveable_atomic.hpp
-// (inlined) #include "moveable_mutex.hpp"               // IWYU pragma: export
+// end atomic.hpp
+// (inlined) #include "moveable/mutex.hpp"               // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_mutex.hpp
+// begin mutex.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_mutex.hpp
@@ -363,10 +363,10 @@ namespace snicholls
 
 
 #endif /* moveable_mutex_hpp */
-// end moveable_mutex.hpp
-// (inlined) #include "moveable_spin_lock.hpp"           // IWYU pragma: export
+// end mutex.hpp
+// (inlined) #include "moveable/spin_lock.hpp"           // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_spin_lock.hpp
+// begin spin_lock.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_spin_lock.hpp
@@ -460,10 +460,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_spin_lock_hpp */
-// end moveable_spin_lock.hpp
-// (inlined) #include "moveable_condition_variable.hpp"  // IWYU pragma: export
+// end spin_lock.hpp
+// (inlined) #include "moveable/condition_variable.hpp"  // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_condition_variable.hpp
+// begin condition_variable.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_condition_variable.hpp
@@ -595,10 +595,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_condition_variable_hpp */
-// end moveable_condition_variable.hpp
-// (inlined) #include "moveable_once_flag.hpp"           // IWYU pragma: export
+// end condition_variable.hpp
+// (inlined) #include "moveable/once_flag.hpp"           // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_once_flag.hpp
+// begin once_flag.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_once_flag.hpp
@@ -698,10 +698,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_once_flag_hpp */
-// end moveable_once_flag.hpp
-// (inlined) #include "moveable_semaphore.hpp"           // IWYU pragma: export
+// end once_flag.hpp
+// (inlined) #include "moveable/semaphore.hpp"           // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_semaphore.hpp
+// begin semaphore.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_semaphore.hpp
@@ -835,10 +835,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_semaphore_hpp */
-// end moveable_semaphore.hpp
-// (inlined) #include "moveable_latch.hpp"               // IWYU pragma: export
+// end semaphore.hpp
+// (inlined) #include "moveable/latch.hpp"               // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_latch.hpp
+// begin latch.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_latch.hpp
@@ -961,10 +961,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_latch_hpp */
-// end moveable_latch.hpp
-// (inlined) #include "moveable_barrier.hpp"             // IWYU pragma: export
+// end latch.hpp
+// (inlined) #include "moveable/barrier.hpp"             // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_barrier.hpp
+// begin barrier.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_barrier.hpp
@@ -1104,8 +1104,8 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_barrier_hpp */
-// end moveable_barrier.hpp
-// (inlined) #include "circular_buffer.hpp"              // IWYU pragma: export
+// end barrier.hpp
+// (inlined) #include "concurrent/circular_buffer.hpp"              // IWYU pragma: export
 // ----------------------------------------------------------------------
 // begin circular_buffer.hpp
 // ----------------------------------------------------------------------
@@ -1492,7 +1492,7 @@ namespace snicholls
 
 #endif /* circular_buffer_hpp */
 // end circular_buffer.hpp
-// (inlined) #include "mpmc_queue.hpp"                   // IWYU pragma: export
+// (inlined) #include "concurrent/mpmc_queue.hpp"                   // IWYU pragma: export
 // ----------------------------------------------------------------------
 // begin mpmc_queue.hpp
 // ----------------------------------------------------------------------
@@ -1719,7 +1719,7 @@ namespace snicholls
 
 #endif /* mpmc_queue_hpp */
 // end mpmc_queue.hpp
-// (inlined) #include "disruptor.hpp"                    // IWYU pragma: export
+// (inlined) #include "concurrent/disruptor.hpp"                    // IWYU pragma: export
 // ----------------------------------------------------------------------
 // begin disruptor.hpp
 // ----------------------------------------------------------------------
@@ -2352,9 +2352,9 @@ namespace snicholls
 
 #endif /* disruptor_hpp */
 // end disruptor.hpp
-// (inlined) #include "moveable_signal.hpp"              // IWYU pragma: export
+// (inlined) #include "moveable/signal.hpp"              // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin moveable_signal.hpp
+// begin signal.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_signal.hpp
@@ -2594,10 +2594,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_signal_hpp */
-// end moveable_signal.hpp
-// (inlined) #include "logging.hpp"                      // IWYU pragma: export
+// end signal.hpp
+// (inlined) #include "logging/logger.hpp"                      // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin logging.hpp
+// begin logger.hpp
 // ----------------------------------------------------------------------
 //
 //  logging.hpp
@@ -2683,8 +2683,8 @@ namespace snicholls
 #ifndef logging_hpp
 #define logging_hpp
 
-// (inlined) #include "moveable_signal.hpp"
-// (inlined) #include "mpmc_queue.hpp"
+// (inlined) #include "../moveable/signal.hpp"
+// (inlined) #include "../concurrent/mpmc_queue.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -3755,8 +3755,8 @@ private:
 #define SN_LOG_CRITICAL() SN_LOGGER_CRITICAL(::snicholls::log::default_logger())
 
 #endif /* logging_hpp */
-// end logging.hpp
-// (inlined) #include "thread_pool.hpp"                  // IWYU pragma: export
+// end logger.hpp
+// (inlined) #include "concurrent/thread_pool.hpp"                  // IWYU pragma: export
 // ----------------------------------------------------------------------
 // begin thread_pool.hpp
 // ----------------------------------------------------------------------
@@ -3787,7 +3787,7 @@ private:
 #include <utility>
 #include <vector>
 
-// (inlined) #include "moveable_condition_variable.hpp"
+// (inlined) #include "../moveable/condition_variable.hpp"
 // (inlined) #include "synchronized.hpp"
 // ----------------------------------------------------------------------
 // begin synchronized.hpp
@@ -3814,7 +3814,7 @@ private:
 #include <type_traits>
 #include <utility>
 
-// (inlined) #include "moveable_condition_variable.hpp"
+// (inlined) #include "../moveable/condition_variable.hpp"
 
 namespace snicholls
 {
@@ -4053,6 +4053,45 @@ namespace snicholls
 // end synchronized.hpp
 // (inlined) #include "circular_buffer.hpp"
 // (inlined) #include "mpmc_queue.hpp"
+// (inlined) #include "../interfaces/task_pool.hpp"
+// ----------------------------------------------------------------------
+// begin task_pool.hpp
+// ----------------------------------------------------------------------
+//
+//  interfaces/task_pool.hpp
+//  TSMoveables
+//
+//  Copyright 2026 Saxon Herschel Nicholls
+//
+//  Somewhere to submit work - the interface the thread pools share.
+//
+//  It is here on its own because the point of the pools was always
+//  *comparison*: one shared queue versus sharded versus work-stealing, weighed
+//  through a common surface. Code that only needs "somewhere to run this"
+//  should depend on that surface, not on five implementations.
+//
+
+#ifndef interfaces_task_pool_hpp
+#define interfaces_task_pool_hpp
+
+#include <cstddef>
+#include <functional>
+
+namespace snicholls
+{
+    struct task_pool {
+        using task = std::function<void()>;
+
+        virtual ~task_pool() = default;
+
+        virtual void submit(task t) = 0;                    // enqueue work
+        virtual void wait_idle() = 0;                       // block until all submitted work has run
+        virtual std::size_t worker_count() const noexcept = 0;
+    };
+} // namespace snicholls
+
+#endif /* interfaces_task_pool_hpp */
+// end task_pool.hpp
 // (inlined) #include "work_stealing_deque.hpp"
 // ----------------------------------------------------------------------
 // begin work_stealing_deque.hpp
@@ -4221,15 +4260,6 @@ namespace snicholls
     // We do not try to beat the work-stealing greats (Taskflow, TBB, Tokio).
     // What we add: pools composed visibly from these primitives, a moveable
     // pool handle, dependency-free/header-only/C++17, and a level harness.
-    struct task_pool {
-        using task = std::function<void()>;
-
-        virtual ~task_pool() = default;
-
-        virtual void submit(task t) = 0;                    // enqueue work
-        virtual void wait_idle() = 0;                       // block until all submitted work has run
-        virtual std::size_t worker_count() const noexcept = 0;
-    };
 
     // Result-returning submission over ANY implementation - non-virtual and
     // generic, like snicholls::call_once. Wraps a packaged_task, returns its
@@ -4685,9 +4715,9 @@ namespace snicholls
 
 #endif /* thread_pool_hpp */
 // end thread_pool.hpp
-// (inlined) #include "event_loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
+// (inlined) #include "event/loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 // ----------------------------------------------------------------------
-// begin event_loop.hpp
+// begin loop.hpp
 // ----------------------------------------------------------------------
 //
 //  event_loop.hpp
@@ -4746,8 +4776,8 @@ namespace snicholls
 #include <poll.h>
 #endif
 
-// (inlined) #include "moveable_signal.hpp"
-// (inlined) #include "mpmc_queue.hpp"
+// (inlined) #include "../moveable/signal.hpp"
+// (inlined) #include "../concurrent/mpmc_queue.hpp"
 
 namespace snicholls
 {
@@ -5432,8 +5462,8 @@ namespace snicholls
 
 #endif // !defined(_WIN32)
 #endif /* event_loop_hpp */
-// end event_loop.hpp
-// (inlined) #include "time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
+// end loop.hpp
+// (inlined) #include "event/time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
 // ----------------------------------------------------------------------
 // begin time_master.hpp
 // ----------------------------------------------------------------------
@@ -5484,7 +5514,7 @@ namespace snicholls
 #ifndef time_master_hpp
 #define time_master_hpp
 
-// (inlined) #include "event_loop.hpp"
+// (inlined) #include "loop.hpp"
 
 #if !SNICHOLLS_HAS_EVENT_LOOP
 #define SNICHOLLS_HAS_TIME_MASTER 0
@@ -5618,9 +5648,9 @@ private:
 #endif // SNICHOLLS_HAS_EVENT_LOOP
 #endif /* time_master_hpp */
 // end time_master.hpp
-// (inlined) #include "http_server.hpp"                  // IWYU pragma: export (follows the event loop)
+// (inlined) #include "http/server.hpp"                  // IWYU pragma: export (follows the event loop)
 // ----------------------------------------------------------------------
-// begin http_server.hpp
+// begin server.hpp
 // ----------------------------------------------------------------------
 //
 //  http_server.hpp
@@ -5668,8 +5698,85 @@ private:
 #ifndef http_server_hpp
 #define http_server_hpp
 
-// (inlined) #include "event_loop.hpp"
-// (inlined) #include "moveable_signal.hpp"
+// (inlined) #include "../event/loop.hpp"
+// (inlined) #include "../interfaces/transport_delegate.hpp"
+// ----------------------------------------------------------------------
+// begin transport_delegate.hpp
+// ----------------------------------------------------------------------
+//
+//  interfaces/transport_delegate.hpp
+//  TSMoveables
+//
+//  Copyright 2026 Saxon Herschel Nicholls
+//
+//  How bytes reach a connection - one of the two axes the server hangs on.
+//
+//  This is here, on its own, because it is an *extension point*: writing a TLS
+//  backend means implementing this and nothing else. It needs only <string>,
+//  because the engine is deliberately transport-agnostic - ciphertext in,
+//  plaintext out, and the reverse. It never sees a socket; the reactor owns
+//  all IO. That is what makes every backend testable without a network, and
+//  it is why implementing one does not mean including a 2,700-line server.
+//
+//  Shipped implementations: plain (below), tls/openssl.hpp, tls/mbedtls.hpp.
+//
+
+#ifndef interfaces_transport_delegate_hpp
+#define interfaces_transport_delegate_hpp
+
+#include <cstddef>
+#include <string>
+
+namespace snicholls {
+namespace http {
+
+class transport_delegate {
+public:
+    virtual ~transport_delegate() = default;
+    virtual const char* name() const noexcept = 0;
+
+    // Wire bytes arrived: append application bytes to app_in, and any bytes
+    // the transport itself owes the peer (handshake, alerts) to wire_out
+    virtual bool wire_in(const char* data, std::size_t n,
+                         std::string& app_in, std::string& wire_out) = 0;
+
+    // The application wants to send bytes: append wire bytes to wire_out
+    virtual bool app_out(const char* data, std::size_t n, std::string& wire_out) = 0;
+
+    virtual bool established() const noexcept { return true; }
+    // The protocol ALPN settled on, or an **empty string** when nothing was
+    // negotiated - a plaintext connection, or a client that offered no list.
+    // Those two cases must stay distinguishable: choosing the protocol
+    // delegate by ALPN means "the client asked for h2" and "the client said
+    // nothing, so default to http/1.1" are different answers, and collapsing
+    // them into the literal "http/1.1" throws away the only bit that matters.
+    virtual const char* alpn() const noexcept { return ""; }
+    virtual void shutdown(std::string& /*wire_out*/) {}
+};
+
+class plain_transport final : public transport_delegate {
+public:
+    const char* name() const noexcept override { return "plain"; }
+
+    bool wire_in(const char* data, std::size_t n, std::string& app_in, std::string&) override
+    {
+        app_in.append(data, n);
+        return true;
+    }
+
+    bool app_out(const char* data, std::size_t n, std::string& wire_out) override
+    {
+        wire_out.append(data, n);
+        return true;
+    }
+};
+
+} // namespace http
+} // namespace snicholls
+
+#endif /* interfaces_transport_delegate_hpp */
+// end transport_delegate.hpp
+// (inlined) #include "../moveable/signal.hpp"
 
 #if !SNICHOLLS_HAS_EVENT_LOOP
 #define SNICHOLLS_HAS_HTTP_SERVER 0
@@ -6702,46 +6809,9 @@ struct access_entry {
 // the reactor owns all IO. That is what makes every backend testable without
 // a network, and what makes the backend a run-time choice.
 
-class transport_delegate {
-public:
-    virtual ~transport_delegate() = default;
-    virtual const char* name() const noexcept = 0;
-
-    // Wire bytes arrived: append application bytes to app_in, and any bytes
-    // the transport itself owes the peer (handshake, alerts) to wire_out
-    virtual bool wire_in(const char* data, std::size_t n,
-                         std::string& app_in, std::string& wire_out) = 0;
-
-    // The application wants to send bytes: append wire bytes to wire_out
-    virtual bool app_out(const char* data, std::size_t n, std::string& wire_out) = 0;
-
-    virtual bool established() const noexcept { return true; }
-    // The protocol ALPN settled on, or an **empty string** when nothing was
-    // negotiated - a plaintext connection, or a client that offered no list.
-    // Those two cases must stay distinguishable: choosing the protocol
-    // delegate by ALPN means "the client asked for h2" and "the client said
-    // nothing, so default to http/1.1" are different answers, and collapsing
-    // them into the literal "http/1.1" throws away the only bit that matters.
-    virtual const char* alpn() const noexcept { return ""; }
-    virtual void shutdown(std::string& /*wire_out*/) {}
-};
-
-class plain_transport final : public transport_delegate {
-public:
-    const char* name() const noexcept override { return "plain"; }
-
-    bool wire_in(const char* data, std::size_t n, std::string& app_in, std::string&) override
-    {
-        app_in.append(data, n);
-        return true;
-    }
-
-    bool app_out(const char* data, std::size_t n, std::string& wire_out) override
-    {
-        wire_out.append(data, n);
-        return true;
-    }
-};
+// transport_delegate and plain_transport now live in
+// interfaces/transport_delegate.hpp - implementing a transport should not
+// mean including the whole server.
 
 class protocol_delegate;
 
@@ -8351,8 +8421,8 @@ private:
 
 #endif // SNICHOLLS_HAS_EVENT_LOOP
 #endif /* http_server_hpp */
-// end http_server.hpp
-// (inlined) #include "websocket.hpp"                    // IWYU pragma: export (a protocol delegate on it)
+// end server.hpp
+// (inlined) #include "http/websocket.hpp"                    // IWYU pragma: export (a protocol delegate on it)
 // ----------------------------------------------------------------------
 // begin websocket.hpp
 // ----------------------------------------------------------------------
@@ -8395,7 +8465,56 @@ private:
 #ifndef websocket_hpp
 #define websocket_hpp
 
-// (inlined) #include "http_server.hpp"
+// (inlined) #include "server.hpp"
+// (inlined) #include "../interfaces/ws_extension.hpp"
+// ----------------------------------------------------------------------
+// begin ws_extension.hpp
+// ----------------------------------------------------------------------
+//
+//  interfaces/ws_extension.hpp
+//  TSMoveables
+//
+//  Copyright 2026 Saxon Herschel Nicholls
+//
+//  A WebSocket per-message extension (RFC 6455 §9) - the third delegate axis.
+//
+//  Transport decides how bytes arrive, protocol decides what they mean, and an
+//  extension transforms the message payload. Like the transport interface this
+//  needs nothing but <string>: it is a byte transformer with negotiated state,
+//  so a backend can be written and tested without a socket in sight.
+//
+//  Shipped implementation: permessage-deflate, in http/websocket_deflate.hpp.
+//
+
+#ifndef interfaces_ws_extension_hpp
+#define interfaces_ws_extension_hpp
+
+#include <functional>
+#include <memory>
+#include <string>
+
+namespace snicholls {
+namespace http {
+
+class ws_extension {
+public:
+    virtual ~ws_extension() = default;
+    virtual const char* name() const noexcept = 0;
+
+    // Given this extension's parameters from the client's offer, fill in the
+    // parameters to send back and return true to accept. Returning false
+    // declines the offer, and the connection proceeds uncompressed.
+    virtual bool negotiate(const std::string& offer_params, std::string& response_params) = 0;
+
+    virtual bool compress(const std::string& in, std::string& out) = 0;
+    virtual bool decompress(const std::string& in, std::string& out) = 0;
+};
+
+} // namespace http
+} // namespace snicholls
+
+#endif /* interfaces_ws_extension_hpp */
+// end ws_extension.hpp
 
 #if !SNICHOLLS_HAS_HTTP_SERVER
 #define SNICHOLLS_HAS_WEBSOCKET 0
@@ -8559,20 +8678,6 @@ enum ws_close : std::uint16_t {
 // single-consumer transform with a result, not a fan-out notification. A
 // signal would be the wrong tool; the value here is choosing the
 // implementation at run time, which is what a delegate is for.
-class ws_extension {
-public:
-    virtual ~ws_extension() = default;
-    virtual const char* name() const noexcept = 0;
-
-    // Given this extension's parameters from the client's offer, fill in the
-    // parameters to send back and return true to accept. Returning false
-    // declines the offer, and the connection proceeds uncompressed.
-    virtual bool negotiate(const std::string& offer_params, std::string& response_params) = 0;
-
-    virtual bool compress(const std::string& in, std::string& out) = 0;
-    virtual bool decompress(const std::string& in, std::string& out) = 0;
-};
-
 struct ws_config {
     std::size_t max_message = 8u * 1024 * 1024;
     std::size_t max_frame   = 8u * 1024 * 1024;
@@ -9105,8 +9210,8 @@ inline handler websocket_route(ws_handler on_open, ws_config cfg = ws_config{})
 #endif // SNICHOLLS_HAS_HTTP_SERVER
 #endif /* websocket_hpp */
 // end websocket.hpp
-// (inlined) #include "synchronized.hpp"                 // IWYU pragma: export
-// (inlined) #include "synchronized_heterogeneous.hpp"   // IWYU pragma: export
+// (inlined) #include "concurrent/synchronized.hpp"                 // IWYU pragma: export
+// (inlined) #include "concurrent/synchronized_heterogeneous.hpp"   // IWYU pragma: export
 // ----------------------------------------------------------------------
 // begin synchronized_heterogeneous.hpp
 // ----------------------------------------------------------------------

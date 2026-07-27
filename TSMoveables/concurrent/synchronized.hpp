@@ -20,7 +20,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "moveable_condition_variable.hpp"
+#include "../moveable/condition_variable.hpp"
 
 namespace snicholls
 {

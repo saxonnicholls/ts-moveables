@@ -14,8 +14,8 @@
 
 #include "test_helpers.hpp"
 
-#include "../TSMoveables/logging.hpp"
-#include "../TSMoveables/moveable_mutex.hpp"
+#include "../TSMoveables/logging/logger.hpp"
+#include "../TSMoveables/moveable/mutex.hpp"
 
 #include <atomic>
 #include <chrono>

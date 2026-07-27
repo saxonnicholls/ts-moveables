@@ -15,7 +15,7 @@
 
 #include "test_helpers.hpp"
 
-#include "../TSMoveables/websocket.hpp"
+#include "../TSMoveables/http/websocket.hpp"
 
 #if SNICHOLLS_HAS_WEBSOCKET
 

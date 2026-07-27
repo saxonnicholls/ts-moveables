@@ -45,7 +45,7 @@
 #ifndef time_master_hpp
 #define time_master_hpp
 
-#include "event_loop.hpp"
+#include "loop.hpp"
 
 #if !SNICHOLLS_HAS_EVENT_LOOP
 #define SNICHOLLS_HAS_TIME_MASTER 0

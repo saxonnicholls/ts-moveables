@@ -43,13 +43,13 @@
 
 #include "../test_helpers.hpp"
 
-#include "../../TSMoveables/tls_openssl.hpp"
+#include "../../TSMoveables/tls/openssl.hpp"
 
 #if defined(SNICHOLLS_TEST_MBEDTLS)
-#include "../../TSMoveables/tls_mbedtls.hpp"
+#include "../../TSMoveables/tls/mbedtls.hpp"
 #endif
 
-#include "../../TSMoveables/websocket.hpp"
+#include "../../TSMoveables/http/websocket.hpp"
 
 #if SNICHOLLS_HAS_TLS
 

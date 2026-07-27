@@ -28,7 +28,7 @@
 //  Build and run:  make bench-http     (fetches httplib into third_party/)
 //
 
-#include "../TSMoveables/http_server.hpp"
+#include "../TSMoveables/http/server.hpp"
 
 #include <cstdio>
 #include <cstdlib>

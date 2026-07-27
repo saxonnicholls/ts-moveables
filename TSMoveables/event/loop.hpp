@@ -55,8 +55,8 @@
 #include <poll.h>
 #endif
 
-#include "moveable_signal.hpp"
-#include "mpmc_queue.hpp"
+#include "../moveable/signal.hpp"
+#include "../concurrent/mpmc_queue.hpp"
 
 namespace snicholls
 {

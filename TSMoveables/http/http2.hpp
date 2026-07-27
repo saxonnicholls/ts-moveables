@@ -54,7 +54,7 @@
 #ifndef http2_hpp
 #define http2_hpp
 
-#include "http_server.hpp"
+#include "server.hpp"
 
 #if !SNICHOLLS_HAS_HTTP_SERVER
 #define SNICHOLLS_HAS_HTTP2 0

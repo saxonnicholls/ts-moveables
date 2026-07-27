@@ -30,7 +30,7 @@
 //  Build and run:  make bench-scale
 //
 
-#include "../TSMoveables/http_server.hpp"
+#include "../TSMoveables/http/server.hpp"
 
 #include <cstdio>
 #include <cstdlib>

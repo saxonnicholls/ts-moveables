@@ -19,9 +19,9 @@
 //      ./build/ws_echo_server [port]         (default 9001, the Autobahn one)
 //
 
-#include "../../TSMoveables/websocket.hpp"
+#include "../../TSMoveables/http/websocket.hpp"
 #ifdef SNICHOLLS_AUTOBAHN_DEFLATE
-#include "../../TSMoveables/websocket_deflate.hpp"
+#include "../../TSMoveables/http/websocket_deflate.hpp"
 #endif
 
 #include <cstdio>

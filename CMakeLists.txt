@@ -85,11 +85,11 @@ if(TS_MOVEABLES_BUILD_TESTS)
     endforeach()
 endif()
 
-# Install and export
-file(GLOB TS_MOVEABLES_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/TSMoveables/*.hpp")
-
-install(FILES ${TS_MOVEABLES_HEADERS}
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ts_moveables)
+# Install and export - headers live in subdirectories, so the tree is
+# installed as a tree; consumers include "moveable/mutex.hpp" and friends
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/TSMoveables/"
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ts_moveables
+    FILES_MATCHING PATTERN "*.hpp")
 
 install(TARGETS ts_moveables EXPORT ts_moveablesTargets)
 

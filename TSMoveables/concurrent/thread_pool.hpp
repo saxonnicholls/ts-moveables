@@ -25,10 +25,11 @@
 #include <utility>
 #include <vector>
 
-#include "moveable_condition_variable.hpp"
+#include "../moveable/condition_variable.hpp"
 #include "synchronized.hpp"
 #include "circular_buffer.hpp"
 #include "mpmc_queue.hpp"
+#include "../interfaces/task_pool.hpp"
 #include "work_stealing_deque.hpp"
 
 namespace snicholls
@@ -49,15 +50,6 @@ namespace snicholls
     // We do not try to beat the work-stealing greats (Taskflow, TBB, Tokio).
     // What we add: pools composed visibly from these primitives, a moveable
     // pool handle, dependency-free/header-only/C++17, and a level harness.
-    struct task_pool {
-        using task = std::function<void()>;
-
-        virtual ~task_pool() = default;
-
-        virtual void submit(task t) = 0;                    // enqueue work
-        virtual void wait_idle() = 0;                       // block until all submitted work has run
-        virtual std::size_t worker_count() const noexcept = 0;
-    };
 
     // Result-returning submission over ANY implementation - non-virtual and
     // generic, like snicholls::call_once. Wraps a packaged_task, returns its

@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-#include "../TSMoveables/moveable_signal.hpp"
+#include "../TSMoveables/moveable/signal.hpp"
 
 using snicholls::moveable_signal;
 using snicholls::scoped_connection;

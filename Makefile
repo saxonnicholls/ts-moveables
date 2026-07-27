@@ -22,7 +22,7 @@ ifeq ($(UNAME_S),Linux)
   LDLIBS += -latomic
 endif
 
-HEADERS  := $(wildcard TSMoveables/*.hpp) $(wildcard tests/*.hpp)
+HEADERS  := $(shell find TSMoveables -name '*.hpp') $(wildcard tests/*.hpp)
 TEST_SRC := $(wildcard tests/*.cpp)
 
 all: build/tests build/demo
@@ -205,7 +205,7 @@ bench-dispatch: build/loop_dispatch
 
 # One self-contained file per entry header, for drop-in use
 amalgamate:
-	python3 scripts/amalgamate.py http_server.hpp
+	python3 scripts/amalgamate.py http/server.hpp -o single_include/ts_http_server.hpp
 	python3 scripts/amalgamate.py ts_moveables.hpp
 
 # The amalgamated header must always still compile - and run - on its own,

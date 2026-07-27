@@ -13,7 +13,7 @@
 
 #include "test_helpers.hpp"
 
-#include "../TSMoveables/event_loop.hpp"
+#include "../TSMoveables/event/loop.hpp"
 
 #if SNICHOLLS_HAS_EVENT_LOOP
 

@@ -16,8 +16,8 @@
 
 #include "test_helpers.hpp"
 
-#include "../TSMoveables/http_server.hpp"
-#include "../TSMoveables/moveable_mutex.hpp"
+#include "../TSMoveables/http/server.hpp"
+#include "../TSMoveables/moveable/mutex.hpp"
 
 #if SNICHOLLS_HAS_HTTP_SERVER
 

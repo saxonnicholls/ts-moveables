@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "../TSMoveables/mpmc_queue.hpp"
+#include "../TSMoveables/concurrent/mpmc_queue.hpp"
 
 using namespace snicholls;
 
