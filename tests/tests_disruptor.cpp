@@ -540,7 +540,9 @@ void test_disruptor_multi_producer_move()
     // *object* is not a synchronisation point - the same externally
     // synchronized handoff the single-producer contract already asks for.
     constexpr int producers = 3;
-    constexpr std::int64_t per_phase = 3000;    // per producer, per phase
+    // static, because the producer lambda below has an explicit capture list
+    // and no default capture mode - see the note in test_helpers.hpp
+    static constexpr std::int64_t per_phase = 3000;     // per producer, per phase
     constexpr std::int64_t total = 2 * producers * per_phase;
 
     multi_producer_disruptor<Event> d1{64};

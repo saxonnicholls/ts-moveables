@@ -97,12 +97,31 @@ elif [ "$(uname -s)" = "Linux" ]; then
         crossbario/autobahn-testsuite \
         wstest --mode fuzzingclient --spec /config/fuzzingclient.json \
         >"$outdir/wstest.log" 2>&1
+    docker_rc=$?
 else
     docker run --rm \
         -v "$outdir:/config" -v "$outdir:/reports" \
         crossbario/autobahn-testsuite \
         wstest --mode fuzzingclient --spec /config/fuzzingclient.json \
         >"$outdir/wstest.log" 2>&1
+    docker_rc=$?
+fi
+
+# Distinguish "the suite could not run" from "the suite found failures". The
+# official image is published for amd64 only, so on an arm64 host the run dies
+# with a manifest error - which is a missing grader, not a conformance result,
+# and reporting it as a parse failure sends you looking in the wrong place.
+if [ "$mode" = "docker" ] && [ "${docker_rc:-0}" -ne 0 ]; then
+    if grep -qiE "no matching manifest|not match the detected host|exec format error" \
+            "$outdir/wstest.log" 2>/dev/null; then
+        echo "error: crossbario/autobahn-testsuite has no image for $(uname -m)." >&2
+        echo "       Run the conformance suite on x86-64, or install wstest natively" >&2
+        echo "       and point WSTEST at it. This is a missing grader, not a failure." >&2
+        exit 2
+    fi
+    echo "error: the Autobahn container exited $docker_rc - see $outdir/wstest.log" >&2
+    tail -20 "$outdir/wstest.log" >&2
+    exit 2
 fi
 echo "wstest finished"
 

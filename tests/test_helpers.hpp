@@ -39,6 +39,18 @@ void spin_until(Pred pred)
         std::this_thread::yield();
 }
 
+// A note that has cost this repository four CI failures, so it lives here
+// where every test file will see it:
+//
+//   A `constexpr` local used inside a lambda that has NO default capture mode
+//   (`[a, b]` rather than `[&]` or `[&, b]`) is rejected by MSVC with C3493 -
+//   "cannot be implicitly captured because no default capture mode has been
+//   specified" - even though GCC and Clang accept it, since a constant needs
+//   no capture. The fix is `static constexpr`: static storage duration means
+//   there is nothing to capture on any compiler. Prefer that to adding a
+//   default capture mode, because it keeps the explicit capture list honest
+//   about what the lambda actually touches.
+//
 // Bounded spin: returns false if the condition has not come true within the
 // deadline. Use it (with assert) wherever a broken invariant would otherwise
 // hang the suite instead of failing it. The limit is deliberately generous -

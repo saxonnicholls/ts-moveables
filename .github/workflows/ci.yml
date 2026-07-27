@@ -79,10 +79,12 @@ jobs:
             ./build/http_server_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # Autobahn|Testsuite: the external RFC 6455 grader. Linux only, since it
-      # needs Docker with --network host to reach the echo server.
+      # Autobahn|Testsuite: the external RFC 6455 grader. x86-64 Linux only -
+      # it needs Docker with --network host to reach the echo server, and the
+      # official image is published for amd64 only. Protocol conformance does
+      # not vary by architecture, so grading it once is enough.
       - name: Autobahn WebSocket conformance
-        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
           make build/ws_echo_server CXX=${{ matrix.cxx }}
           ./scripts/run_autobahn.sh
