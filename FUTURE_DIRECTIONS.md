@@ -223,7 +223,11 @@ loop.run();
 - **Phase 2 — comfort:** POSIX signals (signalfd / kqueue `EVFILT_SIGNAL`) as signal emissions; Windows sockets-only `WSAPoll` backend; a backpressure-aware write helper.
 - **Non-goals:** no proactor/IOCP, no SSL or protocol stacks, no filesystem watching, no general async model — Asio exists.
 
-**Bar to clear.** TSan-green across the matrix; a self-verifying **replayable-loop demo** (journal a scripted session over socketpairs, replay into a fresh handler graph, assert identical output hashes); a bench row measuring dispatch overhead against a raw epoll/kqueue loop, publishing the "syscall dominates, elegance is free" number honestly.
+**Bar cleared.** TSan is green across the matrix. The replayable-loop demo ships as `make demo-replay`: a scripted session over three socketpairs, two timers and cross-thread posts is journalled through the dispatch tap, replayed into a *fresh* handler graph with no sockets, timers, threads or clock, and the digests match bit for bit — with a negative control that drops exactly one event and asserts the digests then diverge, because a replay test that cannot fail proves nothing. The same discipline replays a whole HTTP session through a fresh router.
+
+The dispatch bench ships as `make bench-dispatch`, and the honest answer is *nearly* free rather than free: typed signal dispatch costs roughly **100 ns per event on top of syscalls costing ~1.5 µs, about 6-11%**. The original claim said the abstraction was free at this altitude; it is small, not zero, and the range is wide because the measuring machine was busy — CI now runs it on six platforms, which is a better answer than one laptop. Read the ratio, not the rate: the absolute number is whatever that machine charges for `epoll_wait` and `read`.
+
+**Original bar.** TSan-green across the matrix; a self-verifying **replayable-loop demo** (journal a scripted session over socketpairs, replay into a fresh handler graph, assert identical output hashes); a bench row measuring dispatch overhead against a raw epoll/kqueue loop, publishing the "syscall dominates, elegance is free" number honestly.
 
 **Effort.** Large-ish but bounded: the poller backends are ~50 lines each; the loop core is the careful part; the tests and the replay demo are where the honesty lives.
 
@@ -379,6 +383,6 @@ Written down so nobody — including us — spends a busy week on them:
 | 4 | Disruptor phase 1 | Large | **Shipped** |
 | 5 | `thread_pool` interface + mutex / sharded / dispatch impls | Medium | **Shipped** |
 | 6 | `mpmc_queue` + work-stealing pool | Large ×2 | **Shipped** |
-| 7 | `event_loop` phase 1 (POSIX reactor, replayable) | Large | **In progress** — core + tests + TimeMaster demo landed; replay demo and dispatch bench remain |
+| 7 | `event_loop` phase 1 (POSIX reactor, replayable) | Large | ✅ **Shipped — the §7 bar is clear.** Core, tests, TimeMaster, the replayable-loop demo (`make demo-replay`) and the dispatch-overhead bench (`make bench-dispatch`) |
 | 8 | Disruptor phase 2 (multi-producer) | Large | **Shipped** — `multi_producer_disruptor<T>`; opt-in at compile time, single-producer codegen unchanged |
 | 9 | HTTP/HTTPS server on delegates (§8) — with `moveable_function` when needed | Large ×2 | After event_loop phase 1 clears its bar |

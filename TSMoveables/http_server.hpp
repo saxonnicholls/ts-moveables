@@ -1132,6 +1132,12 @@ public:
     virtual const char* http_date() = 0;
     virtual bool live() const noexcept = 0;
 
+    // What ALPN settled on for this connection, or an empty string when
+    // nothing did. A protocol delegate needs this to choose its successor:
+    // "the client asked for h2" and "the client said nothing" are different
+    // answers, and only the transport knows which one happened.
+    virtual const char* alpn() const noexcept { return ""; }
+
     // Hand this connection to a different protocol - the Upgrade path. The
     // swap is deferred until the current delegate's consume() has returned,
     // because a delegate cannot safely be destroyed from inside its own call.
@@ -1717,6 +1723,8 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     void deliver(request& req, std::uint64_t stream) override;
     void protocol_failure(int status, const char* reason) override;
 
+    const char* alpn() const noexcept override { return transport ? transport->alpn() : ""; }
+
     void write_app(const char* data, std::size_t n) override
     {
         if (!transport->app_out(data, n, out))
@@ -1837,6 +1845,15 @@ struct server_core : std::enable_shared_from_this<server_core> {
     std::function<std::unique_ptr<transport_delegate>()> make_transport =
         [] { return std::unique_ptr<transport_delegate>(new plain_transport()); };
 
+    // The other half of the matrix. A connection's protocol is a run-time
+    // choice too, and it has to be one: over TLS the ALPN result does not
+    // exist yet when the descriptor is accepted, so the delegate installed
+    // here is free to be one that decides later and swaps itself out.
+    std::function<std::unique_ptr<protocol_delegate>(const server_config&)> make_protocol =
+        [](const server_config& sc) {
+            return std::unique_ptr<protocol_delegate>(new http1_protocol(sc.limits));
+        };
+
     explicit server_core(server_config c) : cfg(std::move(c))
     {
         readbuf.resize(cfg.read_buffer ? cfg.read_buffer : 64u * 1024);
@@ -1954,7 +1971,9 @@ struct server_core : std::enable_shared_from_this<server_core> {
         s->fd = cfd;
         s->id = next_id++;
         s->transport = make_transport();
-        s->protocol.reset(new http1_protocol(cfg.limits));
+        s->protocol = make_protocol(cfg);
+        if (!s->protocol)
+            s->protocol.reset(new http1_protocol(cfg.limits));
         s->poster = loop.make_poster();
         s->last_activity = s->request_started = std::chrono::steady_clock::now();
         s->info = describe(cfd, ss);
@@ -2520,6 +2539,15 @@ public:
     server& transport_factory(std::function<std::unique_ptr<transport_delegate>()> f)
     {
         c_->make_transport = std::move(f);
+        return *this;
+    }
+
+    // The protocol factory - where an h2-aware delegate is installed at run
+    // time. See http2.hpp's enable_http2(), which is this in one line.
+    server& protocol_factory(
+        std::function<std::unique_ptr<protocol_delegate>(const server_config&)> f)
+    {
+        c_->make_protocol = std::move(f);
         return *this;
     }
 

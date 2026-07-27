@@ -68,6 +68,20 @@ build/taskflow_style_demo: demos/taskflow_style_demo.cpp $(HEADERS) | build
 build/time_master_demo: demos/time_master_demo.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/time_master_demo.cpp -o $@ $(LDLIBS)
 
+build/drone_fleet_demo: demos/drone_fleet_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    demos/drone_fleet_demo.cpp -o $@ $(LDLIBS)
+
+demo-drones: build/drone_fleet_demo
+	./build/drone_fleet_demo
+
+build/replay_loop_demo: demos/replay_loop_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    demos/replay_loop_demo.cpp -o $@ $(LDLIBS)
+
+demo-replay: build/replay_loop_demo
+	./build/replay_loop_demo
+
 build/http_server_demo: demos/http_server_demo.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/http_server_demo.cpp -o $@ $(LDLIBS)
 
@@ -111,6 +125,16 @@ build/ws_echo_server: tests/autobahn/ws_echo_server.cpp $(HEADERS) | build
 
 autobahn: build/ws_echo_server
 	./scripts/run_autobahn.sh
+
+# h2spec - the external RFC 9113 / RFC 7541 grader. Same shape as Autobahn:
+# the server under test is ours, the conformance client comes from the
+# official image, and the runner distinguishes "could not run" from "failed"
+build/h2_server: tests/h2spec/h2_server.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O2 -pthread \
+	    tests/h2spec/h2_server.cpp -o $@ $(LDLIBS)
+
+h2spec: build/h2_server
+	./scripts/run_h2spec.sh
 
 tsan: build/tests_tsan
 	TSAN_OPTIONS="suppressions=tests/tsan.supp" ./build/tests_tsan
@@ -171,6 +195,14 @@ build/http_request_path: benchmarks/http_request_path.cpp $(HEADERS) | build
 bench-request: build/http_request_path
 	./build/http_request_path
 
+# What typed signal dispatch costs against a raw epoll/kqueue loop
+build/loop_dispatch: benchmarks/loop_dispatch.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    benchmarks/loop_dispatch.cpp -o $@ $(LDLIBS)
+
+bench-dispatch: build/loop_dispatch
+	./build/loop_dispatch
+
 # One self-contained file per entry header, for drop-in use
 amalgamate:
 	python3 scripts/amalgamate.py http_server.hpp
@@ -186,4 +218,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http test-tls autobahn bench-http bench-scale bench-request amalgamate check-amalgamate clean
+.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-replay demo-drones test-tls autobahn h2spec bench-http bench-scale bench-request bench-dispatch amalgamate check-amalgamate clean

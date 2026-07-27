@@ -66,7 +66,7 @@ jobs:
       - name: Demos (self-verifying)
         run: |
           set -o pipefail
-          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo build/http_server_demo CXX=${{ matrix.cxx }}
+          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo build/http_server_demo build/replay_loop_demo CXX=${{ matrix.cxx }}
           {
             ./build/capture_replay_demo --markdown
             echo ""
@@ -77,6 +77,8 @@ jobs:
             ./build/time_master_demo --markdown
             echo ""
             ./build/http_server_demo --markdown
+            echo ""
+            ./build/replay_loop_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Autobahn|Testsuite: the external RFC 6455 grader. x86-64 Linux only -
@@ -103,6 +105,18 @@ jobs:
             echo "::error::single_include/ is stale - run 'make amalgamate' and commit"
             exit 1
           }
+
+      # What typed signal dispatch costs against a raw epoll/kqueue loop. Six
+      # platforms give a better answer than one developer laptop.
+      - name: Dispatch overhead (informational)
+        continue-on-error: true
+        run: |
+          make build/loop_dispatch CXX=${{ matrix.cxx }}
+          {
+            echo "## Dispatch overhead - ${{ matrix.name }}"
+            echo ""
+            ./build/loop_dispatch --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # What one request costs in CPU alone, with no sockets involved: the
       # ceiling a core cannot exceed however good the I/O layer is.
@@ -207,6 +221,8 @@ jobs:
             run_exe ts_moveables_time_master_demo
             echo ""
             run_exe ts_moveables_http_server_demo
+            echo ""
+            run_exe ts_moveables_replay_loop_demo
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   msvc:

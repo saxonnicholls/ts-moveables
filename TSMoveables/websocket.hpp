@@ -340,6 +340,16 @@ public:
     moveable_signal<const std::string&>& on_pong() { return s_->on_pong; }
 
     const request& handshake() const noexcept { return s_->handshake; }
+
+    // Bytes queued for this socket but not yet handed to the kernel. The
+    // backpressure signal a fan-out needs: a relay with many destinations must
+    // be able to tell which of them has fallen behind, and skip it, rather
+    // than let one slow peer grow a buffer without bound.
+    std::size_t backlog() const noexcept
+    {
+        auto sess = s_ ? s_->session.lock() : nullptr;
+        return sess ? sess->pending_bytes() : 0;
+    }
     bool connected() const noexcept
     {
         return s_ && s_->open.load(std::memory_order_acquire) && !s_->session.expired();

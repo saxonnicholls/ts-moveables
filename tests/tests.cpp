@@ -32,6 +32,8 @@ void run_event_loop_tests();
 void run_http_server_tests();
 void run_websocket_tests();
 void run_ws_deflate_tests();
+void run_logging_tests();
+void run_http2_tests();
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -860,6 +862,8 @@ int main()
     run_http_server_tests();
     run_websocket_tests();
     run_ws_deflate_tests();
+    run_logging_tests();
+    run_http2_tests();
 
     test_once_flag();
 

@@ -24,6 +24,7 @@
 #include "mpmc_queue.hpp"                   // IWYU pragma: export
 #include "disruptor.hpp"                    // IWYU pragma: export
 #include "moveable_signal.hpp"              // IWYU pragma: export
+#include "logging.hpp"                      // IWYU pragma: export
 #include "thread_pool.hpp"                  // IWYU pragma: export
 #include "event_loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 #include "time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
