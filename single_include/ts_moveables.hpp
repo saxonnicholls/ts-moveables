@@ -1773,6 +1773,94 @@ namespace snicholls
         };
     } // namespace detail
 
+    // Which producer discipline a disruptor is built for. This is a
+    // compile-time choice rather than a runtime flag on purpose: the
+    // single-producer path is the one people benchmark, and it must not pay a
+    // branch, a CAS or an availability array for a mode it never uses.
+    // Multi-producer users spell it out through multi_producer_disruptor.
+    enum class producer_mode { single, multi };
+
+    namespace detail
+    {
+        // Multi-producer bookkeeping. The primary template is empty, so a
+        // single-producer disruptor allocates nothing here and carries none of
+        // these members - the mode you did not choose costs you nothing.
+        template <bool Multi>
+        struct multi_producer_state {
+            void init(std::size_t) noexcept {}
+        };
+
+        template <>
+        struct multi_producer_state<true> {
+            // A shared, deliberately stale view of the slowest consumer, so
+            // producers do not have to scan every gating sequence on every
+            // claim. Padded: it is written on the slow path but read on the
+            // fast one by every producer.
+            sequence gate_cache;
+
+            // One mark per slot, holding the *round* on which the slot was
+            // last published: round(s) = s >> index_bits. -1 means "never".
+            //
+            // Why the round and not a bool - this is the subtle part. With
+            // several producers in flight, sequence N+1 can be published
+            // before N, so the cursor alone no longer means "everything up to
+            // here is readable" and each slot has to say for itself. A bool
+            // would have to be cleared when the slot is recycled, and there is
+            // no safe moment to clear it: the producer that claims the slot
+            // for the next lap cannot clear before filling (a consumer would
+            // then see an already-published event vanish) and cannot clear
+            // after filling (until it does, the previous lap's `true` reads as
+            // this lap's publication, and a consumer walks straight into a
+            // half-written event). Storing the round makes the mark
+            // self-describing instead: a mark written on lap k can never
+            // answer a question about lap k+1, so nothing ever needs clearing
+            // and wraparound cannot be mistaken for availability.
+            //
+            // Held as int64 so no truncation argument is needed - the round
+            // has the same range as the sequence it came from.
+            std::unique_ptr<std::atomic<std::int64_t>[]> avail;
+            std::size_t mask = 0;
+            int index_bits = 0;
+
+            void init(std::size_t capacity) {
+                mask = capacity - 1;
+                index_bits = 0;
+                while ((std::size_t{1} << index_bits) < capacity)
+                    ++index_bits;
+                avail = std::unique_ptr<std::atomic<std::int64_t>[]>(
+                    new std::atomic<std::int64_t>[capacity]);
+                for (std::size_t i = 0; i < capacity; ++i)
+                    avail[i].store(-1, std::memory_order_relaxed);   // no lap published yet
+            }
+
+            bool is_available(std::int64_t s) const noexcept {
+                // Acquire: pairs with the release store in publish(). Seeing
+                // this lap's mark is exactly what makes the producer's writes
+                // into the slot visible to the consumer about to read them.
+                return avail[static_cast<std::size_t>(s) & mask].load(std::memory_order_acquire) ==
+                       (s >> index_bits);
+            }
+
+            void publish(std::int64_t s) noexcept {
+                // Release: everything this producer wrote into the slot
+                // happens-before any consumer that observes the mark
+                avail[static_cast<std::size_t>(s) & mask].store(s >> index_bits,
+                                                                std::memory_order_release);
+            }
+
+            // The highest sequence in [from, upto] with no unpublished hole
+            // below it. `from` must be a sequence already known to be
+            // consumed or published - the walk cannot start in the middle of
+            // nowhere, because a gap below it would go unnoticed.
+            std::int64_t highest_published(std::int64_t from, std::int64_t upto) const noexcept {
+                for (std::int64_t s = from; s <= upto; ++s)
+                    if (!is_available(s))
+                        return s - 1;
+                return upto;
+            }
+        };
+    } // namespace detail
+
     // Wait strategies - how a consumer with nothing to do waits for the
     // producer's cursor (or its dependency barrier) to advance. The strategy
     // is called in a loop: wait(ready) may return spuriously; the caller
@@ -1816,36 +1904,69 @@ namespace snicholls
         }
     };
 
-    // Disruptor - phase 1: single producer, any number of consumers, consumer
-    // dependency graphs, batch consumption.
+    // Disruptor - any number of consumers, consumer dependency graphs, batch
+    // consumption, and either producer discipline.
     //
-    // A pre-allocated ring of default-constructed events. The producer claims
-    // the next sequence, mutates the event in place, and publishes by
-    // advancing the cursor - no allocation, no locking, one release store.
-    // Consumers see contiguous batches and record progress in their own
-    // padded sequence; a consumer constructed with dependencies will not see
-    // an event until every dependency has processed it. The producer is gated
-    // by the slowest consumer so it can never lap anyone.
+    // A pre-allocated ring of default-constructed events. A producer claims a
+    // sequence, mutates the event in place, and publishes it - no allocation,
+    // no locking. Consumers see contiguous batches and record progress in
+    // their own padded sequence; a consumer constructed with dependencies will
+    // not see an event until every dependency has processed it. Producers are
+    // gated by the slowest consumer so they can never lap anyone.
+    //
+    // Two producer disciplines, chosen at compile time:
+    //
+    //   disruptor<T>                    one producer thread (phase 1). The
+    //                                   producer owns the claim counter
+    //                                   outright and publishes with a single
+    //                                   release store to the cursor, which
+    //                                   therefore means "everything up to here
+    //                                   is readable".
+    //   multi_producer_disruptor<T>     any number of producer threads (phase
+    //                                   2). Producers CAS sequences out of a
+    //                                   shared claim counter, so sequence N+1
+    //                                   can be published while N is still
+    //                                   being written; publication is recorded
+    //                                   per slot instead, and consumers walk
+    //                                   those marks to find the highest
+    //                                   *contiguously* published sequence.
+    //
+    // The multi-producer mode costs a CAS per claim, one availability array of
+    // int64 per slot, and a short mark walk per poll. That is why it is opt-in
+    // rather than the default: nothing in the single-producer path branches on
+    // it or allocates for it.
+    //
+    // Named honestly: the claim loop is lock-free, not wait-free, and the
+    // contiguity guarantee means a producer that claims a sequence and then
+    // stalls holds up every consumer behind it (and eventually every other
+    // producer, once the ring fills). That is inherent to the pattern - a
+    // consumer that must see a dense, ordered stream cannot step over a hole -
+    // and LMAX's implementation behaves the same way. Fill callbacks should be
+    // short and must not block on anything the consumers are needed for.
     //
     // Wiring happens before the data flows: add all consumers, then publish
-    // (add_consumer after the first publish throws std::logic_error). One
-    // thread publishes; each consumer is pumped by one thread via poll() or
-    // run(). Handlers receive T& - dependent stages may write fields for
-    // stages downstream of them (the sequence protocol orders those writes);
-    // consumers at the same barrier level must treat shared events as
-    // read-only.
+    // (add_consumer after the first publish throws std::logic_error). Each
+    // consumer is pumped by one thread via poll() or run(). Handlers receive
+    // T& - dependent stages may write fields for stages downstream of them
+    // (the sequence protocol orders those writes); consumers at the same
+    // barrier level must treat shared events as read-only.
     //
     // Movability: every shared byte lives behind a stable heap core, so
     // moving the disruptor handle just transfers ownership of that core -
     // consumer references and running threads are unaffected. The moved-from
-    // handle is empty; publishing continues through the new handle (from the
-    // same thread, or via an externally synchronized handoff, as the single-
-    // producer contract already requires).
-    template <typename T, typename WaitStrategy = yielding_wait_strategy>
+    // handle is empty; publishing continues through the new handle. The handle
+    // object itself is not a synchronisation point in either mode, so a move
+    // needs the same externally synchronized handoff the single-producer
+    // contract already asks for - the ring, the consumers and the in-flight
+    // events do not care.
+    template <typename T, typename WaitStrategy = yielding_wait_strategy,
+              producer_mode Producers = producer_mode::single>
     class disruptor {
 
         static_assert(std::is_default_constructible_v<T>,
                       "disruptor: events are pre-allocated, so T must be default constructible");
+
+        static constexpr bool multi = (Producers == producer_mode::multi);
 
         struct core;
 
@@ -1860,15 +1981,43 @@ namespace snicholls
             detail::sequence seq_;                          // last processed
             std::vector<const detail::sequence*> barrier_;  // cursor, or dependency sequences
 
-            // The lowest sequence this consumer may process up to
-            std::int64_t available() const noexcept {
-                std::int64_t m = c_->cursor.v.load(std::memory_order_acquire);
-                for (const detail::sequence* s : barrier_) {
-                    const std::int64_t d = s->v.load(std::memory_order_acquire);
-                    if (d < m)
-                        m = d;
+            // The highest sequence this consumer may process, given that it is
+            // about to resume at `from` (only the multi-producer walk needs
+            // the starting point)
+            std::int64_t available(std::int64_t from) const noexcept {
+                if constexpr (multi) {
+                    if (!barrier_.empty()) {
+                        // A dependency records only sequences it has already
+                        // processed, and it could not have processed an
+                        // unpublished event - so the minimum over the
+                        // dependencies is already a contiguous bound and the
+                        // availability marks would add nothing
+                        std::int64_t m = barrier_.front()->v.load(std::memory_order_acquire);
+                        for (std::size_t i = 1; i < barrier_.size(); ++i) {
+                            const std::int64_t d = barrier_[i]->v.load(std::memory_order_acquire);
+                            if (d < m)
+                                m = d;
+                        }
+                        return m;
+                    }
+                    // Gated on the producers directly. Here the cursor is the
+                    // highest sequence *claimed*, which with several producers
+                    // in flight can be well past the highest one published, so
+                    // it is only an upper bound for the walk. `from` is safe to
+                    // start from: everything below it has already been
+                    // processed by this consumer.
+                    return c_->mp.highest_published(from,
+                                                    c_->cursor.v.load(std::memory_order_acquire));
+                } else {
+                    (void)from;
+                    std::int64_t m = c_->cursor.v.load(std::memory_order_acquire);
+                    for (const detail::sequence* s : barrier_) {
+                        const std::int64_t d = s->v.load(std::memory_order_acquire);
+                        if (d < m)
+                            m = d;
+                    }
+                    return m;
                 }
-                return m;
             }
 
         public:
@@ -1886,7 +2035,7 @@ namespace snicholls
             template <typename F>
             std::size_t poll(F&& f) {
                 const std::int64_t next = seq_.v.load(std::memory_order_relaxed) + 1;
-                const std::int64_t avail = available();
+                const std::int64_t avail = available(next);
                 if (avail < next)
                     return 0;
                 for (std::int64_t s = next; s <= avail; ++s)
@@ -1903,8 +2052,9 @@ namespace snicholls
                 while (keep_running.load(std::memory_order_acquire)) {
                     if (poll(f) == 0)
                         c_->wait.wait([&] {
+                            const std::int64_t last = seq_.v.load(std::memory_order_relaxed);
                             return !keep_running.load(std::memory_order_acquire) ||
-                                   available() > seq_.v.load(std::memory_order_relaxed);
+                                   available(last + 1) > last;
                         });
                 }
             }
@@ -1918,20 +2068,32 @@ namespace snicholls
         struct core {
             std::unique_ptr<T[]> events;
             std::size_t mask;
-            detail::sequence cursor;                        // last published
+            // Single-producer: the last sequence *published*, and the whole of
+            // the consumers' barrier. Multi-producer: the last sequence
+            // *claimed* - publication is recorded per slot in `mp` instead.
+            // LMAX splits its single- and multi-producer sequencers along
+            // exactly this line.
+            detail::sequence cursor;
             WaitStrategy wait{};
             std::deque<consumer> consumers;                 // deque: stable addresses
             std::vector<const detail::sequence*> gating;    // every consumer's sequence
-            std::int64_t next = 0;                          // producer-owned: next to claim
-            std::int64_t cached_gate = -1;                  // producer's stale view of the slowest consumer
+            std::int64_t next = 0;                          // single-producer: next to claim
+            std::int64_t cached_gate = -1;                  // single-producer: stale view of the slowest consumer
             std::atomic<bool> started{false};
+            // Empty (and allocation-free) unless Producers == multi. Placed
+            // last so the single-producer layout above is untouched.
+            detail::multi_producer_state<multi> mp;
 
             explicit core(std::size_t capacity)
-                : events(new T[capacity]), mask(capacity - 1) {}
+                : events(new T[capacity]), mask(capacity - 1) {
+                mp.init(capacity);
+            }
 
-            std::int64_t min_gating() const noexcept {
+            // Lowest sequence any consumer has processed, or `if_empty` when
+            // nothing consumes - callers pass a value that cannot gate them
+            std::int64_t min_gating(std::int64_t if_empty) const noexcept {
                 if (gating.empty())
-                    return next - 1;                        // nobody consumes: never gated
+                    return if_empty;
                 std::int64_t m = gating.front()->v.load(std::memory_order_acquire);
                 for (std::size_t i = 1; i < gating.size(); ++i) {
                     const std::int64_t s = gating[i]->v.load(std::memory_order_acquire);
@@ -1951,16 +2113,82 @@ namespace snicholls
             return p;
         }
 
+        static void mark_started(core& c) noexcept {
+            if constexpr (multi) {
+                // Several producers writing the same shared line on every
+                // publish would be pure contention for a flag that only ever
+                // goes false -> true. A relaxed load leaves the line shared.
+                if (!c.started.load(std::memory_order_relaxed))
+                    c.started.store(true, std::memory_order_release);
+            } else {
+                c.started.store(true, std::memory_order_release);
+            }
+        }
+
         // Producer gating: wait until publishing seq `last` cannot lap the
         // slowest consumer. Plain yield loop - producers gate rarely in a
         // well-sized ring, and it keeps the wait strategy consumer-only.
         void wait_for_room(core& c, std::int64_t last) {
             const std::int64_t wrap = last - static_cast<std::int64_t>(c.mask + 1);
             if (wrap > c.cached_gate) {
-                c.cached_gate = c.min_gating();
+                c.cached_gate = c.min_gating(c.next - 1);
                 while (wrap > c.cached_gate) {
                     std::this_thread::yield();
-                    c.cached_gate = c.min_gating();
+                    c.cached_gate = c.min_gating(c.next - 1);
+                }
+            }
+        }
+
+        // Multi-producer claim: take n consecutive sequences out of the shared
+        // cursor with a CAS. The winner owns those slots outright until it
+        // marks them published, so the events themselves need no further
+        // synchronisation between producers. Gating happens before the CAS: a
+        // claim that would lap a slot some consumer has not finished with is
+        // never made. Returns the last sequence claimed through `last_out`;
+        // with Blocking == false, returns false instead of waiting when full.
+        template <bool Blocking>
+        bool claim_multi(core& c, std::int64_t n, std::int64_t& last_out) {
+            const std::int64_t cap = static_cast<std::int64_t>(c.mask) + 1;
+            std::int64_t current = c.cursor.v.load(std::memory_order_relaxed);
+            for (;;) {
+                const std::int64_t last = current + n;
+                const std::int64_t wrap = last - cap;
+                // Acquire: pairs with the release store below. The cache is
+                // only ever written from a real scan of the gating sequences,
+                // and those only ever move forward, so a cached value can
+                // never exceed the true minimum. Trusting it can therefore
+                // only make a producer scan when it need not have - never let
+                // one through when it should have waited.
+                if (wrap > c.mp.gate_cache.v.load(std::memory_order_acquire)) {
+                    const std::int64_t gate = c.min_gating(last);   // `last` never gates
+                    if (wrap > gate) {
+                        if constexpr (!Blocking)
+                            return false;                          // ring is full
+                        std::this_thread::yield();
+                        current = c.cursor.v.load(std::memory_order_relaxed);
+                        continue;
+                    }
+                    // Release: the acquire loads inside min_gating are what
+                    // order each consumer's reads of these slots before this
+                    // producer's writes to them. A producer that later takes
+                    // the fast path on this cached value inherits that
+                    // ordering only if the store is a release and its load an
+                    // acquire - happens-before is transitive through the pair,
+                    // and without it that producer would have established
+                    // nothing with the consumers at all.
+                    c.mp.gate_cache.v.store(gate, std::memory_order_release);
+                }
+                // Relaxed on both success and failure: the cursor hands out
+                // disjoint sequence numbers and carries no data of its own.
+                // Modification order on a single atomic is total regardless of
+                // ordering, which is all a claim needs. What orders the slot
+                // contents is the gating above (before we write) and the
+                // availability mark (after we write). A failed CAS has already
+                // refreshed `current`, so we simply go round again.
+                if (c.cursor.v.compare_exchange_weak(current, last, std::memory_order_relaxed,
+                                                     std::memory_order_relaxed)) {
+                    last_out = last;
+                    return true;
                 }
             }
         }
@@ -1993,42 +2221,64 @@ namespace snicholls
         }
 
         // Claim the next event, mutate it in place, publish it. Blocks
-        // (yielding) while the ring is full. Single producer thread only.
+        // (yielding) while the ring is full. Single-producer mode: one
+        // producer thread only. Multi-producer mode: callable from any number
+        // of threads at once.
         template <typename F>
         void publish(F&& fill) {
             core& c = *c_;
-            c.started.store(true, std::memory_order_release);
-            const std::int64_t next = c.next;
-            wait_for_room(c, next);
-            fill(c.events[static_cast<std::size_t>(next) & c.mask]);
-            // Release: pairs with consumers' acquire of the cursor - the event
-            // contents happen-before anyone processes the sequence
-            c.cursor.v.store(next, std::memory_order_release);
-            c.next = next + 1;
-            c.wait.signal();
+            mark_started(c);
+            if constexpr (multi) {
+                std::int64_t seq = 0;
+                (void)claim_multi<true>(c, 1, seq);
+                fill(c.events[static_cast<std::size_t>(seq) & c.mask]);
+                c.mp.publish(seq);
+                c.wait.signal();
+            } else {
+                const std::int64_t next = c.next;
+                wait_for_room(c, next);
+                fill(c.events[static_cast<std::size_t>(next) & c.mask]);
+                // Release: pairs with consumers' acquire of the cursor - the event
+                // contents happen-before anyone processes the sequence
+                c.cursor.v.store(next, std::memory_order_release);
+                c.next = next + 1;
+                c.wait.signal();
+            }
         }
 
         // As publish, but returns false instead of blocking when full
         template <typename F>
         bool try_publish(F&& fill) {
             core& c = *c_;
-            c.started.store(true, std::memory_order_release);
-            const std::int64_t next = c.next;
-            const std::int64_t wrap = next - static_cast<std::int64_t>(c.mask + 1);
-            if (wrap > c.cached_gate) {
-                c.cached_gate = c.min_gating();
-                if (wrap > c.cached_gate)
+            mark_started(c);
+            if constexpr (multi) {
+                std::int64_t seq = 0;
+                if (!claim_multi<false>(c, 1, seq))
                     return false;
+                fill(c.events[static_cast<std::size_t>(seq) & c.mask]);
+                c.mp.publish(seq);
+                c.wait.signal();
+                return true;
+            } else {
+                const std::int64_t next = c.next;
+                const std::int64_t wrap = next - static_cast<std::int64_t>(c.mask + 1);
+                if (wrap > c.cached_gate) {
+                    c.cached_gate = c.min_gating(c.next - 1);
+                    if (wrap > c.cached_gate)
+                        return false;
+                }
+                fill(c.events[static_cast<std::size_t>(next) & c.mask]);
+                c.cursor.v.store(next, std::memory_order_release);
+                c.next = next + 1;
+                c.wait.signal();
+                return true;
             }
-            fill(c.events[static_cast<std::size_t>(next) & c.mask]);
-            c.cursor.v.store(next, std::memory_order_release);
-            c.next = next + 1;
-            c.wait.signal();
-            return true;
         }
 
         // Claim n consecutive events, fill each via fill(T&, int64_t seq),
-        // publish them with one cursor advance and one signal
+        // publish them with one signal. Single-producer mode advances the
+        // cursor once; multi-producer mode marks each slot, because
+        // publication there is per slot by construction.
         template <typename F>
         void publish_n(std::size_t n, F&& fill) {
             core& c = *c_;
@@ -2036,23 +2286,67 @@ namespace snicholls
                 return;
             if (n > capacity())
                 throw std::invalid_argument("disruptor: batch larger than capacity");
-            c.started.store(true, std::memory_order_release);
-            const std::int64_t first = c.next;
-            const std::int64_t last = first + static_cast<std::int64_t>(n) - 1;
-            wait_for_room(c, last);
-            for (std::int64_t s = first; s <= last; ++s)
-                fill(c.events[static_cast<std::size_t>(s) & c.mask], s);
-            c.cursor.v.store(last, std::memory_order_release);
-            c.next = last + 1;
-            c.wait.signal();
+            mark_started(c);
+            if constexpr (multi) {
+                std::int64_t last = 0;
+                (void)claim_multi<true>(c, static_cast<std::int64_t>(n), last);
+                const std::int64_t first = last - static_cast<std::int64_t>(n) + 1;
+                for (std::int64_t s = first; s <= last; ++s)
+                    fill(c.events[static_cast<std::size_t>(s) & c.mask], s);
+                // Mark ascending. Correctness does not depend on the order -
+                // every mark is a release store that carries all of this
+                // producer's writes so far - but ascending is what lets a
+                // consumer pick up the front of the batch without waiting for
+                // the tail, instead of stalling on a hole we are about to fill.
+                for (std::int64_t s = first; s <= last; ++s)
+                    c.mp.publish(s);
+                c.wait.signal();
+            } else {
+                const std::int64_t first = c.next;
+                const std::int64_t last = first + static_cast<std::int64_t>(n) - 1;
+                wait_for_room(c, last);
+                for (std::int64_t s = first; s <= last; ++s)
+                    fill(c.events[static_cast<std::size_t>(s) & c.mask], s);
+                c.cursor.v.store(last, std::memory_order_release);
+                c.next = last + 1;
+                c.wait.signal();
+            }
         }
 
+        // The highest sequence every consumer may safely look at. Single
+        // producer: one cursor read. Multi-producer: a walk of the
+        // availability marks, because no single counter can mean
+        // "contiguously published" there - that is precisely why the marks
+        // exist. Treat the multi-producer form as a query, not as part of the
+        // publish/consume protocol; consumers use their own barrier.
         std::int64_t last_published() const noexcept {
-            return c_->cursor.v.load(std::memory_order_acquire);
+            core& c = *c_;
+            if constexpr (multi) {
+                const std::int64_t claimed = c.cursor.v.load(std::memory_order_acquire);
+                // Where the walk may start. Nothing at or below the slowest
+                // consumer can still be unpublished - it was consumed - and
+                // with no consumers at all nothing further back than one lap
+                // survives anyway, so the older marks are not worth reading.
+                std::int64_t from = claimed - static_cast<std::int64_t>(c.mask);
+                const std::int64_t gate = c.min_gating(-1);
+                if (gate + 1 > from)
+                    from = gate + 1;
+                if (from < 0)
+                    from = 0;
+                return c.mp.highest_published(from, claimed);
+            } else {
+                return c.cursor.v.load(std::memory_order_acquire);
+            }
         }
 
         std::size_t capacity() const noexcept { return c_->mask + 1; }
     };
+
+    // The opt-in multi-producer disruptor: same ring, same consumers, same
+    // dependency graphs; producers CAS their sequences out of a shared claim
+    // counter and publish through per-slot availability marks.
+    template <typename T, typename WaitStrategy = yielding_wait_strategy>
+    using multi_producer_disruptor = disruptor<T, WaitStrategy, producer_mode::multi>;
 
 } // namespace snicholls
 
@@ -3498,6 +3792,10 @@ namespace snicholls
             moveable_signal<> on_readable;
             moveable_signal<> on_writable;
             moveable_signal<> on_error;
+            // Connections parked by the connect-and-park overloads. Declared
+            // last so it is destroyed first: the connections disconnect while
+            // the signals above them are still alive.
+            std::vector<scoped_connection> kept;
         };
 
         struct timer_state {
@@ -3505,6 +3803,7 @@ namespace snicholls
             std::chrono::nanoseconds period{0};     // 0: one-shot
             std::atomic<bool> alive{true};
             moveable_signal<> on_fire;
+            std::vector<scoped_connection> kept;    // see fd_state::kept
         };
 
         struct heap_entry {
@@ -3751,6 +4050,22 @@ namespace snicholls
                                  has(interest, fd_interest::write));
             }
 
+            // Connect and park: the connection lives exactly as long as the
+            // watch does, so there is no separate scoped_connection to keep
+            // alive - forgetting which is the classic way to wire a handler
+            // that silently never fires.
+            //
+            //     auto w = loop.watch(fd);
+            //     w.on_readable([&] { drain(fd); });      // that is all
+            //
+            template <typename F>
+            void on_readable(F&& f) { park(state("on_readable"), state("on_readable").on_readable, std::forward<F>(f)); }
+            template <typename F>
+            void on_writable(F&& f) { park(state("on_writable"), state("on_writable").on_writable, std::forward<F>(f)); }
+            template <typename F>
+            void on_error(F&& f) { park(state("on_error"), state("on_error").on_error, std::forward<F>(f)); }
+
+            // The raw signals, for wiring by hand and owning the connection
             moveable_signal<>& on_readable() { return state("on_readable").on_readable; }
             moveable_signal<>& on_writable() { return state("on_writable").on_writable; }
             moveable_signal<>& on_error() { return state("on_error").on_error; }
@@ -3759,6 +4074,11 @@ namespace snicholls
             explicit operator bool() const noexcept { return st_ != nullptr; }
 
         private:
+            template <typename Sig, typename F>
+            static void park(fd_state& st, Sig& sig, F&& f) {
+                st.kept.push_back(scoped_connection{sig.connect(std::forward<F>(f))});
+            }
+
             fd_state& state(const char* what) {
                 if (!st_)
                     throw std::logic_error(std::string("event_loop: fd_watch is empty: ") + what);
@@ -3798,6 +4118,14 @@ namespace snicholls
             }
 
             std::uint64_t id() const noexcept { return st_ ? st_->id : 0; }
+
+            // Connect and park: the connection lives as long as the timer
+            template <typename F>
+            void on_fire(F&& f) {
+                if (!st_)
+                    throw std::logic_error("event_loop: timer is empty");
+                st_->kept.push_back(scoped_connection{st_->on_fire.connect(std::forward<F>(f))});
+            }
 
             moveable_signal<>& on_fire() {
                 if (!st_)
@@ -4406,6 +4734,24 @@ inline int hex_value(char c) noexcept
     return kChars.hex[static_cast<unsigned char>(c)];
 }
 
+// memmem is a GNU extension; this is the two-line portable equivalent
+inline const void* find_bytes(const void* hay, std::size_t n,
+                              const char* needle, std::size_t m) noexcept
+{
+    if (m == 0 || n < m)
+        return nullptr;
+    const char* p = static_cast<const char*>(hay);
+    const char* const end = p + (n - m) + 1;
+    while ((p = static_cast<const char*>(std::memchr(p, needle[0], std::size_t(end - p)))) != nullptr) {
+        if (std::memcmp(p, needle, m) == 0)
+            return p;
+        ++p;
+        if (p >= end)
+            break;
+    }
+    return nullptr;
+}
+
 // Strict: a malformed escape is a 400, not a literal '%'
 inline bool percent_decode(const char* p, std::size_t n, std::string& out, bool plus_is_space)
 {
@@ -4481,6 +4827,8 @@ public:
 
     void add(std::string name, std::string value)
     {
+        if (v_.capacity() == 0)
+            v_.reserve(16);                     // typical request; avoids the growth walk
         v_.emplace_back(std::move(name), std::move(value));
     }
 
@@ -4517,6 +4865,8 @@ public:
 
     std::size_t size() const noexcept { return v_.size(); }
     bool empty() const noexcept { return v_.empty(); }
+    // clear(), not destroy: the vector keeps its capacity so the next request
+    // on this connection reuses it instead of allocating again
     void clear() noexcept { v_.clear(); }
 
     std::vector<entry>::const_iterator begin() const noexcept { return v_.begin(); }
@@ -4541,6 +4891,23 @@ public:
     std::string body;
     bool keep_alive = true;
     std::unordered_map<std::string, std::string> params;    // ":name" captures
+
+    // Reset for reuse without releasing a single allocation. The strings keep
+    // their capacity and the header vector keeps its buffer, so a connection
+    // serving many requests allocates for them once rather than every time.
+    void clear() noexcept
+    {
+        method = http::method::unknown;
+        method_text.clear();
+        target.clear();
+        path.clear();
+        query.clear();
+        http_major = http_minor = 1;
+        headers.clear();
+        body.clear();
+        keep_alive = true;
+        params.clear();
+    }
 
     const std::string* header(const char* name) const noexcept { return headers.find(name); }
 
@@ -4641,7 +5008,7 @@ public:
 
     void reset()
     {
-        req_ = request{};
+        req_.clear();                           // reuse the buffers, do not free them
         st_ = state::start_line;
         headers_done_ = expect_continue_ = started_ = false;
         header_bytes_ = 0;
@@ -4906,26 +5273,37 @@ private:
     bool parse_target(const char* b, const char* e)
     {
         req_.target.assign(b, std::size_t(e - b));
-        std::string t = req_.target;
-        if (t.empty())
+        if (b == e)
             return bad(400, "empty request target");
 
-        if (t == "*") {                         // asterisk-form (OPTIONS *)
+        if (e - b == 1 && *b == '*') {          // asterisk-form (OPTIONS *)
             req_.path = "*";
             return true;
         }
-        if (t[0] != '/') {                      // absolute-form: strip scheme://authority
-            const std::size_t s = t.find("://");
-            if (s == std::string::npos)
+        // Work over the incoming bytes rather than a copy of them
+        const char* tb = b;
+        if (*tb != '/') {                       // absolute-form: skip scheme://authority
+            const char* scheme = static_cast<const char*>(
+                detail::find_bytes(tb, std::size_t(e - tb), "://", 3));
+            if (!scheme)
                 return bad(400, "unsupported request-target form");
-            const std::size_t slash = t.find('/', s + 3);
-            t = (slash == std::string::npos) ? std::string("/") : t.substr(slash);
+            const char* slash = static_cast<const char*>(
+                std::memchr(scheme + 3, '/', std::size_t(e - (scheme + 3))));
+            tb = slash ? slash : nullptr;
             absolute_form_ = true;
+            if (!tb) {                          // "http://host" with no path
+                req_.path = "/";
+                req_.query.clear();
+                return true;
+            }
         }
-        const std::size_t q = t.find('?');
-        const std::size_t path_len = (q == std::string::npos) ? t.size() : q;
-        req_.query = (q == std::string::npos) ? std::string{} : t.substr(q + 1);
-        if (!detail::percent_decode(t.data(), path_len, req_.path, false))
+        const char* q = static_cast<const char*>(std::memchr(tb, '?', std::size_t(e - tb)));
+        const std::size_t path_len = std::size_t((q ? q : e) - tb);
+        if (q)
+            req_.query.assign(q + 1, std::size_t(e - (q + 1)));
+        else
+            req_.query.clear();
+        if (!detail::percent_decode(tb, path_len, req_.path, false))
             return bad(400, "invalid percent-encoding in request target");
         if (req_.path.find('\0') != std::string::npos)
             return bad(400, "NUL byte in request target");
@@ -5204,7 +5582,7 @@ class protocol_delegate;
 class connection_host {
 public:
     virtual ~connection_host() = default;
-    virtual void deliver(request&& req, std::uint64_t stream) = 0;
+    virtual void deliver(request& req, std::uint64_t stream) = 0;
     virtual void write_app(const char* data, std::size_t n) = 0;
     virtual void protocol_failure(int status, const char* reason) = 0;
     virtual const server_config& config() const noexcept = 0;
@@ -5267,15 +5645,18 @@ public:
                 return true;
             }
 
-            request req = std::move(parser_.message());
-            parser_.reset();
+            request& req = parser_.message();
             head_ = (req.method == method::head);
             keep_alive_ = req.keep_alive;
             request_bytes_ = req.body.size();
             sent_continue_ = false;
             in_flight_ = true;
-            host.deliver(std::move(req), 0);
-            if (!host.live())
+            // Handed over by reference and reset afterwards: handlers already
+            // see a const& valid only for the call, so nothing needs to own it
+            host.deliver(req, 0);
+            const bool alive = host.live();
+            parser_.reset();
+            if (!alive)
                 return false;
         }
         return true;
@@ -5445,27 +5826,58 @@ public:
 
     // Returns the handler, or null. path_exists reports "the path matched but
     // the method did not", which is a 405 rather than a 404.
+    //
+    // Deliberately allocation-free until a route actually wins. The earlier
+    // shape built a fresh hash map for every route it *tried*, so an eight
+    // route table cost eight map constructions per request; segments are now
+    // matched as views over the path, and captures collected only once.
     const handler* match(const request& req,
                          std::unordered_map<std::string, std::string>& params,
                          bool& path_exists, std::string& allowed) const
     {
         path_exists = false;
-        std::vector<std::string> segs;
+
+        const std::size_t n = count_segments(req.path);
+        seg inline_segs[kInlineSegments];
+        std::vector<seg> heap_segs;                 // only for pathological paths
+        seg* segs = inline_segs;
+        if (n > kInlineSegments) {
+            heap_segs.resize(n);
+            segs = heap_segs.data();
+        }
         split(req.path, segs);
+
+        const route* winner = nullptr;
         for (const auto& r : routes_) {
-            std::unordered_map<std::string, std::string> local;
-            if (!matches(r, segs, local))
+            if (!shape_matches(r, segs, n))
                 continue;
             path_exists = true;
             if (r.m == req.method) {
-                params = std::move(local);
-                return &r.h;
+                winner = &r;
+                break;
             }
             if (!allowed.empty())
                 allowed += ", ";
             allowed += to_string(r.m);
         }
-        return nullptr;
+        if (!winner)
+            return nullptr;
+
+        // Only the winning route pays for captures
+        for (std::size_t i = 0; i < winner->segments.size(); ++i) {
+            const std::string& pat = winner->segments[i];
+            if (!pat.empty() && pat[0] == ':')
+                params.emplace(pat.substr(1), std::string(segs[i].p, segs[i].n));
+        }
+        if (winner->wildcard) {
+            std::string rest;
+            for (std::size_t i = winner->segments.size(); i < n; ++i) {
+                rest += '/';
+                rest.append(segs[i].p, segs[i].n);
+            }
+            params.emplace("*", std::move(rest));
+        }
+        return &winner->h;
     }
 
     std::size_t size() const noexcept { return routes_.size(); }
@@ -5478,38 +5890,51 @@ private:
         handler h;
     };
 
-    static void split(const std::string& path, std::vector<std::string>& out)
+    // A path segment as a view over the request's own path: no copy, no
+    // allocation, nothing to free
+    struct seg {
+        const char* p = nullptr;
+        std::size_t n = 0;
+    };
+    static const std::size_t kInlineSegments = 32;
+
+    static std::size_t count_segments(const std::string& path) noexcept
     {
-        std::size_t i = 0;
+        std::size_t i = 0, k = 0;
+        while (i < path.size()) {
+            if (path[i] == '/') { ++i; continue; }
+            const std::size_t j = path.find('/', i);
+            ++k;
+            i = (j == std::string::npos) ? path.size() : j;
+        }
+        return k;
+    }
+
+    static void split(const std::string& path, seg* out) noexcept
+    {
+        std::size_t i = 0, k = 0;
         while (i < path.size()) {
             if (path[i] == '/') { ++i; continue; }
             std::size_t j = path.find('/', i);
             if (j == std::string::npos)
                 j = path.size();
-            out.emplace_back(path, i, j - i);
+            out[k].p = path.data() + i;
+            out[k].n = j - i;
+            ++k;
             i = j;
         }
     }
 
-    static bool matches(const route& r, const std::vector<std::string>& segs,
-                        std::unordered_map<std::string, std::string>& params)
+    static bool shape_matches(const route& r, const seg* segs, std::size_t n) noexcept
     {
-        if (r.wildcard ? segs.size() < r.segments.size() : segs.size() != r.segments.size())
+        if (r.wildcard ? n < r.segments.size() : n != r.segments.size())
             return false;
         for (std::size_t i = 0; i < r.segments.size(); ++i) {
             const std::string& pat = r.segments[i];
             if (!pat.empty() && pat[0] == ':')
-                params.emplace(pat.substr(1), segs[i]);
-            else if (pat != segs[i])
+                continue;                       // a capture matches any segment
+            if (pat.size() != segs[i].n || std::memcmp(pat.data(), segs[i].p, segs[i].n) != 0)
                 return false;
-        }
-        if (r.wildcard) {
-            std::string rest;
-            for (std::size_t i = r.segments.size(); i < segs.size(); ++i) {
-                rest += '/';
-                rest += segs[i];
-            }
-            params.emplace("*", rest);
         }
         return true;
     }
@@ -5572,6 +5997,7 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     bool close_when_drained = false;
     bool driving = false;
     bool peer_closed = false;
+    bool logging_ = false;                  // is anything attached to on_access?
 
     std::chrono::steady_clock::time_point last_activity{};
     std::chrono::steady_clock::time_point request_started{};
@@ -5588,7 +6014,7 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     const server_config& config() const noexcept override;
     const char* http_date() override;
     bool live() const noexcept override { return live_; }
-    void deliver(request&& req, std::uint64_t stream) override;
+    void deliver(request& req, std::uint64_t stream) override;
     void protocol_failure(int status, const char* reason) override;
 
     void write_app(const char* data, std::size_t n) override
@@ -5652,6 +6078,7 @@ struct server_core : std::enable_shared_from_this<server_core> {
     moveable_signal<const connection_info&> on_close;
     moveable_signal<const access_entry&> on_access;
     moveable_signal<const char*, int> on_error;
+    std::vector<scoped_connection> kept;         // connect-and-park; see below
 
     std::function<std::unique_ptr<transport_delegate>()> make_transport =
         [] { return std::unique_ptr<transport_delegate>(new plain_transport()); };
@@ -6022,7 +6449,7 @@ inline void session_core::protocol_failure(int status, const char* reason)
     }
 }
 
-inline void session_core::deliver(request&& req, std::uint64_t stream)
+inline void session_core::deliver(request& req, std::uint64_t stream)
 {
     auto s = srv.lock();
     if (!s) {
@@ -6031,13 +6458,21 @@ inline void session_core::deliver(request&& req, std::uint64_t stream)
     }
     ++s->total_requests;
 
-    pending = access_entry{};
-    pending.method = req.method_text;
-    pending.path = req.path;
-    pending.query = req.query;
+    // Only pay for the access-log snapshot when something is listening. These
+    // are three string copies per request, and most servers run with no tap
+    // attached at all.
+    pending.status = 0;
+    pending.response_bytes = 0;
+    pending.duration_ms = 0.0;
     pending.fd = fd;
     pending.stream = stream;
     pending.request_bytes = req.body.size();
+    logging_ = (s->on_access.slot_count() != 0);
+    if (logging_) {
+        pending.method = req.method_text;
+        pending.path = req.path;
+        pending.query = req.query;
+    }
     request_started = std::chrono::steady_clock::now();
 
     responder r;
@@ -6073,12 +6508,14 @@ inline void session_core::complete(std::uint64_t stream, response&& res)
     const int status = res.status;
     protocol->respond(stream, std::move(res), *this);
 
-    if (auto s = srv.lock()) {
-        pending.status = status;
-        pending.response_bytes = protocol->last_response_bytes();
-        pending.duration_ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - request_started).count();
-        s->on_access(pending);
+    if (logging_) {
+        if (auto s = srv.lock()) {
+            pending.status = status;
+            pending.response_bytes = protocol->last_response_bytes();
+            pending.duration_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - request_started).count();
+            s->on_access(pending);
+        }
     }
 
     // Coalesce. While we are still inside the read loop (driving), more
@@ -6347,12 +6784,32 @@ public:
     const server_config& config() const noexcept { return c_->cfg; }
 
     // ---- taps: logging, metrics and tracing, off the hot path
+    //
+    // Connect and park: the connection lives as long as the server, so there
+    // is no scoped_connection to hold on to. Forgetting to hold one is the
+    // classic way to wire a log handler that silently never fires.
+    //
+    //     srv.on_access([](const auto& e) { log(e.method, e.path, e.status); });
+    //
+    template <typename F> server& on_open(F&& f)   { return park(c_->on_open, std::forward<F>(f)); }
+    template <typename F> server& on_close(F&& f)  { return park(c_->on_close, std::forward<F>(f)); }
+    template <typename F> server& on_access(F&& f) { return park(c_->on_access, std::forward<F>(f)); }
+    template <typename F> server& on_error(F&& f)  { return park(c_->on_error, std::forward<F>(f)); }
+
+    // The raw signals, for wiring by hand and owning the connection
     moveable_signal<const connection_info&>& on_open() noexcept { return c_->on_open; }
     moveable_signal<const connection_info&>& on_close() noexcept { return c_->on_close; }
     moveable_signal<const access_entry&>& on_access() noexcept { return c_->on_access; }
     moveable_signal<const char*, int>& on_error() noexcept { return c_->on_error; }
 
 private:
+    template <typename Sig, typename F>
+    server& park(Sig& sig, F&& f)
+    {
+        c_->kept.push_back(scoped_connection{sig.connect(std::forward<F>(f))});
+        return *this;
+    }
+
     void arm_listener()
     {
         auto& c = *c_;
@@ -6414,10 +6871,9 @@ private:
 //
 //      srv.get("/chat", snicholls::http::websocket_route(
 //          [](snicholls::http::websocket ws) {
-//              auto c = ws.on_message().connect([ws = ws.share()](const auto& m) {
-//                  ws.send_text("echo: " + m.text);
+//              ws.on_message([](auto sock, const auto& m) {
+//                  sock.send_text("echo: " + m.data);
 //              });
-//              ws.keep(std::move(c));
 //          }));
 //
 //  Correctness the RFC insists on, and Autobahn checks: client frames must be
@@ -6444,6 +6900,7 @@ private:
 #define SNICHOLLS_HAS_WEBSOCKET 1
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -6636,7 +7093,10 @@ struct ws_state {
     moveable_signal<const std::string&> on_pong;
     request handshake;
     std::unique_ptr<ws_extension> ext;          // loop thread only
-    bool open = true;
+    // Atomic because close() may be called from any thread while the loop
+    // thread is closing the same socket from its own side, and connected() is
+    // readable from anywhere. A plain bool here is a genuine data race.
+    std::atomic<bool> open{true};
     std::vector<scoped_connection> kept;        // connections the handler parked here
 };
 
@@ -6705,20 +7165,49 @@ public:
     websocket() = default;
     explicit websocket(std::shared_ptr<detail::ws_state> s) : s_(std::move(s)) {}
 
+    // The ergonomic form, and the one to reach for: the socket is handed to
+    // the callback rather than captured by it, so the slot holds only a weak
+    // reference to the connection state. That matters - a slot capturing a
+    // strong handle would own the state that owns the slot, and the socket
+    // would never be freed. The connection is parked for you, and dies with
+    // the socket, which is the library's own lifetime-tracking idiom applied
+    // to itself.
+    //
+    //     ws.on_message([](auto sock, const auto& m) { sock.send_text(m.data); });
+    //
+    template <typename F>
+    void on_message(F&& f) const
+    {
+        track(s_->on_message, std::forward<F>(f));
+    }
+    template <typename F>
+    void on_close(F&& f) const { track(s_->on_close, std::forward<F>(f)); }
+    template <typename F>
+    void on_ping(F&& f) const { track(s_->on_ping, std::forward<F>(f)); }
+    template <typename F>
+    void on_pong(F&& f) const { track(s_->on_pong, std::forward<F>(f)); }
+
+    // The raw signals, for wiring by hand. Anything connected here is yours to
+    // keep alive - see keep() - and must not capture a strong handle.
     moveable_signal<const ws_message&>& on_message() { return s_->on_message; }
     moveable_signal<std::uint16_t, const std::string&>& on_close() { return s_->on_close; }
     moveable_signal<const std::string&>& on_ping() { return s_->on_ping; }
     moveable_signal<const std::string&>& on_pong() { return s_->on_pong; }
 
     const request& handshake() const noexcept { return s_->handshake; }
-    bool connected() const noexcept { return s_ && s_->open && !s_->session.expired(); }
+    bool connected() const noexcept
+    {
+        return s_ && s_->open.load(std::memory_order_acquire) && !s_->session.expired();
+    }
     explicit operator bool() const noexcept { return connected(); }
 
     // A second handle onto the same connection, for capturing into slots
     websocket share() const { return websocket(s_); }
 
     // Park a connection so it lives as long as the socket does - the usual
-    // shape, since the handler returns immediately and the slots must outlive it
+    // shape, since the handler returns immediately and the slots must outlive
+    // it. Loop thread only, which is where handlers run; the parked list is
+    // cleared on the loop thread when the socket closes.
     void keep(scoped_connection c) const { s_->kept.push_back(std::move(c)); }
 
     bool send_text(std::string payload) const
@@ -6746,11 +7235,25 @@ public:
         body.push_back(char((code >> 8) & 0xff));
         body.push_back(char(code & 0xff));
         body += reason;
-        s_->open = false;
+        s_->open.store(false, std::memory_order_release);
         return send_frame(ws_opcode::close, std::move(body));
     }
 
 private:
+    // Connect f so that it receives the socket as its first argument and holds
+    // only a weak reference to the state, then park the connection so it lives
+    // exactly as long as the socket does
+    template <typename Signal, typename F>
+    void track(Signal& sig, F&& f) const
+    {
+        std::weak_ptr<detail::ws_state> weak = s_;
+        s_->kept.push_back(scoped_connection{
+            sig.connect([weak, fn = std::forward<F>(f)](auto&&... args) {
+                if (auto st = weak.lock())
+                    fn(websocket(st), std::forward<decltype(args)>(args)...);
+            })});
+    }
+
     bool send_frame(ws_opcode op, std::string payload) const
     {
         if (!s_)
@@ -6803,7 +7306,7 @@ public:
     ~websocket_protocol() override
     {
         if (st_) {
-            st_->open = false;
+            st_->open.store(false, std::memory_order_release);
             st_->kept.clear();
         }
     }
@@ -6913,8 +7416,8 @@ private:
         body += reason;
         const std::string f = detail::ws_frame(ws_opcode::close, body.data(), body.size());
         host.write_app(f.data(), f.size());
-        if (st_ && st_->open) {
-            st_->open = false;
+        if (st_ && st_->open.exchange(false, std::memory_order_acq_rel)) {
+            // exchange, not load-then-store: only one side announces the close
             st_->on_close(code, reason);
         }
     }

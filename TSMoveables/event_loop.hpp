@@ -262,6 +262,10 @@ namespace snicholls
             moveable_signal<> on_readable;
             moveable_signal<> on_writable;
             moveable_signal<> on_error;
+            // Connections parked by the connect-and-park overloads. Declared
+            // last so it is destroyed first: the connections disconnect while
+            // the signals above them are still alive.
+            std::vector<scoped_connection> kept;
         };
 
         struct timer_state {
@@ -269,6 +273,7 @@ namespace snicholls
             std::chrono::nanoseconds period{0};     // 0: one-shot
             std::atomic<bool> alive{true};
             moveable_signal<> on_fire;
+            std::vector<scoped_connection> kept;    // see fd_state::kept
         };
 
         struct heap_entry {
@@ -515,6 +520,22 @@ namespace snicholls
                                  has(interest, fd_interest::write));
             }
 
+            // Connect and park: the connection lives exactly as long as the
+            // watch does, so there is no separate scoped_connection to keep
+            // alive - forgetting which is the classic way to wire a handler
+            // that silently never fires.
+            //
+            //     auto w = loop.watch(fd);
+            //     w.on_readable([&] { drain(fd); });      // that is all
+            //
+            template <typename F>
+            void on_readable(F&& f) { park(state("on_readable"), state("on_readable").on_readable, std::forward<F>(f)); }
+            template <typename F>
+            void on_writable(F&& f) { park(state("on_writable"), state("on_writable").on_writable, std::forward<F>(f)); }
+            template <typename F>
+            void on_error(F&& f) { park(state("on_error"), state("on_error").on_error, std::forward<F>(f)); }
+
+            // The raw signals, for wiring by hand and owning the connection
             moveable_signal<>& on_readable() { return state("on_readable").on_readable; }
             moveable_signal<>& on_writable() { return state("on_writable").on_writable; }
             moveable_signal<>& on_error() { return state("on_error").on_error; }
@@ -523,6 +544,11 @@ namespace snicholls
             explicit operator bool() const noexcept { return st_ != nullptr; }
 
         private:
+            template <typename Sig, typename F>
+            static void park(fd_state& st, Sig& sig, F&& f) {
+                st.kept.push_back(scoped_connection{sig.connect(std::forward<F>(f))});
+            }
+
             fd_state& state(const char* what) {
                 if (!st_)
                     throw std::logic_error(std::string("event_loop: fd_watch is empty: ") + what);
@@ -562,6 +588,14 @@ namespace snicholls
             }
 
             std::uint64_t id() const noexcept { return st_ ? st_->id : 0; }
+
+            // Connect and park: the connection lives as long as the timer
+            template <typename F>
+            void on_fire(F&& f) {
+                if (!st_)
+                    throw std::logic_error("event_loop: timer is empty");
+                st_->kept.push_back(scoped_connection{st_->on_fire.connect(std::forward<F>(f))});
+            }
 
             moveable_signal<>& on_fire() {
                 if (!st_)

@@ -264,6 +264,29 @@ panel[0].clicked(1);                            // every connection still fires
 
 The architecture this enables at scale — typed emitters, observers, meshes, capture and replay — is shown working in the [Demos](#demos) section below.
 
+### Connect and park — the pattern worth stealing
+
+Every signal in this library is exposed twice. The raw form hands you a `connection` you must keep alive:
+
+```cpp
+auto c = w.on_readable().connect([&] { drain(fd); });   // drop `c` and the slot dies
+```
+
+That is the single most common way to wire a handler that silently never fires — the connection is a temporary, it disconnects at the end of the statement, and nothing complains. So every component whose state lives in a heap-stable core also offers a **connect-and-park** overload, which ties the connection's life to the object it is watching:
+
+```cpp
+w.on_readable([&] { drain(fd); });                 // event_loop fd watch
+t.on_fire([&] { tick(); });                        // event_loop timer
+srv.on_access([](const auto& e) { log(e); });      // http server tap
+ws.on_message([](auto sock, const auto& m) {       // websocket
+    sock.send_text(m.data);
+});
+```
+
+Nothing to hold, nothing to forget, and the slot dies exactly when the thing it watches does.
+
+The WebSocket form shows why it is more than sugar. The socket arrives **as an argument rather than a capture**, so the slot holds only a weak reference to the connection state. Capturing a socket handle instead would have the state own the slot that owns the state — a reference cycle that leaks the connection on every close. We shipped that bug, and this API is what makes it unrepresentable rather than merely fixed. `time_master` has worked this way from the start: it parks each event's connection beside its timer, which is why cancelling one event cannot leave a dangling callback behind.
+
 ## Building and testing
 
 The library is header-only — just add the headers to your include path.
@@ -644,7 +667,7 @@ macOS, 32-core laptop, Apple Clang:
 
 Read those together, because either one alone would mislead you:
 
-- **On raw throughput at low concurrency, httplib beats us on Linux by about 1.5×.** That is a real result and we are not going to dress it up. It is also the expected one: a reactor pays a `epoll_wait` syscall and an extra wakeup hop per readiness event, while a blocking thread parked in `read()` is woken directly by the kernel with the data already there. When connections are few and threads are cheap, blocking I/O is genuinely the faster path. This is exactly the "low-concurrency run where their blocking pool is at its best" the plan said to measure, and it came out the way the plan feared rather than the way we hoped.
+- **On raw throughput at low concurrency, httplib beat us on Linux by about 1.5×** in the run above. The convenient explanation was architectural — a reactor pays a `epoll_wait` syscall and an extra wakeup hop per readiness event, while a blocking thread parked in `read()` is woken directly with its data — and that is true as far as it goes. It is also exactly the kind of explanation that stops you looking. Measuring the request path with no sockets in it at all ([`make bench-request`](#what-one-request-costs)) said one request cost **3,666 ns of pure CPU**, capping a core at 273k req/s before a single syscall was paid for. Roughly 40% of that was ours to give back, and has been. The table above predates that work and will be re-measured; the deficit was substantially our code, not our architecture, and saying otherwise would have been the comfortable answer rather than the true one.
 - **On concurrency, the gap is categorical on both platforms.** 10,000 held-open connections: 156 ms for us on Linux, versus 32 served by httplib as shipped and 3,391 by httplib with a thousand threads. That is not a tuning difference. A blocking server pins a thread per live keep-alive connection, so the connections it can hold is the threads it has, and adding threads eventually costs more than it buys.
 - **The macOS httplib numbers are anomalous and we do not claim them.** httplib measures ~8–9k req/s on macOS and ~95k on Linux — a 10× platform gap in *their* numbers, with our client and our machine constant. Something in their macOS path is pathological, and until it is understood the honest position is that the macOS throughput comparison proves nothing about either design. The Linux row is the one to trust.
 
@@ -660,6 +683,22 @@ Two things, both worth stating because neither was visible from reading the code
 
 - **Write coalescing — 2.7× on pipelined traffic.** Responses were flushed one at a time, so a batch of 32 pipelined requests cost 32 `send()` calls instead of one. The tell was a throughput ceiling with the machine 90% idle — not CPU-bound, not connection-bound, just too many small packets. Coalescing inside the read loop (while still flushing immediately for off-thread completions, which have no read loop coming back for them) took pipelined throughput from ~135,000 to ~370,000 req/s on one connection.
 - **`constexpr` character tables — 3% to 8%.** Every byte of every method and header name is classified, and every chunk size and percent escape is hex-decoded. Built as 256-entry tables by a `constexpr` function instead of a chain of comparisons, that is worth ~3% on a one-header request and ~8% on a realistic twelve-header one — measured A/B, five runs each, with the gain scaling with parsing work as you would expect. It also cut run-to-run variance from 14% to 2%, since a table lookup cannot mispredict. (`consteval` would express the intent more precisely but does not exist in C++17 and generates identical code, so it is not worth a version fence.)
+
+### What one request costs
+
+`make bench-request` runs the request path with no sockets, no loop and no kernel — parse, route, serialise, repeat — so whatever it reports is CPU we are spending before any I/O. That number sets a hard ceiling per core, and it is the honest place to look before blaming the architecture:
+
+| Stage | Per request |
+|---|---|
+| parse (cold — first request on a connection) | ~1,520 ns |
+| parse (warm — keep-alive steady state) | ~1,150 ns |
+| route (8 routes, capture in the winner) | ~300 ns |
+| serialise | ~590 ns |
+| **full request, keep-alive** | **~2,200 ns → ~454k req/s per core** |
+
+Down from ~3,670 ns when first measured, a 40% cut, from three things that were nothing to do with I/O: the router built a **fresh hash map for every route it tried** rather than only for the one that won (962 → 300 ns); the parser copied the request target before touching it and let its header vector grow one reallocation at a time; and the request was *moved* out of the parser on every request, so its buffers could never be reused — passing it by reference instead makes keep-alive genuinely warm. The access-log snapshot, three string copies per request, now happens only when something is actually connected to `on_access`.
+
+Measuring properly mattered more than the fixes: the first version of this benchmark constructed a fresh parser per iteration, which is exactly the case buffer reuse cannot help, and reported no gain at all from a change that is worth 24% on a real connection.
 
 ### Scaling across cores
 

@@ -261,10 +261,9 @@ public:
             r.send(200, "application/octet-stream", req.body);
         });
         srv.get("/ws", websocket_route([](websocket ws) {
-            auto c = ws.on_message().connect([ws = ws.share()](const ws_message& m) {
-                ws.send_text("secure-echo:" + m.data);
+            ws.on_message([](websocket sock, const ws_message& m) {
+                sock.send_text("secure-echo:" + m.data);
             });
-            ws.keep(std::move(c));
         }));
 
         port = srv.listen("127.0.0.1", 0);

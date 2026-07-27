@@ -256,20 +256,20 @@ public:
     ws_server()
     {
         srv.get("/ws", websocket_route([this](websocket ws) {
-            auto c = ws.on_message().connect([ws = ws.share(), this](const ws_message& m) {
+            // The tracked form: the socket is an argument, not a capture
+            ws.on_message([this](websocket sock, const ws_message& m) {
                 ++messages;
                 if (m.is_text)
-                    ws.send_text("echo:" + m.data);
+                    sock.send_text("echo:" + m.data);
                 else
-                    ws.send_binary(m.data);
+                    sock.send_binary(m.data);
             });
-            auto cc = ws.on_close().connect([this](std::uint16_t code, const std::string&) {
+            ws.on_close([this](websocket, std::uint16_t code, const std::string&) {
                 last_close.store(code);
                 ++closes;
             });
-            ws.keep(std::move(c));
-            ws.keep(std::move(cc));
             sockets.push_back(ws.share());
+            opens.fetch_add(1, std::memory_order_release);
         }));
         srv.get("/plain", [](const request&, responder r) {
             r.send(200, "text/plain", "not a websocket");
@@ -290,6 +290,7 @@ public:
     std::uint16_t port = 0;
     std::thread th;
     std::atomic<int> messages{0};
+    std::atomic<int> opens{0};
     std::atomic<int> closes{0};
     std::atomic<std::uint16_t> last_close{0};
     std::vector<websocket> sockets;      // loop thread only
@@ -466,11 +467,11 @@ void test_ws_server_initiated()
     ws_server s;
     ws_client c;
     assert(c.connect_to(s.port));
-    spin_until([&] {
-        bool have = false;
-        s.srv.loop().post([&] { have = true; });
-        return have;
-    });
+    // Wait for the upgrade to be registered on the loop thread before pushing.
+    // An earlier version posted a task capturing a local that had already gone
+    // out of scope by the time the loop ran it - a dangling reference and a
+    // data race, which is precisely what ThreadSanitizer is for.
+    spin_until([&] { return s.opens.load(std::memory_order_acquire) > 0; });
 
     std::atomic<bool> sent{false};
     s.srv.loop().post([&] {

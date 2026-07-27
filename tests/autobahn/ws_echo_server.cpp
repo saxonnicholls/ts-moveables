@@ -78,13 +78,14 @@ int main(int argc, char** argv)
 
     // Every path is the echo endpoint: Autobahn addresses cases as /runCase?...
     srv.get("/*", websocket_route([](websocket sock) {
-        auto c = sock.on_message().connect([s = sock.share()](const ws_message& m) {
+        // The socket arrives as an argument rather than a capture, so the slot
+        // holds no strong reference to the connection it lives on
+        sock.on_message([](websocket s, const ws_message& m) {
             if (m.is_text)
                 s.send_text(m.data);            // text back as text
             else
                 s.send_binary(m.data);          // binary back as binary
         });
-        sock.keep(std::move(c));
     }, ws));
 
     // The fuzzing client may run in a container, which cannot reach loopback

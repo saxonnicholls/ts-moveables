@@ -18,6 +18,7 @@
 #undef NDEBUG
 #include <cassert>
 
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -36,6 +37,22 @@ void spin_until(Pred pred)
 {
     while (!pred())
         std::this_thread::yield();
+}
+
+// Bounded spin: returns false if the condition has not come true within the
+// deadline. Use it (with assert) wherever a broken invariant would otherwise
+// hang the suite instead of failing it. The limit is deliberately generous -
+// it is a backstop, not a timing assertion.
+template <typename Pred>
+bool spin_until_for(Pred pred, std::chrono::milliseconds limit = std::chrono::milliseconds(30000))
+{
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() > deadline)
+            return false;
+        std::this_thread::yield();
+    }
+    return true;
 }
 
 template <typename F>

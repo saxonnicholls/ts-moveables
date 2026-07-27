@@ -102,6 +102,18 @@ jobs:
             exit 1
           }
 
+      # What one request costs in CPU alone, with no sockets involved: the
+      # ceiling a core cannot exceed however good the I/O layer is.
+      - name: Request path cost (informational)
+        continue-on-error: true
+        run: |
+          make build/http_request_path CXX=${{ matrix.cxx }}
+          {
+            echo "## Request path - ${{ matrix.name }}"
+            echo ""
+            ./build/http_request_path --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       # Multi-reactor scaling sweep. Informational: CI runners are shared and
       # noisy, and the load generator is co-resident, so this tracks shape
       # rather than absolute numbers.

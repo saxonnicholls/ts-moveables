@@ -16,10 +16,9 @@
 //
 //      srv.get("/chat", snicholls::http::websocket_route(
 //          [](snicholls::http::websocket ws) {
-//              auto c = ws.on_message().connect([ws = ws.share()](const auto& m) {
-//                  ws.send_text("echo: " + m.text);
+//              ws.on_message([](auto sock, const auto& m) {
+//                  sock.send_text("echo: " + m.data);
 //              });
-//              ws.keep(std::move(c));
 //          }));
 //
 //  Correctness the RFC insists on, and Autobahn checks: client frames must be
@@ -46,6 +45,7 @@
 #define SNICHOLLS_HAS_WEBSOCKET 1
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -238,7 +238,10 @@ struct ws_state {
     moveable_signal<const std::string&> on_pong;
     request handshake;
     std::unique_ptr<ws_extension> ext;          // loop thread only
-    bool open = true;
+    // Atomic because close() may be called from any thread while the loop
+    // thread is closing the same socket from its own side, and connected() is
+    // readable from anywhere. A plain bool here is a genuine data race.
+    std::atomic<bool> open{true};
     std::vector<scoped_connection> kept;        // connections the handler parked here
 };
 
@@ -307,20 +310,49 @@ public:
     websocket() = default;
     explicit websocket(std::shared_ptr<detail::ws_state> s) : s_(std::move(s)) {}
 
+    // The ergonomic form, and the one to reach for: the socket is handed to
+    // the callback rather than captured by it, so the slot holds only a weak
+    // reference to the connection state. That matters - a slot capturing a
+    // strong handle would own the state that owns the slot, and the socket
+    // would never be freed. The connection is parked for you, and dies with
+    // the socket, which is the library's own lifetime-tracking idiom applied
+    // to itself.
+    //
+    //     ws.on_message([](auto sock, const auto& m) { sock.send_text(m.data); });
+    //
+    template <typename F>
+    void on_message(F&& f) const
+    {
+        track(s_->on_message, std::forward<F>(f));
+    }
+    template <typename F>
+    void on_close(F&& f) const { track(s_->on_close, std::forward<F>(f)); }
+    template <typename F>
+    void on_ping(F&& f) const { track(s_->on_ping, std::forward<F>(f)); }
+    template <typename F>
+    void on_pong(F&& f) const { track(s_->on_pong, std::forward<F>(f)); }
+
+    // The raw signals, for wiring by hand. Anything connected here is yours to
+    // keep alive - see keep() - and must not capture a strong handle.
     moveable_signal<const ws_message&>& on_message() { return s_->on_message; }
     moveable_signal<std::uint16_t, const std::string&>& on_close() { return s_->on_close; }
     moveable_signal<const std::string&>& on_ping() { return s_->on_ping; }
     moveable_signal<const std::string&>& on_pong() { return s_->on_pong; }
 
     const request& handshake() const noexcept { return s_->handshake; }
-    bool connected() const noexcept { return s_ && s_->open && !s_->session.expired(); }
+    bool connected() const noexcept
+    {
+        return s_ && s_->open.load(std::memory_order_acquire) && !s_->session.expired();
+    }
     explicit operator bool() const noexcept { return connected(); }
 
     // A second handle onto the same connection, for capturing into slots
     websocket share() const { return websocket(s_); }
 
     // Park a connection so it lives as long as the socket does - the usual
-    // shape, since the handler returns immediately and the slots must outlive it
+    // shape, since the handler returns immediately and the slots must outlive
+    // it. Loop thread only, which is where handlers run; the parked list is
+    // cleared on the loop thread when the socket closes.
     void keep(scoped_connection c) const { s_->kept.push_back(std::move(c)); }
 
     bool send_text(std::string payload) const
@@ -348,11 +380,25 @@ public:
         body.push_back(char((code >> 8) & 0xff));
         body.push_back(char(code & 0xff));
         body += reason;
-        s_->open = false;
+        s_->open.store(false, std::memory_order_release);
         return send_frame(ws_opcode::close, std::move(body));
     }
 
 private:
+    // Connect f so that it receives the socket as its first argument and holds
+    // only a weak reference to the state, then park the connection so it lives
+    // exactly as long as the socket does
+    template <typename Signal, typename F>
+    void track(Signal& sig, F&& f) const
+    {
+        std::weak_ptr<detail::ws_state> weak = s_;
+        s_->kept.push_back(scoped_connection{
+            sig.connect([weak, fn = std::forward<F>(f)](auto&&... args) {
+                if (auto st = weak.lock())
+                    fn(websocket(st), std::forward<decltype(args)>(args)...);
+            })});
+    }
+
     bool send_frame(ws_opcode op, std::string payload) const
     {
         if (!s_)
@@ -405,7 +451,7 @@ public:
     ~websocket_protocol() override
     {
         if (st_) {
-            st_->open = false;
+            st_->open.store(false, std::memory_order_release);
             st_->kept.clear();
         }
     }
@@ -515,8 +561,8 @@ private:
         body += reason;
         const std::string f = detail::ws_frame(ws_opcode::close, body.data(), body.size());
         host.write_app(f.data(), f.size());
-        if (st_ && st_->open) {
-            st_->open = false;
+        if (st_ && st_->open.exchange(false, std::memory_order_acq_rel)) {
+            // exchange, not load-then-store: only one side announces the close
             st_->on_close(code, reason);
         }
     }

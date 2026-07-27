@@ -271,6 +271,24 @@ inline int hex_value(char c) noexcept
     return kChars.hex[static_cast<unsigned char>(c)];
 }
 
+// memmem is a GNU extension; this is the two-line portable equivalent
+inline const void* find_bytes(const void* hay, std::size_t n,
+                              const char* needle, std::size_t m) noexcept
+{
+    if (m == 0 || n < m)
+        return nullptr;
+    const char* p = static_cast<const char*>(hay);
+    const char* const end = p + (n - m) + 1;
+    while ((p = static_cast<const char*>(std::memchr(p, needle[0], std::size_t(end - p)))) != nullptr) {
+        if (std::memcmp(p, needle, m) == 0)
+            return p;
+        ++p;
+        if (p >= end)
+            break;
+    }
+    return nullptr;
+}
+
 // Strict: a malformed escape is a 400, not a literal '%'
 inline bool percent_decode(const char* p, std::size_t n, std::string& out, bool plus_is_space)
 {
@@ -346,6 +364,8 @@ public:
 
     void add(std::string name, std::string value)
     {
+        if (v_.capacity() == 0)
+            v_.reserve(16);                     // typical request; avoids the growth walk
         v_.emplace_back(std::move(name), std::move(value));
     }
 
@@ -382,6 +402,8 @@ public:
 
     std::size_t size() const noexcept { return v_.size(); }
     bool empty() const noexcept { return v_.empty(); }
+    // clear(), not destroy: the vector keeps its capacity so the next request
+    // on this connection reuses it instead of allocating again
     void clear() noexcept { v_.clear(); }
 
     std::vector<entry>::const_iterator begin() const noexcept { return v_.begin(); }
@@ -406,6 +428,23 @@ public:
     std::string body;
     bool keep_alive = true;
     std::unordered_map<std::string, std::string> params;    // ":name" captures
+
+    // Reset for reuse without releasing a single allocation. The strings keep
+    // their capacity and the header vector keeps its buffer, so a connection
+    // serving many requests allocates for them once rather than every time.
+    void clear() noexcept
+    {
+        method = http::method::unknown;
+        method_text.clear();
+        target.clear();
+        path.clear();
+        query.clear();
+        http_major = http_minor = 1;
+        headers.clear();
+        body.clear();
+        keep_alive = true;
+        params.clear();
+    }
 
     const std::string* header(const char* name) const noexcept { return headers.find(name); }
 
@@ -506,7 +545,7 @@ public:
 
     void reset()
     {
-        req_ = request{};
+        req_.clear();                           // reuse the buffers, do not free them
         st_ = state::start_line;
         headers_done_ = expect_continue_ = started_ = false;
         header_bytes_ = 0;
@@ -771,26 +810,37 @@ private:
     bool parse_target(const char* b, const char* e)
     {
         req_.target.assign(b, std::size_t(e - b));
-        std::string t = req_.target;
-        if (t.empty())
+        if (b == e)
             return bad(400, "empty request target");
 
-        if (t == "*") {                         // asterisk-form (OPTIONS *)
+        if (e - b == 1 && *b == '*') {          // asterisk-form (OPTIONS *)
             req_.path = "*";
             return true;
         }
-        if (t[0] != '/') {                      // absolute-form: strip scheme://authority
-            const std::size_t s = t.find("://");
-            if (s == std::string::npos)
+        // Work over the incoming bytes rather than a copy of them
+        const char* tb = b;
+        if (*tb != '/') {                       // absolute-form: skip scheme://authority
+            const char* scheme = static_cast<const char*>(
+                detail::find_bytes(tb, std::size_t(e - tb), "://", 3));
+            if (!scheme)
                 return bad(400, "unsupported request-target form");
-            const std::size_t slash = t.find('/', s + 3);
-            t = (slash == std::string::npos) ? std::string("/") : t.substr(slash);
+            const char* slash = static_cast<const char*>(
+                std::memchr(scheme + 3, '/', std::size_t(e - (scheme + 3))));
+            tb = slash ? slash : nullptr;
             absolute_form_ = true;
+            if (!tb) {                          // "http://host" with no path
+                req_.path = "/";
+                req_.query.clear();
+                return true;
+            }
         }
-        const std::size_t q = t.find('?');
-        const std::size_t path_len = (q == std::string::npos) ? t.size() : q;
-        req_.query = (q == std::string::npos) ? std::string{} : t.substr(q + 1);
-        if (!detail::percent_decode(t.data(), path_len, req_.path, false))
+        const char* q = static_cast<const char*>(std::memchr(tb, '?', std::size_t(e - tb)));
+        const std::size_t path_len = std::size_t((q ? q : e) - tb);
+        if (q)
+            req_.query.assign(q + 1, std::size_t(e - (q + 1)));
+        else
+            req_.query.clear();
+        if (!detail::percent_decode(tb, path_len, req_.path, false))
             return bad(400, "invalid percent-encoding in request target");
         if (req_.path.find('\0') != std::string::npos)
             return bad(400, "NUL byte in request target");
@@ -1069,7 +1119,7 @@ class protocol_delegate;
 class connection_host {
 public:
     virtual ~connection_host() = default;
-    virtual void deliver(request&& req, std::uint64_t stream) = 0;
+    virtual void deliver(request& req, std::uint64_t stream) = 0;
     virtual void write_app(const char* data, std::size_t n) = 0;
     virtual void protocol_failure(int status, const char* reason) = 0;
     virtual const server_config& config() const noexcept = 0;
@@ -1132,15 +1182,18 @@ public:
                 return true;
             }
 
-            request req = std::move(parser_.message());
-            parser_.reset();
+            request& req = parser_.message();
             head_ = (req.method == method::head);
             keep_alive_ = req.keep_alive;
             request_bytes_ = req.body.size();
             sent_continue_ = false;
             in_flight_ = true;
-            host.deliver(std::move(req), 0);
-            if (!host.live())
+            // Handed over by reference and reset afterwards: handlers already
+            // see a const& valid only for the call, so nothing needs to own it
+            host.deliver(req, 0);
+            const bool alive = host.live();
+            parser_.reset();
+            if (!alive)
                 return false;
         }
         return true;
@@ -1310,27 +1363,58 @@ public:
 
     // Returns the handler, or null. path_exists reports "the path matched but
     // the method did not", which is a 405 rather than a 404.
+    //
+    // Deliberately allocation-free until a route actually wins. The earlier
+    // shape built a fresh hash map for every route it *tried*, so an eight
+    // route table cost eight map constructions per request; segments are now
+    // matched as views over the path, and captures collected only once.
     const handler* match(const request& req,
                          std::unordered_map<std::string, std::string>& params,
                          bool& path_exists, std::string& allowed) const
     {
         path_exists = false;
-        std::vector<std::string> segs;
+
+        const std::size_t n = count_segments(req.path);
+        seg inline_segs[kInlineSegments];
+        std::vector<seg> heap_segs;                 // only for pathological paths
+        seg* segs = inline_segs;
+        if (n > kInlineSegments) {
+            heap_segs.resize(n);
+            segs = heap_segs.data();
+        }
         split(req.path, segs);
+
+        const route* winner = nullptr;
         for (const auto& r : routes_) {
-            std::unordered_map<std::string, std::string> local;
-            if (!matches(r, segs, local))
+            if (!shape_matches(r, segs, n))
                 continue;
             path_exists = true;
             if (r.m == req.method) {
-                params = std::move(local);
-                return &r.h;
+                winner = &r;
+                break;
             }
             if (!allowed.empty())
                 allowed += ", ";
             allowed += to_string(r.m);
         }
-        return nullptr;
+        if (!winner)
+            return nullptr;
+
+        // Only the winning route pays for captures
+        for (std::size_t i = 0; i < winner->segments.size(); ++i) {
+            const std::string& pat = winner->segments[i];
+            if (!pat.empty() && pat[0] == ':')
+                params.emplace(pat.substr(1), std::string(segs[i].p, segs[i].n));
+        }
+        if (winner->wildcard) {
+            std::string rest;
+            for (std::size_t i = winner->segments.size(); i < n; ++i) {
+                rest += '/';
+                rest.append(segs[i].p, segs[i].n);
+            }
+            params.emplace("*", std::move(rest));
+        }
+        return &winner->h;
     }
 
     std::size_t size() const noexcept { return routes_.size(); }
@@ -1343,38 +1427,51 @@ private:
         handler h;
     };
 
-    static void split(const std::string& path, std::vector<std::string>& out)
+    // A path segment as a view over the request's own path: no copy, no
+    // allocation, nothing to free
+    struct seg {
+        const char* p = nullptr;
+        std::size_t n = 0;
+    };
+    static const std::size_t kInlineSegments = 32;
+
+    static std::size_t count_segments(const std::string& path) noexcept
     {
-        std::size_t i = 0;
+        std::size_t i = 0, k = 0;
+        while (i < path.size()) {
+            if (path[i] == '/') { ++i; continue; }
+            const std::size_t j = path.find('/', i);
+            ++k;
+            i = (j == std::string::npos) ? path.size() : j;
+        }
+        return k;
+    }
+
+    static void split(const std::string& path, seg* out) noexcept
+    {
+        std::size_t i = 0, k = 0;
         while (i < path.size()) {
             if (path[i] == '/') { ++i; continue; }
             std::size_t j = path.find('/', i);
             if (j == std::string::npos)
                 j = path.size();
-            out.emplace_back(path, i, j - i);
+            out[k].p = path.data() + i;
+            out[k].n = j - i;
+            ++k;
             i = j;
         }
     }
 
-    static bool matches(const route& r, const std::vector<std::string>& segs,
-                        std::unordered_map<std::string, std::string>& params)
+    static bool shape_matches(const route& r, const seg* segs, std::size_t n) noexcept
     {
-        if (r.wildcard ? segs.size() < r.segments.size() : segs.size() != r.segments.size())
+        if (r.wildcard ? n < r.segments.size() : n != r.segments.size())
             return false;
         for (std::size_t i = 0; i < r.segments.size(); ++i) {
             const std::string& pat = r.segments[i];
             if (!pat.empty() && pat[0] == ':')
-                params.emplace(pat.substr(1), segs[i]);
-            else if (pat != segs[i])
+                continue;                       // a capture matches any segment
+            if (pat.size() != segs[i].n || std::memcmp(pat.data(), segs[i].p, segs[i].n) != 0)
                 return false;
-        }
-        if (r.wildcard) {
-            std::string rest;
-            for (std::size_t i = r.segments.size(); i < segs.size(); ++i) {
-                rest += '/';
-                rest += segs[i];
-            }
-            params.emplace("*", rest);
         }
         return true;
     }
@@ -1437,6 +1534,7 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     bool close_when_drained = false;
     bool driving = false;
     bool peer_closed = false;
+    bool logging_ = false;                  // is anything attached to on_access?
 
     std::chrono::steady_clock::time_point last_activity{};
     std::chrono::steady_clock::time_point request_started{};
@@ -1453,7 +1551,7 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     const server_config& config() const noexcept override;
     const char* http_date() override;
     bool live() const noexcept override { return live_; }
-    void deliver(request&& req, std::uint64_t stream) override;
+    void deliver(request& req, std::uint64_t stream) override;
     void protocol_failure(int status, const char* reason) override;
 
     void write_app(const char* data, std::size_t n) override
@@ -1517,6 +1615,7 @@ struct server_core : std::enable_shared_from_this<server_core> {
     moveable_signal<const connection_info&> on_close;
     moveable_signal<const access_entry&> on_access;
     moveable_signal<const char*, int> on_error;
+    std::vector<scoped_connection> kept;         // connect-and-park; see below
 
     std::function<std::unique_ptr<transport_delegate>()> make_transport =
         [] { return std::unique_ptr<transport_delegate>(new plain_transport()); };
@@ -1887,7 +1986,7 @@ inline void session_core::protocol_failure(int status, const char* reason)
     }
 }
 
-inline void session_core::deliver(request&& req, std::uint64_t stream)
+inline void session_core::deliver(request& req, std::uint64_t stream)
 {
     auto s = srv.lock();
     if (!s) {
@@ -1896,13 +1995,21 @@ inline void session_core::deliver(request&& req, std::uint64_t stream)
     }
     ++s->total_requests;
 
-    pending = access_entry{};
-    pending.method = req.method_text;
-    pending.path = req.path;
-    pending.query = req.query;
+    // Only pay for the access-log snapshot when something is listening. These
+    // are three string copies per request, and most servers run with no tap
+    // attached at all.
+    pending.status = 0;
+    pending.response_bytes = 0;
+    pending.duration_ms = 0.0;
     pending.fd = fd;
     pending.stream = stream;
     pending.request_bytes = req.body.size();
+    logging_ = (s->on_access.slot_count() != 0);
+    if (logging_) {
+        pending.method = req.method_text;
+        pending.path = req.path;
+        pending.query = req.query;
+    }
     request_started = std::chrono::steady_clock::now();
 
     responder r;
@@ -1938,12 +2045,14 @@ inline void session_core::complete(std::uint64_t stream, response&& res)
     const int status = res.status;
     protocol->respond(stream, std::move(res), *this);
 
-    if (auto s = srv.lock()) {
-        pending.status = status;
-        pending.response_bytes = protocol->last_response_bytes();
-        pending.duration_ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - request_started).count();
-        s->on_access(pending);
+    if (logging_) {
+        if (auto s = srv.lock()) {
+            pending.status = status;
+            pending.response_bytes = protocol->last_response_bytes();
+            pending.duration_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - request_started).count();
+            s->on_access(pending);
+        }
     }
 
     // Coalesce. While we are still inside the read loop (driving), more
@@ -2212,12 +2321,32 @@ public:
     const server_config& config() const noexcept { return c_->cfg; }
 
     // ---- taps: logging, metrics and tracing, off the hot path
+    //
+    // Connect and park: the connection lives as long as the server, so there
+    // is no scoped_connection to hold on to. Forgetting to hold one is the
+    // classic way to wire a log handler that silently never fires.
+    //
+    //     srv.on_access([](const auto& e) { log(e.method, e.path, e.status); });
+    //
+    template <typename F> server& on_open(F&& f)   { return park(c_->on_open, std::forward<F>(f)); }
+    template <typename F> server& on_close(F&& f)  { return park(c_->on_close, std::forward<F>(f)); }
+    template <typename F> server& on_access(F&& f) { return park(c_->on_access, std::forward<F>(f)); }
+    template <typename F> server& on_error(F&& f)  { return park(c_->on_error, std::forward<F>(f)); }
+
+    // The raw signals, for wiring by hand and owning the connection
     moveable_signal<const connection_info&>& on_open() noexcept { return c_->on_open; }
     moveable_signal<const connection_info&>& on_close() noexcept { return c_->on_close; }
     moveable_signal<const access_entry&>& on_access() noexcept { return c_->on_access; }
     moveable_signal<const char*, int>& on_error() noexcept { return c_->on_error; }
 
 private:
+    template <typename Sig, typename F>
+    server& park(Sig& sig, F&& f)
+    {
+        c_->kept.push_back(scoped_connection{sig.connect(std::forward<F>(f))});
+        return *this;
+    }
+
     void arm_listener()
     {
         auto& c = *c_;

@@ -147,6 +147,14 @@ build/http_scale: benchmarks/http_scale.cpp $(HEADERS) | build
 bench-scale: build/http_scale
 	./build/http_scale
 
+# What one request costs in CPU alone - no sockets, no loop, no kernel
+build/http_request_path: benchmarks/http_request_path.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    benchmarks/http_request_path.cpp -o $@ $(LDLIBS)
+
+bench-request: build/http_request_path
+	./build/http_request_path
+
 # One self-contained file per entry header, for drop-in use
 amalgamate:
 	python3 scripts/amalgamate.py http_server.hpp
@@ -162,4 +170,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http test-tls autobahn bench-http bench-scale amalgamate check-amalgamate clean
+.PHONY: all test tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http test-tls autobahn bench-http bench-scale bench-request amalgamate check-amalgamate clean
