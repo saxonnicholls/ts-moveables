@@ -8,7 +8,7 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[the moveable primitives](#the-types)** — atomic, the full mutex family, spin lock, condition variable, once flag, semaphore, latch, barrier: every "immovable" synchronisation type, moveable with its state integrity intact
 - **[`synchronized<T>`](#synchronizedt)** — a value bonded to its mutex, reachable only under the lock, plus ready-made thread-safe heterogeneous containers (variant / tuple / any / type map / bag)
 - **[`circular_buffer`](#circular_buffer)** — a wait-free SPSC ring with two honest cache-line-separated atomics; ~2 ns/op batched
-- **[`disruptor`](#disruptor)** — the LMAX pattern: pre-allocated events, consumer dependency graphs, batch consumption; ~1 ns/event batched
+- **[`disruptor`](#disruptor)** — the LMAX pattern: pre-allocated events, consumer dependency graphs, batch consumption, single **and** multi-producer; ~1 ns/event batched
 - **[`moveable_signal`](#moveable_signal)** — thread-safe signal/slot whose connections survive moves, with no lock held while slots run
 - **[`event_loop`](#event_loop)** — a clean, typed POSIX reactor (epoll / kqueue) whose dispatch is signals: handler lifetimes safe by construction, moveable watches and timers, replayable by design
 - **[`time_master`](#time_master)** — the legendary periodic scheduler, rebuilt on the loop: drift-free *and* burst-free timers, events added and cancelled from any thread while running, and the whole scheduler is a moveable value
@@ -117,24 +117,31 @@ Moved-from objects are always left valid and usable.
 
 | Header | Type | Wraps / replaces | Copy | Move |
 |---|---|---|---|---|
-| `moveable_atomic.hpp` | `moveable_atomic<T>` (+ aliases such as `moveable_atomic_int`) | `std::atomic<T>` | value | value |
-| `moveable_atomic.hpp` | `moveable_atomic_flag` | `std::atomic_flag` (built on `std::atomic<bool>`) | value | value |
-| `moveable_mutex.hpp` | `moveable_mutex<M>` (+ aliases for recursive / timed / shared / shared timed) | any std mutex | — | checked |
-| `moveable_spin_lock.hpp` | `moveable_spin_lock` | the classic `std::atomic_flag` spin lock | — | checked |
-| `moveable_condition_variable.hpp` | `moveable_condition_variable<CV>` / `moveable_condition_variable_any` | `std::condition_variable(_any)` | — | checked |
-| `moveable_once_flag.hpp` | `moveable_once_flag` + `snicholls::call_once` | `std::once_flag` / `std::call_once` | state | state, checked |
-| `moveable_semaphore.hpp` | `moveable_semaphore` | `std::counting_semaphore` | — | count transfers |
-| `moveable_latch.hpp` | `moveable_latch` | `std::latch` | — | count transfers |
-| `moveable_barrier.hpp` | `moveable_barrier<Completion>` | `std::barrier` | — | config + phase transfer |
-| `synchronized.hpp` | `synchronized<T, M>` / `synchronized_waitable<T, M>` | `folly::Synchronized` / P0290 | locked | locked / checked |
-| `synchronized_heterogeneous.hpp` | `synchronized_variant<Ts...>`, `synchronized_tuple<Ts...>`, `synchronized_any`, `synchronized_type_map`, `synchronized_bag` | — | locked | locked |
-| `circular_buffer.hpp` | `circular_buffer<T>` / `circular_buffer<T, N>` | `boost::lockfree::spsc_queue` (immovable) | checked | checked, contents transfer |
-| `mpmc_queue.hpp` | `mpmc_queue<T>` (bounded, lock-free) | Vyukov bounded MPMC / moodycamel | — | quiescent, contents transfer |
-| `work_stealing_deque.hpp` | `work_stealing_deque<T>` (bounded Chase-Lev) | Chase-Lev / Taskflow internals | — | — (internal, stable) |
-| `disruptor.hpp` | `disruptor<T, WaitStrategy>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
-| `moveable_signal.hpp` | `moveable_signal<Args...>` + `connection` / `scoped_connection` | Boost.Signals2 / sigslot | — | connections survive the move |
-| `thread_pool.hpp` | `task_pool` interface + `mutex_` / `sharded_` / `dispatch_` / `mpmc_` / `work_stealing_task_pool` | Taskflow / TBB / `std::async` | — | moveable handle (heap core) |
+| `moveable/atomic.hpp` | `moveable_atomic<T>` (+ aliases such as `moveable_atomic_int`) | `std::atomic<T>` | value | value |
+| `moveable/atomic.hpp` | `moveable_atomic_flag` | `std::atomic_flag` (built on `std::atomic<bool>`) | value | value |
+| `moveable/mutex.hpp` | `moveable_mutex<M>` (+ aliases for recursive / timed / shared / shared timed) | any std mutex | — | checked |
+| `moveable/spin_lock.hpp` | `moveable_spin_lock` | the classic `std::atomic_flag` spin lock | — | checked |
+| `moveable/condition_variable.hpp` | `moveable_condition_variable<CV>` / `moveable_condition_variable_any` | `std::condition_variable(_any)` | — | checked |
+| `moveable/once_flag.hpp` | `moveable_once_flag` + `snicholls::call_once` | `std::once_flag` / `std::call_once` | state | state, checked |
+| `moveable/semaphore.hpp` | `moveable_semaphore` | `std::counting_semaphore` | — | count transfers |
+| `moveable/latch.hpp` | `moveable_latch` | `std::latch` | — | count transfers |
+| `moveable/barrier.hpp` | `moveable_barrier<Completion>` | `std::barrier` | — | config + phase transfer |
+| `moveable/signal.hpp` | `moveable_signal<Args...>` + `connection` / `scoped_connection` | Boost.Signals2 / sigslot | — | connections survive the move |
+| `concurrent/synchronized.hpp` | `synchronized<T, M>` / `synchronized_waitable<T, M>` | `folly::Synchronized` / P0290 | locked | locked / checked |
+| `concurrent/synchronized_heterogeneous.hpp` | `synchronized_variant<Ts...>`, `synchronized_tuple<Ts...>`, `synchronized_any`, `synchronized_type_map`, `synchronized_bag` | — | locked | locked |
+| `concurrent/circular_buffer.hpp` | `circular_buffer<T>` / `circular_buffer<T, N>` | `boost::lockfree::spsc_queue` (immovable) | checked | checked, contents transfer |
+| `concurrent/mpmc_queue.hpp` | `mpmc_queue<T>` (bounded, lock-free) | Vyukov bounded MPMC / moodycamel | — | quiescent, contents transfer |
+| `concurrent/work_stealing_deque.hpp` | `work_stealing_deque<T>` (bounded Chase-Lev) | Chase-Lev / Taskflow internals | — | — (internal, stable) |
+| `concurrent/disruptor.hpp` | `disruptor<T, WaitStrategy>` + `multi_producer_disruptor<T>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
+| `concurrent/thread_pool.hpp` | `task_pool` interface + `mutex_` / `sharded_` / `dispatch_` / `mpmc_` / `work_stealing_task_pool` | Taskflow / TBB / `std::async` | — | moveable handle (heap core) |
 | `event/loop.hpp` | `event_loop` + `fd_watch` / `timer` (POSIX; self-disables on Windows) | Asio / libuv / libevent | — | moveable handles, loop handle moves mid-run |
+| `event/time_master.hpp` | `time_master` — named, cancellable, repeating timers on the loop | Boost.Asio timer wrappers | — | moveable handle (heap core) |
+| `http/server.hpp` | `server` + `responder` / `response_stream`, HTTP/1.1 delegate | cpp-httplib (blocking) / Asio | — | moveable handle (heap core) |
+| `http/http2.hpp` | `http2_protocol` — framing, HPACK, flow control | nghttp2 | — | owned by the connection |
+| `http/websocket.hpp`, `http/websocket_deflate.hpp` | RFC 6455 protocol delegate + RFC 7692 `permessage-deflate` | uWebSockets / libwebsockets | — | owned by the connection |
+| `tls/openssl.hpp`, `tls/mbedtls.hpp` | memory-BIO transport delegates (**opt-in** — these link a library) | Asio SSL streams | — | owned by the connection |
+| `logging/logger.hpp` | `logger` + `lane`, `record`, console / JSON / file sinks, `journal` / `replayer` | spdlog | — | moveable handle (heap core) |
+| `interfaces/*.hpp` | `transport_delegate`, `protocol_delegate`, `task_pool`, `ws_extension` — the extension points | — | — | — (pure interfaces) |
 | `ts_moveables.hpp` | umbrella header — includes everything | | | |
 
 Two implementation strategies are used:
@@ -238,7 +245,7 @@ The quiescent move-check costs the hot path **nothing**. A lock-free ring has no
 
 ## disruptor
 
-Phase 1 of the [LMAX Disruptor](https://lmax-exchange.github.io/disruptor/) pattern: a pre-allocated ring of events, sequence counters instead of queue locks, consumers that see contiguous batches, and explicit dependency graphs. Single producer; each consumer is pumped by one thread via `poll()` or `run()`. Wait strategies (busy-spin / yielding / blocking) plug in per disruptor.
+The [LMAX Disruptor](https://lmax-exchange.github.io/disruptor/) pattern: a pre-allocated ring of events, sequence counters instead of queue locks, consumers that see contiguous batches, and explicit dependency graphs. Each consumer is pumped by one thread via `poll()` or `run()`. Wait strategies (busy-spin / yielding / blocking) plug in per disruptor.
 
 ```cpp
 snicholls::disruptor<Trade> d{4096};
@@ -253,6 +260,19 @@ d.publish([&](Trade& t) {                journal.run(keep_going, [](Trade& t, st
 ```
 
 The producer claims, mutates in place, and publishes with one release store — no allocation after construction, gated so it can never lap the slowest consumer. A design note on moveability: all shared state lives behind a stable heap core, so the disruptor *handle* moves freely even while producer and consumers are running — consumer references stay valid — at the price of one pointer indirection on the hot path.
+
+**Two producer disciplines, chosen at compile time.** `disruptor<T>` is single-producer. `multi_producer_disruptor<T>` lets any number of threads publish concurrently: producers CAS for their slot, then mark it available on publication, so a consumer only ever sees a run of slots that are genuinely all written — the case that matters is sequence *N+1* being published before *N*, which a naive cursor would hand out as a contiguous batch containing a hole.
+
+The split is a template parameter rather than a runtime flag because the single-producer path is the one people benchmark, and it must not pay for a facility it does not use. The multi-producer bookkeeping — the availability marks and their per-lap tagging — lives in a template specialisation whose primary template is *empty*, declared last in the core so the single-producer layout above it is untouched and nothing extra is allocated. The mode you did not choose costs you nothing.
+
+```cpp
+snicholls::multi_producer_disruptor<Trade> d{4096};
+auto& risk = d.add_consumer();
+// any number of threads, no external lock
+d.publish([&](Trade& t) { t = incoming; });
+```
+
+Both disciplines get the same dependency graphs, batch publication, wait strategies and mid-flight handle moves; the multi-producer path has its own tests for exactly-once delivery, out-of-order publication being gated, wraparound (where the availability marks must distinguish laps), dependency graphs and moves.
 
 ## moveable_signal
 
@@ -510,7 +530,7 @@ We do **not** claim to beat the work-stealing greats (Taskflow, TBB, Tokio) — 
 
 The two lock-free building blocks stand alone too: `mpmc_queue<T>` is a bounded Vyukov MPMC ring (moveable when quiescent), and `work_stealing_deque<T>` is a bounded Chase-Lev deque with the memory-model-verified orderings from Le et al. (2013).
 
-The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Most of it has now shipped; what remains is disruptor phase 2 (multi-producer), the event loop's later phases, and the [HTTP server](#http_server)'s roadmap beyond phase 1 — TLS delegates, WebSocket, HTTP/2, and QUIC/HTTP/3 (§8 there).
+The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Nearly all of it has shipped: disruptor phase 2 (multi-producer), the event loop, and §8 phases 1–4 of the HTTP server — TLS on two backends, WebSocket with `permessage-deflate`, and HTTP/2. What remains is **QUIC and HTTP/3** (§8 phase 5, and the plan there is explicitly to *wrap* a QUIC library rather than write one), the **event loop's phase 2 comforts** (POSIX signals as emissions, a Windows `WSAPoll` backend), and the **two-machine head-to-head** against nginx, which needs hardware rather than code.
 
 ## event_loop
 
@@ -756,7 +776,7 @@ The plateau is the *load generator*, not the server — it lives on the same box
 
 A portability note worth having: `SO_REUSEPORT` load-balances accepts on **Linux**, but on macOS and the BSDs it only permits the duplicate bind — delivery still goes to one socket, so N reactors silently become 1. The benchmark reports per-reactor connection counts precisely to catch that, and did: the first run showed 31 of 32 reactors never receiving a single connection. `listen_shared()` works everywhere. (FreeBSD's balancing flag is `SO_REUSEPORT_LB`, used automatically where it exists.)
 
-**Phase 1 scope, plainly.** HTTP/1.1 only, plaintext only, POSIX only (it follows the [event loop](#event_loop); `SNICHOLLS_HAS_HTTP_SERVER` is 0 on Windows). No TLS, HTTP/2, HTTP/3 or WebSocket *yet* — all four are designed in [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md) with the interfaces already carrying the stream ids they need, and each has an external grader it must pass before it ships: h2spec, Autobahn, the QUIC interop runner.
+**Scope, plainly.** POSIX only — it follows the [event loop](#event_loop), so `SNICHOLLS_HAS_HTTP_SERVER` is 0 on Windows rather than shipping a pretend port. Of the four protocols designed in [FUTURE_DIRECTIONS §8](FUTURE_DIRECTIONS.md), three have shipped and each cleared the external grader it was required to pass before it did: [TLS](#https-tls) on two backends, [WebSocket](#websocket) at 517/517 Autobahn, and [HTTP/2](#http2) at 147/147 h2spec. **HTTP/3 remains**, and the plan there is deliberately to wrap a QUIC library rather than write one — its grader is the QUIC interop runner.
 
 ## http2
 

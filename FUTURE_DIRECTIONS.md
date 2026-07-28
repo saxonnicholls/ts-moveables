@@ -364,6 +364,20 @@ The structural expectation for the head-to-head was that a reactor holds the C10
 
 ---
 
+## 9. Logging and telemetry — the fabric applied to itself
+
+**Status: shipped** as `logging/logger.hpp`. Recorded here after the fact, which is a departure from this document's usual order and worth admitting: it was built to answer a concrete need rather than a planned entry.
+
+**Why it belongs.** Every piece needed already existed. `moveable_signal` runs slots on the emitting thread — which is precisely why a logger must *not* emit from `LOG()`, or a WebSocket write to a machine across the room ends up on whatever thread happened to log. So `LOG()` stamps a record, pushes it into a bounded `mpmc_queue`, and returns; a drain thread pops and emits. Sinks are ordinary signal slots with lifetime tracking, which is why writing one is three lines. The component is almost entirely composition of §3 and §6.
+
+**What shipped beyond the obvious.** Independent **lanes** (a queue and thread each, so a 20 ms Postgres insert cannot stall a console), per-lane overflow policy (`block` / `drop_newest` / `drop_oldest`) with drops counted rather than hidden, a **total-order `seq` stamp** because timestamps alone cannot order concurrent logging — two threads can read the same clock value, and a thread can be descheduled between stamping and queueing — an optional per-lane reordering window built on that, a **persistent sequence** that survives restart via block reservation, and a `journal` / `replayer` pair that makes a run reproducible. Telemetry rides the same pipeline: a metric is a record with a number.
+
+**Where the reasoning lives.** The two defaults that are judgement rather than fact — `drop_newest`, and a metric being a `record` with a bool discriminator rather than a separate type — are argued in the header next to the code, not here. The demo is `make demo-drones` — ten aircraft, five operators, fifteen flight logs, four offices in order, and the training replay paced from the journal. (`make demo-replay` is the *event loop's* replayable-session demo from §7 and touches none of this; the two are easy to confuse by name alone.)
+
+**Honest positioning.** spdlog is faster at formatting, far more mature, and has a rotating-file story this does not. What this has is the fabric: one pipeline, any thread, sinks that are ordinary slots, and a live WebSocket sink that falls out of composition rather than a plugin API.
+
+---
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:
@@ -378,11 +392,15 @@ Written down so nobody — including us — spends a busy week on them:
 | # | Component | Effort | Ships when |
 |---|---|---|---|
 | 1 | `synchronized<T>` | Small | **Shipped** |
-| 2 | `circular_buffer` (SPSC) | Medium | **Shipped** — benchmarks pending |
+| 2 | `circular_buffer` (SPSC) | Medium | **Shipped** — benchmarked (`make bench`), including the batch `push_n`/`pop_n` path |
 | 3 | Signal/slot | Medium | **Shipped** (study done; the gap was real) |
 | 4 | Disruptor phase 1 | Large | **Shipped** |
 | 5 | `thread_pool` interface + mutex / sharded / dispatch impls | Medium | **Shipped** |
 | 6 | `mpmc_queue` + work-stealing pool | Large ×2 | **Shipped** |
 | 7 | `event_loop` phase 1 (POSIX reactor, replayable) | Large | ✅ **Shipped — the §7 bar is clear.** Core, tests, TimeMaster, the replayable-loop demo (`make demo-replay`) and the dispatch-overhead bench (`make bench-dispatch`) |
 | 8 | Disruptor phase 2 (multi-producer) | Large | **Shipped** — `multi_producer_disruptor<T>`; opt-in at compile time, single-producer codegen unchanged |
-| 9 | HTTP/HTTPS server on delegates (§8) — with `moveable_function` when needed | Large ×2 | After event_loop phase 1 clears its bar |
+| 9 | HTTP/HTTPS server on delegates (§8) — with `moveable_function` when needed | Large ×2 | ✅ **Shipped, §8 phases 1–4.** HTTP/1.1 reactor, TLS on two backends, WebSocket (517/517 Autobahn), HTTP/2 (147/147 h2spec). The router still stores `std::function`; `moveable_function` remains deferred on purpose — see the verdict in §8 |
+| 10 | Logging and telemetry on the signal/queue fabric (§9) | Medium | ✅ **Shipped** — `logging/logger.hpp`: lanes, ordering, persistent sequence, journal + replay |
+| 11 | `event_loop` phase 2 comforts — POSIX signals as emissions, `WSAPoll` backend | Medium | Next |
+| 12 | QUIC + HTTP/3 (§8 phase 5) — wrap, do not write | Large ×2 | After phase 5's interop bar is agreed |
+| 13 | Two-machine head-to-head vs nginx (§8 phase 6a) | Medium | Needs a second machine, not more code |
