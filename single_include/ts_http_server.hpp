@@ -1364,6 +1364,7 @@ public:
 #define SNICHOLLS_HAS_HTTP_SERVER 1
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -2572,6 +2573,18 @@ public:
     virtual bool receiving() const noexcept = 0;    // a partial request is buffered (slowloris)
     virtual std::size_t last_response_bytes() const noexcept { return 0; }
 
+    // Bytes the protocol is holding that it has not been allowed to hand to
+    // the socket yet. Zero for HTTP/1.1, where everything written goes
+    // straight to the connection's out-queue and `pending()` already sees it.
+    //
+    // HTTP/2 is the reason this exists. Flow control means a write can be
+    // accepted by the protocol and still be nowhere near the wire: it sits in
+    // a per-stream buffer until the peer sends a WINDOW_UPDATE. Without this,
+    // a streaming producer asking `pending()` whether to keep going is told
+    // "nothing queued" no matter how far behind the peer is - the backpressure
+    // signal reads clear while the backlog grows.
+    virtual std::size_t buffered_bytes() const noexcept { return 0; }
+
     // Streamed responses: headers now, body in pieces, length unknown at the
     // time of the headers. Without this a response must be complete in memory
     // before any of it is sent, which is fine for JSON and hopeless for a
@@ -2916,7 +2929,12 @@ public:
     bool open() const noexcept { return open_ && !s_.expired(); }
     explicit operator bool() const noexcept { return open(); }
 
-    // Bytes queued for this connection but not yet handed to the kernel
+    // Bytes queued for this connection and not yet gone: the socket backlog
+    // plus anything the protocol is holding because flow control will not let
+    // it out yet. On HTTP/2 the second part is usually the larger one, and a
+    // producer that only saw the first would think a stalled peer was idle.
+    // Safe from any thread; the value is published by the loop, so it may lag
+    // by one operation.
     std::size_t pending() const;
     // Fires on the loop thread when the queue empties
     moveable_signal<>* on_drain() const;
@@ -3171,7 +3189,34 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
         flush();
     }
 
-    std::size_t pending_bytes() const noexcept { return out.size() - sent; }
+    // What a streaming producer must throttle against. The socket queue is
+    // only half of it: a multiplexed protocol can be holding bytes that flow
+    // control will not let it emit yet, and those are just as much a backlog.
+    //
+    // Loop thread only - it reads `out`, `sent` and the delegate's stream
+    // table, all of which the loop owns. Producers read `pending_pub` instead.
+    std::size_t pending_bytes() const noexcept
+    {
+        return (out.size() - sent) + (protocol ? protocol->buffered_bytes() : 0);
+    }
+
+    // The published copy, and the reason it exists.
+    //
+    // A streaming producer runs on a worker thread and asks pending() whether
+    // to keep going. Answering that from the producer's own thread means
+    // reading a std::string's size while the loop appends to it, and - once a
+    // multiplexed protocol is involved - walking a std::map while the loop
+    // inserts into it. So the loop computes the number at the points where it
+    // can change and publishes it here, and the producer reads only this.
+    // Slightly stale by construction, which is the correct trade: backpressure
+    // is advisory, and the hard bound that actually protects memory is
+    // enforced inside the protocol on the loop thread.
+    std::atomic<std::size_t> pending_pub{0};
+
+    void publish_pending() noexcept
+    {
+        pending_pub.store(pending_bytes(), std::memory_order_relaxed);
+    }
 
     // Close, but let the transport have its say first.
     //
@@ -3220,7 +3265,9 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
             return;
         protocol->stream_write(id, data, n, *this);
         if (!driving)
-            flush();
+            flush();                            // which republishes
+        else
+            publish_pending();                  // coalescing; nothing else will
     }
 
     void end_stream(std::uint64_t id);
@@ -3575,6 +3622,7 @@ inline void session_core::flush()
             continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             arm_write(true);
+            publish_pending();                  // the backlogged case: publish it
             return;
         }
         close_now();
@@ -3587,6 +3635,10 @@ inline void session_core::flush()
     if (out.capacity() > 256u * 1024)
         std::string().swap(out);
     arm_write(false);
+    // The socket queue is empty, but a multiplexed protocol may still be
+    // holding bytes its send window will not take - so republish rather than
+    // assume zero.
+    publish_pending();
     // Everything queued has reached the kernel. A streaming producer waiting
     // on backpressure can send more now.
     if (had_backlog)
@@ -3877,8 +3929,10 @@ inline void response_stream::end()
 
 inline std::size_t response_stream::pending() const
 {
+    // The published value, never the live one: this is nearly always called
+    // from the producer's thread, and the live one belongs to the loop.
     auto s = s_.lock();
-    return s ? s->pending_bytes() : 0;
+    return s ? s->pending_pub.load(std::memory_order_relaxed) : 0;
 }
 
 inline moveable_signal<>* response_stream::on_drain() const

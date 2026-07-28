@@ -1557,6 +1557,92 @@ void test_h2_flow_control()
     pass("http2: outbound DATA respects the per-stream window and resumes on WINDOW_UPDATE");
 }
 
+// A client may legally open a stream, ask for a large response, and then never
+// send a WINDOW_UPDATE. Nothing in RFC 9113 obliges it to. Everything the
+// server was told to send but cannot then sits in that stream's buffer, and a
+// streaming producer generates as it goes - so without a limit the buffer
+// grows for as long as the client stays quiet, which costs the client nothing.
+void test_h2_outbound_buffer_is_bounded()
+{
+    h2_config h2;
+    h2.max_outbound_buffer = 64u * 1024;        // small, so the test is quick
+    h2_server s(h2);
+    add_common_routes(s.srv);
+
+    // The naive producer this limit exists to survive: it never consults
+    // pending(), it just writes
+    s.srv.get("/firehose", [](const request&, responder r) {
+        auto out = r.stream(response(200).type("application/octet-stream"));
+        for (int i = 0; i < 64; ++i)            // 2 MiB against a 64 KiB budget
+            out.write(std::string(32 * 1024, 'z'));
+        out.end();
+    });
+    s.start();
+
+    h2_client c(s.port);
+    c.preface({{h2_settings_initial_window_size, 0}});   // nothing may be sent
+    c.request(1, h2_client::get("/firehose"));
+
+    h2_client::result r;
+    assert(c.collect(1, r));
+    // The stream is reset, not buffered without limit - and the code is the
+    // one for a peer that is within the rules but expensive
+    assert(!r.goaway);                          // one exchange, not the connection
+    assert(r.reset);
+    assert(r.reset_code == std::uint32_t(h2_error::enhance_your_calm));
+
+    // And the connection is still fully usable: a second exchange completes,
+    // which is the whole point of answering with RST_STREAM instead of GOAWAY
+    c.request(3, h2_client::get("/hello"));
+    c.window_update(3, 65535);                  // this stream may send after all
+    h2_client::result r2;
+    assert(c.collect(3, r2));
+    assert(r2.ended && r2.status == 200);
+    assert(r2.body == "hello t");
+
+    pass("http2: a peer that stalls its window cannot make us buffer without bound");
+}
+
+// The bound above is the backstop. This is the signal that should stop a
+// well-behaved producer long before it - and the reason the bug was worth
+// fixing twice: pending() used to report only the socket queue, which on
+// HTTP/2 is empty exactly when the flow-control backlog is largest.
+void test_h2_pending_sees_the_flow_control_backlog()
+{
+    h2_server s;                                // default budget: nothing is reset here
+    std::atomic<std::size_t> reported{0};
+    std::atomic<bool> saw_backlog{false};
+    std::atomic<bool> ran{false};
+
+    static constexpr std::size_t kChunk = 128u * 1024;
+    s.srv.get("/stalled", [&](const request&, responder r) {
+        auto out = r.stream(response(200).type("application/octet-stream"));
+        out.write(std::string(kChunk, 'q'));
+        // The peer's window is shut, so none of that can have reached the
+        // wire. If pending() only saw the socket queue it would read zero.
+        saw_backlog.store(spin_until_for([&] { return out.pending() >= kChunk; }));
+        reported.store(out.pending());
+        ran.store(true);
+    });
+    s.start();
+
+    h2_client c(s.port);
+    c.preface({{h2_settings_initial_window_size, 0}});
+    c.request(1, h2_client::get("/stalled"));
+
+    // Read the headers so the exchange is genuinely under way
+    h2_in f;
+    while (c.next(f))
+        if (f.sid == 1 && f.type == std::uint8_t(h2_frame::headers))
+            break;
+
+    assert(spin_until_for([&] { return ran.load(); }));
+    assert(saw_backlog.load());                 // not a timeout
+    assert(reported.load() >= kChunk);
+
+    pass("http2: pending() reports the flow-control backlog, not just the socket queue");
+}
+
 void test_h2_initial_window_is_a_delta()
 {
     // §6.9.2: changing SETTINGS_INITIAL_WINDOW_SIZE adjusts the windows of
@@ -1909,6 +1995,8 @@ void run_http2_tests()
     test_h2_continuation_flood();
 
     test_h2_flow_control();
+    test_h2_outbound_buffer_is_bounded();
+    test_h2_pending_sees_the_flow_control_backlog();
     test_h2_initial_window_is_a_delta();
     test_h2_inbound_window_replenishes();
 

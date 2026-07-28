@@ -899,6 +899,26 @@ struct h2_config {
     std::size_t max_header_fields = 128;            // decoded fields per request
     std::size_t max_header_block = 64u * 1024;      // *compressed* bytes across CONTINUATIONs
 
+    // The outbound mirror of the flow-control problem, and the one that is
+    // ours rather than the peer's. A client may legally open a stream, ask for
+    // a large response, and then simply never send a WINDOW_UPDATE. Nothing in
+    // the protocol obliges it to. Everything we are told to send but cannot
+    // then sits in the stream's buffer.
+    //
+    // For a whole-body respond() that backlog is bounded by what the
+    // application chose to allocate, the same argument the inbound side makes
+    // for max_body: the ceiling is a configuration decision the application
+    // already made. A *streaming* producer is different - it generates as it
+    // goes, so without a limit the buffer grows for as long as the client is
+    // willing to stay silent, which is forever and costs the client nothing.
+    //
+    // This is a budget for the whole connection, not per stream: a per-stream
+    // limit multiplies by max_concurrent_streams, and 100 x 8 MiB is not a
+    // bound anyone wanted. The stream whose write crosses the line is the one
+    // reset; streams already inside the budget are left alone, because one
+    // greedy exchange is not grounds to punish the rest of the connection.
+    std::size_t max_outbound_buffer = 8u * 1024 * 1024;
+
     // Rapid Reset (2023) and its relatives: a client that can make the server
     // open and tear down streams, or answer control frames, faster than it can
     // send bytes has an amplifier. Both are token buckets - a burst is normal
@@ -1146,6 +1166,14 @@ public:
         compact(*s);
         s->out_buf.append(data, n);
         last_bytes_ += pump(host);
+        // pump() has already sent everything the windows allowed, so what is
+        // left is precisely what the peer will not take. Checking after rather
+        // than before means a large write that goes straight out is never
+        // refused for its size - only a genuine backlog is.
+        //
+        // `s` may not survive this call: stream_error forgets the stream.
+        if (buffered_bytes() > cfg_.max_outbound_buffer)
+            stream_error(host, std::uint32_t(sid), h2_error::enhance_your_calm);
     }
 
     void end_stream(std::uint64_t sid, connection_host& host) override
@@ -1156,6 +1184,20 @@ public:
         s->streaming = false;
         s->out_end = true;
         last_bytes_ += pump(host);
+    }
+
+    // Everything the send windows have refused so far, across every stream.
+    //
+    // Summed rather than carried as a running counter: the value is wanted
+    // once per write, the stream count is capped by max_concurrent_streams,
+    // and a counter would have to be kept in step with append, pump, compact
+    // and erase - four places to drift out of agreement about the same number.
+    std::size_t buffered_bytes() const noexcept override
+    {
+        std::size_t n = 0;
+        for (const auto& kv : streams_)
+            n += kv.second->out_buf.size() - kv.second->out_off;
+        return n;
     }
 
     // ---- observation, for tests and metrics

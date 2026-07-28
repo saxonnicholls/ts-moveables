@@ -76,6 +76,18 @@ public:
     virtual bool receiving() const noexcept = 0;    // a partial request is buffered (slowloris)
     virtual std::size_t last_response_bytes() const noexcept { return 0; }
 
+    // Bytes the protocol is holding that it has not been allowed to hand to
+    // the socket yet. Zero for HTTP/1.1, where everything written goes
+    // straight to the connection's out-queue and `pending()` already sees it.
+    //
+    // HTTP/2 is the reason this exists. Flow control means a write can be
+    // accepted by the protocol and still be nowhere near the wire: it sits in
+    // a per-stream buffer until the peer sends a WINDOW_UPDATE. Without this,
+    // a streaming producer asking `pending()` whether to keep going is told
+    // "nothing queued" no matter how far behind the peer is - the backpressure
+    // signal reads clear while the backlog grows.
+    virtual std::size_t buffered_bytes() const noexcept { return 0; }
+
     // Streamed responses: headers now, body in pieces, length unknown at the
     // time of the headers. Without this a response must be complete in memory
     // before any of it is sent, which is fine for JSON and hopeless for a
