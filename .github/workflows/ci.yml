@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]          # so a release tag is graded by the same matrix
   pull_request:
   workflow_dispatch:
 
@@ -57,6 +58,14 @@ jobs:
       # platform that compiles with MSVC.
       - name: MSVC capture rules
         run: python3 scripts/check_msvc_capture.py
+
+      # version.hpp, CMakeLists.txt and the release tag are three copies of one
+      # number. RELEASE_TAG is set only on a tag build, where the tag joins the
+      # comparison; on a branch build the header and CMake are still checked.
+      - name: Version is the same everywhere
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: python3 scripts/check_version.py
 
       - name: Unit tests (C++17)
         run: make clean && make test CXX=${{ matrix.cxx }} STD=c++17

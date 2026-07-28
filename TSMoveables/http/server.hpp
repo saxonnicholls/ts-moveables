@@ -44,6 +44,7 @@
 #ifndef http_server_hpp
 #define http_server_hpp
 
+#include "../version.hpp"
 #include "../event/loop.hpp"
 #include "../interfaces/transport_delegate.hpp"
 #include "../moveable/signal.hpp"

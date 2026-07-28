@@ -89,6 +89,11 @@ build/http_server_demo: demos/http_server_demo.cpp $(HEADERS) | build
 check-msvc:
 	python3 scripts/check_msvc_capture.py
 
+# The version is written down in version.hpp, CMakeLists.txt and the git tag.
+# One release, one number - checked rather than remembered.
+check-version:
+	python3 scripts/check_version.py
+
 test: build/tests
 	./build/tests
 
@@ -241,4 +246,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-replay demo-drones test-tls check-mbedtls autobahn h2spec bench-http bench-scale bench-request bench-dispatch amalgamate check-amalgamate clean
+.PHONY: all test check-msvc tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch amalgamate check-amalgamate clean

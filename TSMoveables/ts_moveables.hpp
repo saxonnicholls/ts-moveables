@@ -12,6 +12,7 @@
 #ifndef ts_moveables_hpp
 #define ts_moveables_hpp
 
+#include "version.hpp"                      // IWYU pragma: export
 #include "moveable/atomic.hpp"              // IWYU pragma: export
 #include "moveable/mutex.hpp"               // IWYU pragma: export
 #include "moveable/spin_lock.hpp"           // IWYU pragma: export

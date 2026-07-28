@@ -351,11 +351,25 @@ The library exports the interface target `snicholls::ts_moveables`, which carrie
 include(FetchContent)
 FetchContent_Declare(ts_moveables
     GIT_REPOSITORY https://github.com/saxonnicholls/ts-moveables.git
-    GIT_TAG main)
+    GIT_TAG v1.0.0)
 FetchContent_MakeAvailable(ts_moveables)
 
 target_link_libraries(my_app PRIVATE snicholls::ts_moveables)
 ```
+
+### Which version am I compiling against?
+
+`find_package` answers that for CMake users, but the pitch above is "copy one file" — and someone who dropped `single_include/ts_moveables.hpp` into a tree with no build system has no CMake to ask. So the version is in the headers too, and travels with the amalgamated file:
+
+```cpp
+#if SNICHOLLS_VERSION >= SNICHOLLS_VERSION_CHECK(1, 1, 0)
+    // something that only exists from 1.1 onwards
+#endif
+
+std::cout << snicholls::version_string();      // "1.0.0", constexpr
+```
+
+That number, the `project(... VERSION)` in CMakeLists, and the git tag are three copies of one fact, so `make check-version` compares them and CI runs it on every job — including on the release tag itself. Three places holding the same number is exactly how a number goes quietly wrong.
 
 `add_subdirectory` works the same way. Or build, test and install it system-wide:
 
