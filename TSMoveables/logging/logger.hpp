@@ -172,6 +172,22 @@ struct record {
     std::string logger;                     // channel name
     std::string message;
     std::vector<std::pair<std::string, std::string>> fields;   // structured extras
+
+    // A metric is a record with a number, distinguished by a bool - not a
+    // separate type, and not a variant. That is a deliberate choice, so here
+    // is what it buys and what it costs.
+    //
+    // Telemetry riding the same pipeline is the whole point: a counter reaches
+    // every sink, lane, ordering window and drop policy that already exists,
+    // and a metrics sink is an ordinary slot. Separate types would mean two
+    // signals to connect, two sets of lanes to configure, and a sink author
+    // choosing which pipeline to join. A variant would put a visit in front of
+    // every sink to save the same 16 bytes.
+    //
+    // The cost is honest and small: every log record carries a double and a
+    // bool it does not use, and a sink that cares must ask. Against a record
+    // that already owns two std::strings and a vector, that is noise - and the
+    // alternative spends API surface, which is the expensive kind.
     double value = 0.0;                     // telemetry payload
     bool is_metric = false;
 };
@@ -180,6 +196,19 @@ struct record {
 // alternative is letting a slow sink stall a producer, and a logger that can
 // stall the program it is observing is a liability. Drops are counted.
 enum class overflow { drop_newest, drop_oldest, block };
+
+// Which drop, though - since a default is a decision, and this one was made
+// deliberately rather than by declaration order.
+//
+// The question is which end of a burst is worth more.
+// For a *log* it is the older end: an incident is diagnosed from the records
+// around where things first went wrong, and those are the ones already in the
+// queue when the burst starts. Dropping the oldest to make room for the newest
+// throws away the beginning of the story to keep its aftermath.
+//
+// `drop_oldest` is exactly right for a live view - an operator wants where the
+// aircraft *is*, not a backlog of where it was - which is why the drone demo's
+// stream lane chooses it. That is a per-lane call, and each lane makes it.
 
 // One lane's settings. Each lane chooses independently, which is the point:
 // the audit lane can block rather than lose a line while the dashboard lane
