@@ -81,8 +81,17 @@
 
 #include <mbedtls/build_info.h>                 // 3.x only; 2.x calls this version.h
 
+// 3.x exactly, and both bounds are load-bearing - the versions the two major
+// platforms ship by default sit on either side of it. Ubuntu 24.04 packages
+// 2.28 LTS, which has no build_info.h at all; Homebrew now pours 4.x, which
+// moved the RNG out to TF-PSA-Crypto, so <mbedtls/ctr_drbg.h> simply does not
+// exist there. Without the upper bound 4.x passes this check and then fails
+// four includes later with a missing header, which reads like a broken install
+// rather than an unsupported version. Pin 3.6.x - CI does.
 #if MBEDTLS_VERSION_MAJOR < 3
-#error "tls_mbedtls.hpp requires mbedTLS 3.x - the 2.x API differs in ways this file does not paper over"
+#error "tls/mbedtls.hpp requires mbedTLS 3.x - the 2.x API differs in ways this file does not paper over"
+#elif MBEDTLS_VERSION_MAJOR > 3
+#error "tls/mbedtls.hpp requires mbedTLS 3.x - 4.x moved the RNG and PK APIs to TF-PSA-Crypto, which this file does not yet target"
 #endif
 
 #include <mbedtls/ctr_drbg.h>

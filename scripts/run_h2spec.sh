@@ -33,6 +33,12 @@ mkdir -p "$outdir"
 
 # ---------------------------------------------------------------- the runner
 # A native h2spec if one is on PATH, otherwise the official Docker image.
+#
+# The image is pinned. "147 of 147" is a claim about a specific grader, and an
+# unpinned :latest means the next run grades against something else and the
+# number in the README quietly stops meaning what it said. Override to try a
+# newer one deliberately: H2SPEC_IMAGE=summerwind/h2spec:2.6.0 ./scripts/...
+H2SPEC_IMAGE="${H2SPEC_IMAGE:-summerwind/h2spec:2.6.0}"
 h2spec="${H2SPEC:-$(command -v h2spec 2>/dev/null || true)}"
 mode="native"
 if [ -z "$h2spec" ] || [ ! -x "$h2spec" ]; then
@@ -84,11 +90,11 @@ if [ "$mode" = "native" ]; then
     "$h2spec" "${args[@]}" >"$outdir/h2spec.log" 2>&1
     rc=$?
 elif [ "$(uname -s)" = "Linux" ]; then
-    docker run --rm --network host summerwind/h2spec "${args[@]}" \
+    docker run --rm --network host "$H2SPEC_IMAGE" "${args[@]}" \
         >"$outdir/h2spec.log" 2>&1
     rc=$?
 else
-    docker run --rm summerwind/h2spec "${args[@]}" \
+    docker run --rm "$H2SPEC_IMAGE" "${args[@]}" \
         >"$outdir/h2spec.log" 2>&1
     rc=$?
 fi
@@ -100,7 +106,7 @@ fi
 if [ "$mode" = "docker" ] && [ "$rc" -ne 0 ]; then
     if grep -qiE "no matching manifest|not match the detected host|exec format error|Cannot connect to the Docker daemon" \
             "$outdir/h2spec.log" 2>/dev/null; then
-        echo "error: summerwind/h2spec has no runnable image for $(uname -m)." >&2
+        echo "error: $H2SPEC_IMAGE has no runnable image for $(uname -m)." >&2
         echo "       Run the conformance suite on x86-64, or install h2spec natively" >&2
         echo "       and point H2SPEC at it. This is a missing grader, not a failure." >&2
         exit 2

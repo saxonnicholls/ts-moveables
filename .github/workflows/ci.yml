@@ -6,6 +6,16 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Third-party versions are pinned here, by version *and* checksum, so a CI run
+# is reproducible and an upstream change cannot silently alter what was graded.
+env:
+  # 3.6.x LTS. Both bounds matter: Ubuntu 24.04 packages 2.28 (no build_info.h)
+  # and Homebrew now pours 4.x (RNG moved to TF-PSA-Crypto), so "install the
+  # system package" means a different, and on both platforms unbuildable,
+  # library on each runner. See the version guard in TSMoveables/tls/mbedtls.hpp.
+  MBEDTLS_VERSION: "3.6.4"
+  MBEDTLS_SHA256: "ec35b18a6c593cf98c3e30db8b98ff93e8940a8c4e690e66b41dfc011d678110"
+
 jobs:
   build-and-test:
     name: ${{ matrix.name }}
@@ -106,18 +116,34 @@ jobs:
       # mbedTLS backend shipped without CI ever once compiling it. check-mbedtls
       # fails the job instead, so "the backend is a run-time choice" stays an
       # observation rather than a claim.
-      - name: Install mbedTLS
+      - name: Cache mbedTLS ${{ env.MBEDTLS_VERSION }}
+        id: cache-mbedtls
+        uses: actions/cache@v4
+        with:
+          path: ~/mbedtls-install
+          key: mbedtls-${{ env.MBEDTLS_VERSION }}-${{ matrix.os }}-${{ matrix.cxx }}
+
+      - name: Build mbedTLS ${{ env.MBEDTLS_VERSION }}
+        if: steps.cache-mbedtls.outputs.cache-hit != 'true'
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y libmbedtls-dev
-          else
-            brew install mbedtls
-          fi
+          set -euo pipefail
+          url="https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2"
+          curl -fsSL -o mbedtls.tar.bz2 "$url"
+          # Verify before unpacking: a pinned version with an unverified
+          # download is a version number, not a pin
+          echo "${MBEDTLS_SHA256}  mbedtls.tar.bz2" | shasum -a 256 -c -
+          tar xf mbedtls.tar.bz2
+          cmake -S "mbedtls-${MBEDTLS_VERSION}" -B mbedtls-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTING=Off -DENABLE_PROGRAMS=Off \
+            -DCMAKE_INSTALL_PREFIX="$HOME/mbedtls-install"
+          cmake --build mbedtls-build -j
+          cmake --install mbedtls-build
 
       - name: TLS tests (OpenSSL and mbedTLS)
         run: |
-          make check-mbedtls
-          make test-tls CXX=${{ matrix.cxx }} STD=c++20
+          make check-mbedtls MBEDTLS_PREFIX="$HOME/mbedtls-install"
+          make test-tls CXX=${{ matrix.cxx }} STD=c++20 MBEDTLS_PREFIX="$HOME/mbedtls-install"
 
       # The single-file drop-in must build, run, and match the source headers -
       # a stale committed amalgamation is a broken promise, so fail on drift

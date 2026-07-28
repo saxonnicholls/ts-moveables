@@ -582,7 +582,7 @@ srv.get("/chat", snicholls::http::websocket_route([](auto ws) {
 }));
 ```
 
-**Graded by [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite), the external RFC 6455 conformance suite — `make autobahn`:**
+**Graded by [Autobahn|Testsuite](https://github.com/crossbario/autobahn-testsuite) `25.10.1`, the external RFC 6455 conformance suite — `make autobahn`:**
 
 | Result | Cases |
 |---|---|
@@ -696,7 +696,7 @@ Linux, 4-core CI runner, GCC:
 
 macOS, 32-core laptop, Apple Clang — measured on an idle machine after the request-path work:
 
-| Scenario | ts-moveables (**1 thread**) | cpp-httplib (as shipped) | cpp-httplib (tuned) |
+| Scenario | ts-moveables (**1 thread**) | cpp-httplib `v0.51.0` (as shipped) | cpp-httplib `v0.51.0` (tuned) |
 |---|---|---|---|
 | keep-alive, 16 connections | **~104,000 req/s** | ~11,300 req/s | ~11,700 req/s |
 | keep-alive, 256 connections | **~108,000 req/s** | ~7,200 req/s | ~7,200 req/s |
@@ -767,7 +767,7 @@ snicholls::http::server srv;
 snicholls::http::enable_http2(srv);        // h2 by ALPN, h2c by prior knowledge
 ```
 
-**Graded by [h2spec](https://github.com/summerwind/h2spec) — `make h2spec`: 147 tests, 147 passed, 0 failed.** Framing, HPACK, the stream state machine, bidirectional flow control, and the abuse limits from the start rather than after the first incident: header-list caps against HPACK bombs, concurrent-stream bounds, and RST/SETTINGS rate limits for the 2023 Rapid Reset class.
+**Graded by [h2spec](https://github.com/summerwind/h2spec) `2.6.0` — `make h2spec`: 147 tests, 147 passed, 0 failed.** Framing, HPACK, the stream state machine, bidirectional flow control, and the abuse limits from the start rather than after the first incident: header-list caps against HPACK bombs, concurrent-stream bounds, and RST/SETTINGS rate limits for the 2023 Rapid Reset class.
 
 Two things worth pulling out.
 
@@ -832,6 +832,8 @@ This is the **one opt-in part of the library** — the only file that needs a th
 **There are two backends**, because one implementation behind an interface proves nothing: OpenSSL and mbedTLS, one test binary, and every test body run against both — 12 tests, 6 per backend. The interface needed no change to fit the second one, which is the only evidence worth having that it was an interface rather than a description of OpenSSL.
 
 Both are built in CI, and that is a deliberately recent correction. The Makefile compiles the mbedTLS backend out when its headers are absent and the suite reports that half skipped — which reads as a pass. CI never installed mbedTLS, so those 537 lines shipped without any automated system ever compiling them. `make check-mbedtls` now fails the job rather than letting the absence look like success.
+
+**mbedTLS 3.x specifically, and the bounds are the interesting part.** Ubuntu 24.04 packages 2.28 LTS, which has no `build_info.h` at all; Homebrew now pours 4.x, which moved the RNG out to TF-PSA-Crypto so `<mbedtls/ctr_drbg.h>` does not exist. The two platforms ship versions on either side of what this backend supports, so "install the system package" gets you a different and unbuildable library on each. CI builds **3.6.4** from the release tarball, pinned by version *and* SHA-256, and the header refuses 2.x and 4.x at compile time with a message that says which — rather than failing four includes later on a missing file, which reads like a broken install instead of an unsupported version.
 
 ## The bigger picture: the host side of accelerated systems
 

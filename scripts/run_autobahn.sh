@@ -33,6 +33,11 @@ mkdir -p "$outdir"
 
 # ---------------------------------------------------------------- the runner
 # A native wstest if one is on PATH, otherwise the official Docker image.
+#
+# The image is pinned, for the same reason h2spec's is: "517 of 517" is a claim
+# about a specific grader, and an unpinned :latest means a later run grades
+# against something else while the README still quotes the old number.
+AUTOBAHN_IMAGE="${AUTOBAHN_IMAGE:-crossbario/autobahn-testsuite:25.10.1}"
 # Note: the PyPI `autobahntestsuite` package is a Python 2 codebase and does
 # not import under Python 3, so Docker is the practical route in 2026.
 wstest="${WSTEST:-$(command -v wstest 2>/dev/null || true)}"
@@ -94,14 +99,14 @@ if [ "$mode" = "native" ]; then
 elif [ "$(uname -s)" = "Linux" ]; then
     docker run --rm --network host \
         -v "$outdir:/config" -v "$outdir:/reports" \
-        crossbario/autobahn-testsuite \
+        "$AUTOBAHN_IMAGE" \
         wstest --mode fuzzingclient --spec /config/fuzzingclient.json \
         >"$outdir/wstest.log" 2>&1
     docker_rc=$?
 else
     docker run --rm \
         -v "$outdir:/config" -v "$outdir:/reports" \
-        crossbario/autobahn-testsuite \
+        "$AUTOBAHN_IMAGE" \
         wstest --mode fuzzingclient --spec /config/fuzzingclient.json \
         >"$outdir/wstest.log" 2>&1
     docker_rc=$?
@@ -114,7 +119,7 @@ fi
 if [ "$mode" = "docker" ] && [ "${docker_rc:-0}" -ne 0 ]; then
     if grep -qiE "no matching manifest|not match the detected host|exec format error" \
             "$outdir/wstest.log" 2>/dev/null; then
-        echo "error: crossbario/autobahn-testsuite has no image for $(uname -m)." >&2
+        echo "error: $AUTOBAHN_IMAGE has no image for $(uname -m)." >&2
         echo "       Run the conformance suite on x86-64, or install wstest natively" >&2
         echo "       and point WSTEST at it. This is a missing grader, not a failure." >&2
         exit 2
