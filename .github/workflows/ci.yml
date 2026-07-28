@@ -98,9 +98,26 @@ jobs:
           ./scripts/run_autobahn.sh
 
       # TLS is the one opt-in part of the library; it links OpenSSL, so it
-      # builds and runs on its own rather than inside the dependency-free suite
-      - name: TLS tests (OpenSSL)
-        run: make test-tls CXX=${{ matrix.cxx }} STD=c++20
+      # builds and runs on its own rather than inside the dependency-free suite.
+      #
+      # mbedTLS is installed here rather than left to chance. The Makefile
+      # compiles that backend out when its headers are absent and the suite
+      # reports its half skipped - which looks like a pass, and is how the
+      # mbedTLS backend shipped without CI ever once compiling it. check-mbedtls
+      # fails the job instead, so "the backend is a run-time choice" stays an
+      # observation rather than a claim.
+      - name: Install mbedTLS
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y libmbedtls-dev
+          else
+            brew install mbedtls
+          fi
+
+      - name: TLS tests (OpenSSL and mbedTLS)
+        run: |
+          make check-mbedtls
+          make test-tls CXX=${{ matrix.cxx }} STD=c++20
 
       # The single-file drop-in must build, run, and match the source headers -
       # a stale committed amalgamation is a broken promise, so fail on drift

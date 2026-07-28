@@ -348,7 +348,7 @@ cmake --install build-cmake                        # then: find_package(ts_movea
 
 However the library arrives — vendored, fetched or installed — `#include "ts_moveables.hpp"` is the same.
 
-CI runs the test suite on every push across Linux (x86-64 and ARM64, GCC and Clang), macOS (Apple Silicon and Intel, Apple Clang), and Windows (MSVC), in both C++17 and C++20, with ThreadSanitizer on every POSIX platform and Address + UB Sanitizers on Linux.
+CI runs the test suite on every push across Linux (x86-64 and ARM64, GCC and Clang), macOS (Apple Silicon and Intel, Apple Clang), and Windows (MSVC), in both C++17 and C++20, with ThreadSanitizer on every POSIX platform and Address + UB Sanitizers on Linux. Both TLS backends are built and run on every POSIX job, and a missing mbedTLS fails the job rather than quietly compiling itself out.
 
 ### About ThreadSanitizer
 
@@ -827,7 +827,11 @@ srv.listen("0.0.0.0", 8443);
 
 The engine is deliberately **transport-agnostic**: OpenSSL is driven through a pair of memory BIOs, so it never sees a socket, never calls `read()` or `write()`, and never blocks. The reactor keeps all I/O; this is a byte transformer with a handshake. Three things follow, and they are the whole argument for the shape — every backend becomes testable without a network; the `WANT_READ`/`WANT_WRITE` dance is explicit rather than buried in a blocking call, which is what makes non-blocking TLS tractable at all; and **nothing above knows TLS exists**. ALPN is negotiated and reported here too, because that is the selector a later phase uses to choose between h2 and http/1.1 per connection.
 
-This is the **one opt-in part of the library** — the only file that needs a third party. Nothing includes it unless you do, `make test-tls` builds and runs it separately, and the core keeps its no-dependencies promise. A second backend (BoringSSL, wolfSSL or mbedTLS) is owed, because one implementation behind an interface proves nothing.
+This is the **one opt-in part of the library** — the only file that needs a third party. Nothing includes it unless you do, `make test-tls` builds and runs it separately, and the core keeps its no-dependencies promise.
+
+**There are two backends**, because one implementation behind an interface proves nothing: OpenSSL and mbedTLS, one test binary, and every test body run against both — 12 tests, 6 per backend. The interface needed no change to fit the second one, which is the only evidence worth having that it was an interface rather than a description of OpenSSL.
+
+Both are built in CI, and that is a deliberately recent correction. The Makefile compiles the mbedTLS backend out when its headers are absent and the suite reports that half skipped — which reads as a pass. CI never installed mbedTLS, so those 537 lines shipped without any automated system ever compiling them. `make check-mbedtls` now fails the job rather than letting the absence look like success.
 
 ## The bigger picture: the host side of accelerated systems
 

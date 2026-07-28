@@ -109,6 +109,24 @@ MBEDTLS_PREFIX ?= $(shell brew --prefix mbedtls 2>/dev/null || echo /usr)
 ifneq ($(wildcard $(MBEDTLS_PREFIX)/include/mbedtls/build_info.h),)
   MBEDTLS_CPPFLAGS := -DSNICHOLLS_TEST_MBEDTLS -I$(MBEDTLS_PREFIX)/include
   MBEDTLS_LDLIBS   := -L$(MBEDTLS_PREFIX)/lib -lmbedtls -lmbedx509 -lmbedcrypto
+  MBEDTLS_FOUND    := 1
+else
+  MBEDTLS_FOUND    := 0
+endif
+
+# Optional locally, mandatory in CI, and the difference has to be enforced.
+# A second backend that is quietly not compiled is not a second backend - the
+# absence reads as a pass, which is how 537 lines of it went a whole release
+# cycle without any automated system ever building them. CI runs this first.
+check-mbedtls:
+ifeq ($(MBEDTLS_FOUND),1)
+	@echo "mbedTLS: found at $(MBEDTLS_PREFIX)"
+else
+	@echo "mbedTLS: NOT found at $(MBEDTLS_PREFIX)/include/mbedtls/build_info.h"
+	@echo "  the mbedTLS backend would be compiled out and its half of the"
+	@echo "  suite would report itself skipped - which is not a pass."
+	@echo "  Linux: sudo apt-get install -y libmbedtls-dev   macOS: brew install mbedtls"
+	@exit 1
 endif
 
 build/tests_tls: tests/tls/tests_tls.cpp $(HEADERS) | build
@@ -117,6 +135,7 @@ build/tests_tls: tests/tls/tests_tls.cpp $(HEADERS) | build
 	    -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto $(MBEDTLS_LDLIBS) $(LDLIBS)
 
 test-tls: build/tests_tls
+	@echo "backends compiled: openssl$(if $(filter 1,$(MBEDTLS_FOUND)), + mbedtls, ONLY - mbedTLS absent)"
 	./build/tests_tls
 
 # Autobahn|Testsuite - the external RFC 6455 grader. The echo server is ours;
@@ -222,4 +241,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-replay demo-drones test-tls autobahn h2spec bench-http bench-scale bench-request bench-dispatch amalgamate check-amalgamate clean
+.PHONY: all test check-msvc tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-replay demo-drones test-tls check-mbedtls autobahn h2spec bench-http bench-scale bench-request bench-dispatch amalgamate check-amalgamate clean
