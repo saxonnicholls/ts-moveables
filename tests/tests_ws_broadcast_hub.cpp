@@ -393,7 +393,13 @@ void test_hub_direct_publish_api()
     assert(c.read_data_frame(got));
     assert(contains(got, "\"payload\":\"direct\""));
 
-    auto st = s.hub.snapshot();
+    // `delivered` is incremented AFTER the frame is handed to the socket, so
+    // reading the frame does not imply the counter has moved yet - the loop
+    // thread can be preempted between the send and the fetch_add. Asserting it
+    // directly passes on a quiet machine and fails under TSan, which is exactly
+    // where it did fail. Wait for it rather than race it.
+    assert(spin_until_for([&] { return s.hub.snapshot().delivered >= 1; }));
+    const auto st = s.hub.snapshot();
     assert(st.published >= 1);
     assert(st.delivered >= 1);
 
