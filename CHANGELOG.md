@@ -7,6 +7,73 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Added
+
+- `websocket_client` (`http/websocket_client.hpp`) — the **outbound** half of
+  WebSocket, which is what makes the broadcast hub a *relay*: N upstream feeds
+  in, one fan-out core, M browsers out, on one reactor. Auto-reconnect is the
+  default, with exponential backoff and **full jitter** (undithered backoff
+  resynchronises a fleet of relays into a thundering herd when a feed restarts),
+  and the backoff counter is forgiven only by a session that outlives
+  `session_grace` — connecting is not the same as working, and a server that
+  accepts then drops must not reset the delay every attempt. `close()` is final,
+  so shutdown never races the retry timer. RFC 6455 at this end: client frames
+  are masked with a fresh key per frame (§5.3), a masked *inbound* frame fails
+  the connection (§5.1), and `Sec-WebSocket-Accept` is verified rather than
+  assumed — a plain `200 OK` is not an upgrade, and there is a test that says so.
+  Survivability is tested by killing the upstream and requiring the client to
+  come back on its own.
+
+- `intern_pool<T, Hash, Eq>` (`concurrent/intern_pool.hpp`) — content-addressed
+  interning ("hash-consing"): identical values collapse to a single shared,
+  immutable instance, so equal data is stored once and compared by pointer.
+  Self-cleaning via weak references (memory bounded by the live working set, not
+  history), collision-safe (the hash selects a bucket, an exact `Eq` compare is
+  the authority — distinct values never alias), and thread-safe. `find()` probes
+  without allocating; `snapshot()` reports interned / hits / live.
+- `ws_broadcast_hub::ingest_handler(topic)` — a fixed-topic ingest handler, so
+  several independent webhook endpoints can run on one server
+  (`srv.post("/hook1", hub.ingest_handler("hook1"))`, `"/hook2"`, …), each
+  feeding its own topic and the wildcard firehose.
+- `websocket::send_text_shared(shared_ptr<const std::string>)` — fan a single
+  immutable payload out to many sockets without copying it into each send.
+
+### Changed
+
+- **`ws_broadcast_hub` fan-out no longer copies the frame per subscriber.** Each
+  subscriber queue and the replay ring now hold a `shared_ptr<const std::string>`
+  to one framed message instead of a private copy, and the pump uses
+  `send_text_shared`. Publish cost stops scaling with payload × subscribers:
+  in an isolated fan-out benchmark, ~6× faster at small frames and up to ~87×
+  faster at 8 KB × 1000 subscribers (where it previously spent ~2 ms per publish
+  purely copying). Behaviour is unchanged; only the copies are gone.
+- **`intern_pool` is now moveable.** It shipped non-movable on the reasoning that
+  "identity is the point" — which holds for *copy*, since two pools would fork
+  the identity domain and `a == b` would stop implying `ptr_a == ptr_b`, but not
+  for *move*, which relocates the one pool while every `shared_ptr<const T>`
+  already handed out stays valid and canonical. A component of this library that
+  could not be a member of a moveable object was arguing against the library's
+  own thesis. It now holds a `moveable_mutex`, so the move is checked rather
+  than trusted: moving a pool out from under a thread inside `intern()` throws
+  instead of being undefined.
+- The helpers shared out of the logger and the hub live in **`snicholls::utils`**,
+  not `snicholls::detail`. The latter collided: any translation unit with both
+  `using namespace snicholls;` and `using namespace snicholls::http;` — which
+  every benchmark and demo here has — then saw two `detail` namespaces and every
+  mention of one became ambiguous.
+
+### Fixed
+
+- `tests/tests_intern_pool.cpp` was missing from `CMakeLists.txt`, so the three
+  CMake CI jobs would have failed at **link** time on the missing
+  `run_intern_pool_tests()` symbol while `make test` (which globs) stayed green.
+  Added, plus `scripts/check_test_registry.py` — run by `make check-tests` and on
+  every CI job — so the list and the directory cannot drift apart again. It
+  checks both directions: a file listed but deleted breaks `cmake` configure for
+  everyone who clones.
+
 ## [1.0.0] — 2026-07-29
 
 First tagged release. The library has been in development since 2010; this is

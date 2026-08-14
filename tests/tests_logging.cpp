@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -212,6 +213,52 @@ void test_log_json_and_metrics()
     pass("logging: JSON escaping, structured fields, telemetry on the same pipe");
 }
 
+// The escaper is shared by the JSON sink and the WebSocket broadcast hub, and
+// it got that way because both had written their own and the two had drifted.
+// Testing it directly is what stops that happening again: the logger's copy
+// was only ever exercised through a JSON sink test that used " and \, so the
+// difference in how the two handled \b and \f never showed up.
+void test_json_escape()
+{
+    auto esc = [](std::string_view in) {
+        std::string out;
+        snicholls::utils::json_escape(in, out);
+        return out;
+    };
+
+    // The two escapes RFC 8259 requires
+    assert(esc("say \"hi\"") == "say \\\"hi\\\"");
+    assert(esc("a\\b") == "a\\\\b");
+
+    // All five short forms, including the two that had drifted
+    assert(esc("\b") == "\\b");
+    assert(esc("\f") == "\\f");
+    assert(esc("\n") == "\\n");
+    assert(esc("\r") == "\\r");
+    assert(esc("\t") == "\\t");
+
+    // Remaining C0 controls take the \uXXXX form, lower-case hex, four digits
+    assert(esc(std::string(1, '\x01')) == "\\u0001");
+    assert(esc(std::string(1, '\x1f')) == "\\u001f");
+
+    // 0x20 is the first byte that passes through, and DEL is not a C0 control
+    assert(esc(" ") == " ");
+    assert(esc(std::string(1, '\x7f')) == "\x7f");
+
+    // UTF-8 survives byte for byte. This is the case that breaks if the loop
+    // iterates over a signed char: every continuation byte would compare as
+    // negative, land under 0x20, and get mangled into \uXXXX.
+    const std::string utf8 = "\xE2\x9C\x93 caf\xC3\xA9";       // "checkmark cafe"
+    assert(esc(utf8) == utf8);
+
+    // Appends rather than replaces - the hub builds a frame in one buffer
+    std::string acc = "{\"m\":\"";
+    snicholls::utils::json_escape("a\nb", acc);
+    assert(acc == "{\"m\":\"a\\nb");
+
+    pass("json_escape: RFC 8259 escapes, UTF-8 passthrough, appends");
+}
+
 void test_log_nothing_lost_at_shutdown()
 {
     std::atomic<int> seen{0};
@@ -261,6 +308,7 @@ void run_logging_tests()
     test_log_lanes_are_independent();
     test_log_overflow_counted();
     test_log_json_and_metrics();
+    test_json_escape();
     test_log_nothing_lost_at_shutdown();
     test_log_moveable();
 }

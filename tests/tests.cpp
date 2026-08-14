@@ -24,6 +24,8 @@
 // Defined in the per-area test translation units
 void run_synchronized_tests();
 void run_circular_buffer_tests();
+void run_intern_pool_tests();
+void run_websocket_client_tests();
 void run_disruptor_tests();
 void run_signal_tests();
 void run_mpmc_queue_tests();
@@ -31,6 +33,7 @@ void run_thread_pool_tests();
 void run_event_loop_tests();
 void run_http_server_tests();
 void run_websocket_tests();
+void run_ws_broadcast_hub_tests();
 void run_ws_deflate_tests();
 void run_logging_tests();
 void run_http2_tests();
@@ -854,6 +857,8 @@ int main()
 
     run_synchronized_tests();
     run_circular_buffer_tests();
+    run_intern_pool_tests();
+    run_websocket_client_tests();
     run_disruptor_tests();
     run_signal_tests();
     run_mpmc_queue_tests();
@@ -861,6 +866,7 @@ int main()
     run_event_loop_tests();
     run_http_server_tests();
     run_websocket_tests();
+    run_ws_broadcast_hub_tests();
     run_ws_deflate_tests();
     run_logging_tests();
     run_http2_tests();

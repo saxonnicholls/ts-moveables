@@ -85,9 +85,17 @@ demo-replay: build/replay_loop_demo
 build/http_server_demo: demos/http_server_demo.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/http_server_demo.cpp -o $@ $(LDLIBS)
 
+build/webhook_ws_hub_demo: demos/webhook_ws_hub_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/webhook_ws_hub_demo.cpp -o $@ $(LDLIBS)
+
 # A static check for the one MSVC rule this repository keeps tripping over
 check-msvc:
 	python3 scripts/check_msvc_capture.py
+
+# Every tests/tests_*.cpp must be listed in CMakeLists.txt, or the CMake jobs
+# fail at link time while `make test` stays green. Checked, not remembered.
+check-tests:
+	python3 scripts/check_test_registry.py
 
 # The version is written down in version.hpp, CMakeLists.txt and the git tag.
 # One release, one number - checked rather than remembered.
@@ -197,6 +205,16 @@ demo-timemaster: build/time_master_demo
 demo-http: build/http_server_demo
 	./build/http_server_demo
 
+demo-webhook: build/webhook_ws_hub_demo
+	./build/webhook_ws_hub_demo
+
+build/ws_hub_broadcast: benchmarks/ws_hub_broadcast.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    benchmarks/ws_hub_broadcast.cpp -o $@ $(LDLIBS)
+
+bench-wshub: build/ws_hub_broadcast
+	./build/ws_hub_broadcast
+
 # Head to head vs cpp-httplib. Fetches their header on demand into
 # benchmarks/third_party/ (gitignored) - the library stays dependency-free.
 build/http_compare: benchmarks/http_compare.cpp $(HEADERS) | build
@@ -214,6 +232,7 @@ build/http_scale: benchmarks/http_scale.cpp $(HEADERS) | build
 
 bench-scale: build/http_scale
 	./build/http_scale
+
 
 # What one request costs in CPU alone - no sockets, no loop, no kernel
 build/http_request_path: benchmarks/http_request_path.cpp $(HEADERS) | build
@@ -246,4 +265,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch amalgamate check-amalgamate clean
+.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub amalgamate check-amalgamate clean

@@ -1,0 +1,465 @@
+//
+//  tests_ws_broadcast_hub.cpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - unit tests for the webhook -> WebSocket broadcast hub
+//
+//  A real server on loopback, driven by a hand-rolled WebSocket client (to
+//  receive) and a blocking HTTP client (to POST into the ingest side). The
+//  claims under test: fan-out reaches every subscriber, a topic isolates its
+//  subscribers from other topics, the wildcard sees everything, replay-on-
+//  connect hands a fresh client the recent history in order, a graceful close
+//  unsubscribes, the direct publish() API works, raw framing passes bytes
+//  through untouched, and the per-connection queue is bounded (oldest-dropped)
+//  under backpressure.
+//
+
+#include "test_helpers.hpp"
+
+#include "../TSMoveables/http/ws_broadcast_hub.hpp"
+
+#if SNICHOLLS_HAS_WS_BROADCAST_HUB
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+using namespace snicholls;
+using namespace snicholls::http;
+using namespace std::chrono_literals;
+
+namespace {
+
+// ------------------------------------------------------------- a ws client
+// The same minimal RFC 6455 client the websocket tests use: masks its frames,
+// reads unmasked server frames, and reassembles nothing beyond one frame.
+
+class ws_client {
+public:
+    bool connect_to(std::uint16_t port, const char* path)
+    {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        assert(fd_ >= 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::connect(fd_, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0)
+            return false;
+        const int on = 1;
+        ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+        timeval tv{};
+        tv.tv_sec = 5;
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+        const std::string req =
+            std::string("GET ") + path + " HTTP/1.1\r\nHost: t\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n";
+        send_raw(req);
+
+        std::string head;
+        while (head.find("\r\n\r\n") == std::string::npos) {
+            char t[1024];
+            const ssize_t n = ::recv(fd_, t, sizeof t, 0);
+            if (n <= 0)
+                return false;
+            head.append(t, std::size_t(n));
+        }
+        const std::size_t end = head.find("\r\n\r\n") + 4;
+        buf_.assign(head, end, std::string::npos);
+        status_ = std::atoi(head.c_str() + 9);
+        return true;
+    }
+
+    ~ws_client() { close(); }
+    ws_client() = default;
+    ws_client(ws_client&& o) noexcept : fd_(o.fd_), status_(o.status_), buf_(std::move(o.buf_)) { o.fd_ = -1; }
+    ws_client(const ws_client&) = delete;
+    ws_client& operator=(const ws_client&) = delete;
+
+    void close()
+    {
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    }
+
+    int status() const noexcept { return status_; }
+
+    void send_raw(const std::string& s)
+    {
+        std::size_t off = 0;
+        while (off < s.size()) {
+            const ssize_t n = ::send(fd_, s.data() + off, s.size() - off, 0);
+            if (n <= 0)
+                return;
+            off += std::size_t(n);
+        }
+    }
+
+    void send_frame(ws_opcode op, const std::string& payload, bool fin = true)
+    {
+        std::string f;
+        f.push_back(char((fin ? 0x80 : 0x00) | static_cast<std::uint8_t>(op)));
+        const std::size_t n = payload.size();
+        const char m = char(0x80);                      // client frames are masked
+        if (n < 126) {
+            f.push_back(char(m | char(n)));
+        } else if (n <= 0xFFFF) {
+            f.push_back(char(m | char(126)));
+            f.push_back(char((n >> 8) & 0xff));
+            f.push_back(char(n & 0xff));
+        } else {
+            f.push_back(char(m | char(127)));
+            for (int i = 7; i >= 0; --i)
+                f.push_back(char((std::uint64_t(n) >> (i * 8)) & 0xff));
+        }
+        const unsigned char key[4] = {0x37, 0xfa, 0x21, 0x3d};
+        for (int i = 0; i < 4; ++i)
+            f.push_back(char(key[i]));
+        for (std::size_t i = 0; i < n; ++i)
+            f.push_back(char(static_cast<unsigned char>(payload[i]) ^ key[i & 3]));
+        send_raw(f);
+    }
+
+    // Read one server frame; false on timeout/close
+    bool read_frame(ws_opcode& op, std::string& payload)
+    {
+        bool fin = false;
+        while (!parse(op, payload, fin)) {
+            char t[65536];
+            const ssize_t n = ::recv(fd_, t, sizeof t, 0);
+            if (n <= 0)
+                return false;
+            buf_.append(t, std::size_t(n));
+        }
+        return true;
+    }
+
+    // Read one data (text/binary) frame, skipping ping/pong/close control frames
+    bool read_data_frame(std::string& payload)
+    {
+        for (;;) {
+            ws_opcode op;
+            if (!read_frame(op, payload))
+                return false;
+            if (op == ws_opcode::text || op == ws_opcode::binary)
+                return true;
+            if (op == ws_opcode::close)
+                return false;
+        }
+    }
+
+private:
+    bool parse(ws_opcode& op, std::string& payload, bool& fin)
+    {
+        if (buf_.size() < 2)
+            return false;
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(buf_.data());
+        fin = (p[0] & 0x80) != 0;
+        op = static_cast<ws_opcode>(p[0] & 0x0f);
+        std::uint64_t len = p[1] & 0x7f;
+        std::size_t hdr = 2;
+        if (len == 126) {
+            if (buf_.size() < 4) return false;
+            len = (std::uint64_t(p[2]) << 8) | p[3];
+            hdr = 4;
+        } else if (len == 127) {
+            if (buf_.size() < 10) return false;
+            len = 0;
+            for (int i = 0; i < 8; ++i)
+                len = (len << 8) | p[2 + i];
+            hdr = 10;
+        }
+        if (buf_.size() < hdr + len)
+            return false;
+        payload.assign(buf_, hdr, std::size_t(len));
+        buf_.erase(0, hdr + std::size_t(len));
+        return true;
+    }
+
+    int fd_ = -1;
+    int status_ = 0;
+    std::string buf_;
+};
+
+// A one-shot blocking HTTP POST, returns the status code (or -1)
+int http_post(std::uint16_t port, const std::string& path, const std::string& body)
+{
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    std::string req = "POST " + path + " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
+                      "Content-Type: application/octet-stream\r\nContent-Length: " +
+                      std::to_string(body.size()) + "\r\n\r\n" + body;
+    std::size_t off = 0;
+    while (off < req.size()) {
+        const ssize_t n = ::send(fd, req.data() + off, req.size() - off, 0);
+        if (n <= 0) { ::close(fd); return -1; }
+        off += std::size_t(n);
+    }
+    std::string resp;
+    char t[4096];
+    for (;;) {
+        const ssize_t n = ::recv(fd, t, sizeof t, 0);
+        if (n <= 0)
+            break;
+        resp.append(t, std::size_t(n));
+        if (resp.find("\r\n\r\n") != std::string::npos)
+            break;
+    }
+    ::close(fd);
+    return resp.size() >= 12 ? std::atoi(resp.c_str() + 9) : -1;
+}
+
+// A hub mounted on a loopback server, torn down cleanly on destruction
+struct hub_server {
+    explicit hub_server(ws_broadcast_hub::config cfg = ws_broadcast_hub::config{})
+        : hub(std::move(cfg))
+    {
+        hub.mount(srv);
+        port = srv.listen("127.0.0.1", 0);
+        th = std::thread([this] { srv.run(); });
+        spin_until([this] { return srv.running(); });
+    }
+    ~hub_server()
+    {
+        srv.stop();
+        if (th.joinable())
+            th.join();
+    }
+
+    server            srv;
+    ws_broadcast_hub  hub;
+    std::uint16_t     port = 0;
+    std::thread       th;
+};
+
+bool contains(const std::string& hay, const std::string& needle)
+{
+    return hay.find(needle) != std::string::npos;
+}
+
+// ------------------------------------------------------------------- tests
+
+void test_hub_ingest_and_deliver()
+{
+    hub_server s;
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=alerts"));
+    assert(c.status() == 101);
+    spin_until([&] { return s.hub.subscribers() == 1; });
+
+    assert(http_post(s.port, "/ingest/alerts", "hello world") == 202);
+
+    std::string got;
+    assert(c.read_data_frame(got));
+    assert(contains(got, "\"topic\":\"alerts\""));
+    assert(contains(got, "\"payload\":\"hello world\""));
+    assert(contains(got, "\"seq\":1"));
+    assert(contains(got, "\"ts_ms\":"));
+
+    pass("ws_broadcast_hub: ingest a webhook, deliver a framed envelope");
+}
+
+void test_hub_topic_isolation()
+{
+    hub_server s;
+    ws_client alerts, news;
+    assert(alerts.connect_to(s.port, "/ws?topic=alerts"));
+    assert(news.connect_to(s.port, "/ws?topic=news"));
+    spin_until([&] { return s.hub.subscribers() == 2; });
+
+    assert(http_post(s.port, "/ingest/news", "breaking") == 202);
+
+    std::string got;
+    assert(news.read_data_frame(got));
+    assert(contains(got, "\"payload\":\"breaking\""));
+
+    // The alerts subscriber must not receive the news message. Prove it by
+    // posting to alerts and checking that is the FIRST thing it sees.
+    assert(http_post(s.port, "/ingest/alerts", "for-alerts") == 202);
+    std::string a;
+    assert(alerts.read_data_frame(a));
+    assert(contains(a, "\"payload\":\"for-alerts\""));
+    assert(!contains(a, "breaking"));
+
+    pass("ws_broadcast_hub: a topic isolates its subscribers");
+}
+
+void test_hub_wildcard_and_fanout()
+{
+    hub_server s;
+    ws_client star, a1, a2;
+    assert(star.connect_to(s.port, "/ws?topic=*"));     // firehose
+    assert(a1.connect_to(s.port, "/ws?topic=room"));
+    assert(a2.connect_to(s.port, "/ws?topic=room"));
+    spin_until([&] { return s.hub.subscribers() == 3; });
+
+    assert(http_post(s.port, "/ingest/room", "party") == 202);
+
+    std::string g1, g2, gs;
+    assert(a1.read_data_frame(g1));
+    assert(a2.read_data_frame(g2));
+    assert(star.read_data_frame(gs));
+    assert(contains(g1, "\"payload\":\"party\""));
+    assert(contains(g2, "\"payload\":\"party\""));
+    assert(contains(gs, "\"payload\":\"party\""));          // wildcard saw it too
+    assert(contains(gs, "\"topic\":\"room\""));
+
+    pass("ws_broadcast_hub: wildcard subscriber + fan-out to many");
+}
+
+void test_hub_replay_on_connect()
+{
+    hub_server s;
+    // Publish history BEFORE anyone is listening
+    assert(http_post(s.port, "/ingest/log", "first") == 202);
+    assert(http_post(s.port, "/ingest/log", "second") == 202);
+    assert(http_post(s.port, "/ingest/log", "third") == 202);
+
+    // A fresh client sees the recent history immediately, oldest first
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=log"));
+    std::string a, b, d;
+    assert(c.read_data_frame(a));
+    assert(c.read_data_frame(b));
+    assert(c.read_data_frame(d));
+    assert(contains(a, "\"payload\":\"first\""));
+    assert(contains(b, "\"payload\":\"second\""));
+    assert(contains(d, "\"payload\":\"third\""));
+
+    // ...and live messages continue in order after the replay
+    assert(http_post(s.port, "/ingest/log", "fourth") == 202);
+    std::string e;
+    assert(c.read_data_frame(e));
+    assert(contains(e, "\"payload\":\"fourth\""));
+
+    pass("ws_broadcast_hub: replay-on-connect, then live, in order");
+}
+
+void test_hub_unsubscribe_on_close()
+{
+    hub_server s;
+    {
+        ws_client c;
+        assert(c.connect_to(s.port, "/ws?topic=temp"));
+        spin_until([&] { return s.hub.subscribers() == 1; });
+        // Graceful close handshake
+        c.send_frame(ws_opcode::close, std::string("\x03\xe8", 2));   // 1000
+        ws_opcode op;
+        std::string ignored;
+        c.read_frame(op, ignored);                  // read the close echo back
+    }
+    // The graceful close unsubscribes us
+    assert(spin_until_for([&] { return s.hub.subscribers() == 0; }));
+
+    // Publishing to nobody is fine
+    assert(http_post(s.port, "/ingest/temp", "nobody home") == 202);
+
+    pass("ws_broadcast_hub: graceful close unsubscribes");
+}
+
+void test_hub_direct_publish_api()
+{
+    hub_server s;
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=api"));
+    spin_until([&] { return s.hub.subscribers() == 1; });
+
+    // publish() straight from this (foreign) thread; the mounted hub marshals
+    const std::size_t n = s.hub.publish("api", "direct");
+    assert(n == 1);
+
+    std::string got;
+    assert(c.read_data_frame(got));
+    assert(contains(got, "\"payload\":\"direct\""));
+
+    auto st = s.hub.snapshot();
+    assert(st.published >= 1);
+    assert(st.delivered >= 1);
+
+    pass("ws_broadcast_hub: direct publish() from a foreign thread");
+}
+
+void test_hub_raw_framing()
+{
+    ws_broadcast_hub::config cfg;
+    cfg.frame_mode = ws_broadcast_hub::framing::raw;    // payload verbatim, no envelope
+    hub_server s(cfg);
+
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=raw"));
+    spin_until([&] { return s.hub.subscribers() == 1; });
+
+    assert(http_post(s.port, "/ingest/raw", "just-the-bytes") == 202);
+    std::string got;
+    assert(c.read_data_frame(got));
+    assert(got == "just-the-bytes");                    // no envelope at all
+
+    pass("ws_broadcast_hub: raw framing passes payload through verbatim");
+}
+
+void test_hub_backpressure_bounded()
+{
+    // send_high_water 0 => the pump never hands a frame to the socket, so every
+    // publish piles into the per-connection queue. With a queue cap of 2, the
+    // oldest are dropped and the drop counter climbs - bounded, never unbounded.
+    ws_broadcast_hub::config cfg;
+    cfg.send_high_water = 0;
+    cfg.max_queue_msgs  = 2;
+    cfg.replay_on_connect = false;
+    hub_server s(cfg);
+
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=slow"));
+    spin_until([&] { return s.hub.subscribers() == 1; });
+
+    for (int i = 0; i < 10; ++i)
+        assert(http_post(s.port, "/ingest/slow", "m" + std::to_string(i)) == 202);
+
+    assert(spin_until_for([&] { return s.hub.snapshot().dropped >= 8; }));
+    auto st = s.hub.snapshot();
+    assert(st.published >= 10);
+    assert(st.dropped  >= 8);          // 10 queued, cap 2 => at least 8 trimmed
+
+    pass("ws_broadcast_hub: slow client is bounded, oldest dropped");
+}
+
+} // namespace
+
+void run_ws_broadcast_hub_tests()
+{
+    test_hub_ingest_and_deliver();
+    test_hub_topic_isolation();
+    test_hub_wildcard_and_fanout();
+    test_hub_replay_on_connect();
+    test_hub_unsubscribe_on_close();
+    test_hub_direct_publish_api();
+    test_hub_raw_framing();
+    test_hub_backpressure_bounded();
+}
+
+#else // !SNICHOLLS_HAS_WS_BROADCAST_HUB
+
+void run_ws_broadcast_hub_tests() {}
+
+#endif

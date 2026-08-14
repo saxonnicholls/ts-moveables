@@ -378,6 +378,77 @@ The structural expectation for the head-to-head was that a reactor holds the C10
 
 ---
 
+## 10. `ws_broadcast_hub` — webhook → WebSocket fan-out ✅ shipped
+
+**What.** A `webhook → WebSocket` broadcast hub on the reactor: POST endpoints
+publish messages in, topic-subscribed browsers receive them live, and a small
+per-topic ring replays recent history to whoever connects next. `mount()` wires
+`GET /ws?topic=..` plus `POST /ingest/:topic`; `ingest_handler("topic")` binds a
+fixed endpoint, so `POST /hook1`, `/hook2`, … each feed their own topic on one
+server. Topics are strings, payloads are bytes — the hub is domain-free.
+
+**The fix that made it fast.** Fan-out used to copy the framed message into every
+subscriber's queue (`std::deque<std::string>`), so a publish to N subscribers was
+N deep copies and N allocations. It now shares one immutable frame — the queues
+and the replay ring hold `shared_ptr<const std::string>`, and the pump uses
+`websocket::send_text_shared`. Publish cost is now flat in payload size: an
+isolated fan-out A/B measured ~6× at small frames and up to ~94× at 8 KB × 1000
+subscribers (where it previously spent ~2 ms per publish purely copying). ~44 M
+fan-out deliveries/s from one thread; end-to-end you then meet the kernel
+`send()` path, which is the real ceiling for remote subscribers.
+
+**`intern_pool` — the companion, placed deliberately.** Content-addressed
+interning ("identical data ⇒ one pointer") shipped as `concurrent/intern_pool.hpp`
+and is the right tool for collapsing repeats at an *ingress* boundary
+(idempotency, keyed by a short id). It is **not** wired into the publish hot path:
+a measured A/B showed hashing a full frame per publish costs more than the
+allocation a hit would save — even at 99 % duplication — so the hot-path win is
+the shared frame, not interning. Recorded so "just intern everything" meets the
+number that says don't.
+
+### Deferred — filed, not built (the hot path is fast enough for now)
+
+Each was assessed during the shared-frame work and deliberately parked; none is
+needed at the current scale.
+
+- **Encode the WebSocket wire frame once, share it.** After the JSON frame is
+  shared, the next per-subscriber cost is the WS frame encode in `send_frame`,
+  run once per subscriber. Server frames are unmasked, so when `permessage-deflate`
+  is *off* the encoded bytes are identical for everyone and could be encoded once
+  and shared (the per-socket `push_app` copy into each send buffer stays — each
+  socket owns its buffer). With deflate *on* the stream is per-connection stateful
+  and must stay per-subscriber. A second-order win, below the frame copy this work
+  removed.
+- **Batch the syscalls for remote fan-out.** The end-to-end ceiling is one
+  `send()` per subscriber. `io_uring` (with `IORING_OP_SEND_ZC` for zero-copy) or
+  `sendmmsg` would hand many sockets to the kernel in one submission per publish —
+  the real answer to "can we beat loopback" for *remote* subscribers, where a
+  kernel bypass is impossible because the peer speaks standard TCP+TLS. The
+  destination address is a red herring (127.0.0.1 is already the kernel's shortest
+  path; any other IP only routes further). Linux-specific; a reactor-level change.
+- **Shared-memory transport for same-host consumers.** For subscribers on the
+  same machine (other services, not browsers) the true "own loopback" is a
+  shared-memory ring — no socket, no kernel per message — which the library
+  already has as the `disruptor` / `circular_buffer`. Exposing the hub over a
+  shared-memory ring instead of TCP for local consumers removes the loopback
+  ceiling entirely. (DPDK / userspace-TCP is *not* on the table — irrelevant to
+  browsers and a project of its own, same verdict as QUIC in §8.)
+- **Trusted-payload passthrough.** The envelope escapes the payload as a JSON
+  string, an O(payload) scan per publish. If the source guarantees compliant JSON,
+  an opt-in mode could embed it as a raw value (no escape), and the `raw` framing
+  mode already skips the envelope entirely. Trust-gated — the default must stay
+  safe, because an unescaped stray quote is a malformed frame at best and field
+  injection at worst.
+- **Conflation for backpressure, not a Bloom filter.** The queues are already
+  bounded (trim-oldest, high-water). The smart escalation for a genuinely slow
+  consumer is *keyed conflation* — for a state topic, collapse a backlog to the
+  latest value per key (last-value-wins), deterministic and memory-bounded. A
+  Bloom filter is the wrong tool: its false positives would silently drop a
+  distinct event, and event streams must never lose one — dedup is exact-keyed,
+  never probabilistic.
+
+---
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:
@@ -404,3 +475,4 @@ Written down so nobody — including us — spends a busy week on them:
 | 11 | `event_loop` phase 2 comforts — POSIX signals as emissions, `WSAPoll` backend | Medium | Next |
 | 12 | QUIC + HTTP/3 (§8 phase 5) — wrap, do not write | Large ×2 | After phase 5's interop bar is agreed |
 | 13 | Two-machine head-to-head vs nginx (§8 phase 6a) | Medium | Needs a second machine, not more code |
+| 14 | `ws_broadcast_hub` fan-out + `intern_pool` (§10) | Medium | ✅ **Shipped** — shared-frame fan-out (up to ~94× at 8 KB × 1000), fixed-topic multi-webhook, `intern_pool`. Syscall batching / shared-mem transport / conflation deferred (§10) |

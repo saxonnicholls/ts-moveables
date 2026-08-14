@@ -62,6 +62,9 @@ jobs:
       # version.hpp, CMakeLists.txt and the release tag are three copies of one
       # number. RELEASE_TAG is set only on a tag build, where the tag joins the
       # comparison; on a branch build the header and CMake are still checked.
+      - name: Test registry matches CMakeLists
+        run: python3 scripts/check_test_registry.py
+
       - name: Version is the same everywhere
         env:
           RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
@@ -79,19 +82,21 @@ jobs:
       - name: Throughput (informational)
         run: |
           set -o pipefail
-          make build/bench build/signal_slot_demo CXX=${{ matrix.cxx }}
+          make build/bench build/signal_slot_demo build/ws_hub_broadcast CXX=${{ matrix.cxx }}
           {
             echo "## Throughput - ${{ matrix.name }}"
             echo ""
             ./build/bench --markdown
             echo ""
             ./build/signal_slot_demo --markdown
+            echo ""
+            ./build/ws_hub_broadcast --subs 100 --payload 1024 --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Demos (self-verifying)
         run: |
           set -o pipefail
-          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo build/http_server_demo build/replay_loop_demo CXX=${{ matrix.cxx }}
+          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo build/http_server_demo build/webhook_ws_hub_demo build/replay_loop_demo CXX=${{ matrix.cxx }}
           {
             ./build/capture_replay_demo --markdown
             echo ""
@@ -102,6 +107,8 @@ jobs:
             ./build/time_master_demo --markdown
             echo ""
             ./build/http_server_demo --markdown
+            echo ""
+            ./build/webhook_ws_hub_demo --markdown
             echo ""
             ./build/replay_loop_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"

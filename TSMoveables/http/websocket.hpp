@@ -360,6 +360,17 @@ public:
     {
         return send_frame(ws_opcode::binary, std::move(payload));
     }
+
+    // Zero-extra-copy fan-out. Hand the SAME immutable payload buffer to many
+    // sockets: the payload is not copied into the send call, the deliver closure
+    // holds a shared reference to it, and the wire frame is encoded from it on
+    // the loop thread. A relay with N subscribers builds the payload once and
+    // shares it across all of them (server frames are unmasked, so the payload
+    // bytes are identical for every subscriber) instead of copying it N times.
+    bool send_text_shared(std::shared_ptr<const std::string> payload) const
+    {
+        return send_frame_shared(ws_opcode::text, std::move(payload));
+    }
     bool ping(std::string payload = {}) const
     {
         return send_frame(ws_opcode::ping, std::move(payload));
@@ -419,6 +430,41 @@ private:
                 }
             }
             const std::string f = detail::ws_frame(op, body.data(), body.size(), true, rsv1);
+            sess->push_app(f.data(), f.size());
+        };
+
+        if (s_->poster.on_loop_thread()) {
+            deliver();
+            return true;
+        }
+        return s_->poster.post(std::move(deliver));
+    }
+
+    // Shared-payload variant of send_frame: the closure holds a reference to an
+    // immutable payload buffer instead of owning a copy, so one buffer fans out
+    // to many sockets without a per-socket payload copy. Compression is stateful
+    // and per-connection, so that path (only) copies into a private buffer.
+    bool send_frame_shared(ws_opcode op, std::shared_ptr<const std::string> payload) const
+    {
+        if (!s_ || !payload)
+            return false;
+        auto sess = s_->session.lock();
+        if (!sess)
+            return false;
+
+        auto st = s_;
+        auto deliver = [st, sess, op, body = std::move(payload)]() mutable {
+            bool rsv1 = false;
+            const bool control = (static_cast<std::uint8_t>(op) & 0x08) != 0;
+            const std::string* src = body.get();
+            std::string z;
+            if (!control && st->ext) {
+                if (st->ext->compress(*body, z)) {
+                    src  = &z;
+                    rsv1 = true;
+                }
+            }
+            const std::string f = detail::ws_frame(op, src->data(), src->size(), true, rsv1);
             sess->push_app(f.data(), f.size());
         };
 

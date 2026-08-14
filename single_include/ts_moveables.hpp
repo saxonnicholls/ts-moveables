@@ -1562,6 +1562,192 @@ namespace snicholls
 
 #endif /* circular_buffer_hpp */
 // end circular_buffer.hpp
+// (inlined) #include "concurrent/intern_pool.hpp"                  // IWYU pragma: export
+// ----------------------------------------------------------------------
+// begin intern_pool.hpp
+// ----------------------------------------------------------------------
+//
+//  intern_pool.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - content-addressed interning ("hash-consing").
+//
+//  Identical values collapse to a single shared, immutable instance, so equal
+//  data is stored once and can be compared by pointer. Plug-and-play for any
+//  hashable, equality-comparable T - frames, packets, structs. It turns "N
+//  copies of the same bytes" into "one buffer, N pointers", which is the natural
+//  companion to the ws_broadcast_hub's shared-frame fan-out: the hub already
+//  hands every subscriber a shared_ptr to one frame; interning makes that
+//  pointer canonical across time and across publishes too (a re-sent webhook,
+//  a heartbeat, an unchanged status - one buffer, however many times it arrives).
+//
+//  Self-cleaning: the pool holds WEAK references, so a value is freed as soon as
+//  the last user drops it. Memory is bounded by the live working set, never by
+//  history - there is no "cache eviction" to tune and no unbounded growth.
+//
+//  Why exact equality, not just a hash (this matters wherever a wrong alias is
+//  costly): two DIFFERENT payloads must never alias to one pointer. A 64-bit hash has
+//  birthday collisions around 2^32 live values; a Bloom filter has false
+//  positives by construction. So here the hash only selects a bucket and an
+//  exact `Eq` compare decides membership - the hash is the accelerator, equality
+//  is the authority. (A Bloom filter is a legitimate *negative* pre-check in
+//  front of this - "definitely new, skip the lookup" - but can never BE the
+//  check, because a false "seen" would silently drop or mis-alias a real value.)
+//
+//  Thread-safe under one moveable_mutex. The hot path is one lock + one hash probe; a hit
+//  returns the existing pointer (and frees the duplicate), a miss allocates once.
+//  Shard by hash if a single lock ever becomes the bottleneck.
+//
+
+#pragma once
+
+// (inlined) #include "../moveable/mutex.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+
+namespace snicholls
+{
+
+template <class T, class Hash = std::hash<T>, class Eq = std::equal_to<T>>
+class intern_pool
+{
+public:
+    using value_type = T;
+    using ptr        = std::shared_ptr<const T>;
+
+    struct stats {
+        std::uint64_t interned = 0;   // total intern() calls
+        std::uint64_t hits     = 0;   // calls that reused an existing instance
+        std::size_t   live     = 0;   // distinct values currently alive
+    };
+
+    intern_pool() = default;
+    explicit intern_pool(std::size_t bucket_hint) { table_.reserve(bucket_hint); }
+
+    // Copy is deleted, move is not, and the difference is the whole point.
+    //
+    // Copying would fork the identity domain: two pools, each handing out its
+    // own canonical pointer for the same bytes, so `a == b` would stop implying
+    // `ptr_a == ptr_b` - the one guarantee this class exists to make.
+    //
+    // Moving forks nothing. It relocates the single pool; the table travels with
+    // it, and every `shared_ptr<const T>` already handed out stays valid and
+    // stays canonical, because those point at the interned values and never at
+    // the pool. So a class holding an intern_pool keeps the rule of zero, which
+    // is the reason this library exists - a component of ours that could not be
+    // a member of a moveable object would be arguing against its own thesis.
+    //
+    // The move is checked rather than trusted: `moveable_mutex` throws if it is
+    // held, so moving a pool out from under a thread inside intern() is loud
+    // instead of undefined. Not noexcept, for exactly that reason.
+    intern_pool(const intern_pool&)            = delete;
+    intern_pool& operator=(const intern_pool&) = delete;
+    intern_pool(intern_pool&&)                 = default;
+    intern_pool& operator=(intern_pool&&)      = default;
+
+    // Return the one canonical, immutable instance equal to `value`. If an equal
+    // instance is already alive, returns it and discards `value`'s buffer;
+    // otherwise adopts `value`. While any result is still referenced, every
+    // equal input returns a pointer-identical result: (a == b) ⇔ (ptr_a == ptr_b).
+    ptr intern(T value)
+    {
+        const std::size_t h = hash_(value);
+        std::lock_guard<moveable_mutex<>> g(mtx_);
+        ++interned_;
+
+        auto range = table_.equal_range(h);
+        for (auto it = range.first; it != range.second;) {
+            if (ptr sp = it->second.lock()) {
+                if (eq_(*sp, value)) {          // hash matched AND bytes equal
+                    ++hits_;
+                    return sp;                  // duplicate `value` freed on return
+                }
+                ++it;
+            } else {
+                it = table_.erase(it);          // prune a dead weak ref in passing
+            }
+        }
+
+        ptr sp = std::make_shared<const T>(std::move(value));
+        table_.emplace(h, std::weak_ptr<const T>(sp));
+        maybe_sweep_();
+        return sp;
+    }
+
+    // Intern without adopting: return the canonical instance if one is alive,
+    // else nullptr. A read-only probe (no allocation, no insert).
+    ptr find(const T& value) const
+    {
+        const std::size_t h = hash_(value);
+        std::lock_guard<moveable_mutex<>> g(mtx_);
+        auto range = table_.equal_range(h);
+        for (auto it = range.first; it != range.second; ++it)
+            if (ptr sp = it->second.lock())
+                if (eq_(*sp, value))
+                    return sp;
+        return nullptr;
+    }
+
+    stats snapshot() const
+    {
+        std::lock_guard<moveable_mutex<>> g(mtx_);
+        stats s;
+        s.interned = interned_;
+        s.hits     = hits_;
+        for (const auto& kv : table_)
+            if (!kv.second.expired())
+                ++s.live;
+        return s;
+    }
+
+    // Drop expired entries now. intern() does this lazily and amortised; exposed
+    // for tests and for ops that want to reclaim table slots on demand.
+    void sweep()
+    {
+        std::lock_guard<moveable_mutex<>> g(mtx_);
+        sweep_locked_();
+    }
+
+private:
+    void sweep_locked_()
+    {
+        for (auto it = table_.begin(); it != table_.end();) {
+            if (it->second.expired())
+                it = table_.erase(it);
+            else
+                ++it;
+        }
+        since_sweep_ = 0;
+    }
+
+    // Amortised cleanup: once we have inserted about as many entries as the table
+    // holds, walk it once. Dead weak refs therefore cost O(1) amortised per
+    // insert and can never accumulate without bound.
+    void maybe_sweep_()
+    {
+        if (++since_sweep_ >= table_.size())
+            sweep_locked_();
+    }
+
+    mutable moveable_mutex<>                                    mtx_;
+    std::unordered_multimap<std::size_t, std::weak_ptr<const T>> table_;
+    Hash          hash_{};
+    Eq            eq_{};
+    std::uint64_t interned_    = 0;
+    std::uint64_t hits_        = 0;
+    std::size_t   since_sweep_ = 0;
+};
+
+} // namespace snicholls
+// end intern_pool.hpp
 // (inlined) #include "concurrent/mpmc_queue.hpp"                   // IWYU pragma: export
 // ----------------------------------------------------------------------
 // begin mpmc_queue.hpp
@@ -2770,6 +2956,83 @@ namespace snicholls
 
 // (inlined) #include "../moveable/signal.hpp"
 // (inlined) #include "../concurrent/mpmc_queue.hpp"
+// (inlined) #include "../utils/json.hpp"
+// ----------------------------------------------------------------------
+// begin json.hpp
+// ----------------------------------------------------------------------
+//
+//  utils/json.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - the JSON escaping every part of this library needs.
+//
+//  Small, and shared for a specific reason: it had been written twice, once in
+//  the logger's JSON sink and once in the WebSocket broadcast hub, and the two
+//  copies had already drifted. One handled \b and \f as short escapes and the
+//  other fell through to  / ; one took a string_view and reserved,
+//  the other took a const std::string&. Both produced legal JSON, which is
+//  exactly why nobody noticed - a duplicate that is merely *different* rather
+//  than wrong is the kind that survives, and then one copy gets a fix the
+//  other does not.
+//
+//  Kept in `snicholls::utils`, not `snicholls::detail`. The latter was tried
+//  first and collides: any translation unit doing `using namespace snicholls;`
+//  plus `using namespace snicholls::http;` - which every benchmark and demo
+//  here does - then sees two `detail` namespaces and every mention is
+//  ambiguous. `utils` says the same thing about intent without shadowing a
+//  name each module already uses for its own internals.
+//
+
+#ifndef ts_moveables_utils_json_hpp
+#define ts_moveables_utils_json_hpp
+
+#include <cstdio>
+#include <string>
+#include <string_view>
+
+namespace snicholls {
+namespace utils {
+
+// Escape a byte string into the body of a JSON string literal - the surrounding
+// quotes are the caller's. Enough of RFC 8259 to make any UTF-8 text a legal
+// value: the two mandatory escapes, the five short forms, and \uXXXX for the
+// remaining C0 controls.
+//
+// Bytes >= 0x20 pass through untouched, so valid UTF-8 stays valid UTF-8 and
+// stays one byte per byte. Iterating as unsigned char is what makes that true
+// on platforms where plain char is signed - a comparison against 0x20 on a
+// signed char would treat every byte of a multi-byte sequence as a control.
+inline void json_escape(std::string_view in, std::string& out)
+{
+    out.reserve(out.size() + in.size() + 8);
+    for (unsigned char c : in) {
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:
+            if (c < 0x20) {
+                char b[8];
+                std::snprintf(b, sizeof b, "\\u%04x", static_cast<unsigned>(c));
+                out += b;
+            } else {
+                out += static_cast<char>(c);
+            }
+        }
+    }
+}
+
+} // namespace utils
+} // namespace snicholls
+
+#endif /* ts_moveables_utils_json_hpp */
+// end json.hpp
 
 #include <atomic>
 #include <chrono>
@@ -2947,26 +3210,11 @@ inline std::uint64_t next_seq() noexcept
 }
 
 // Just enough escaping for a JSON string - quotes, backslash, control chars
-inline void json_escape(const std::string& in, std::string& out)
-{
-    for (char c : in) {
-        switch (c) {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n";  break;
-        case '\r': out += "\\r";  break;
-        case '\t': out += "\\t";  break;
-        default:
-            if (static_cast<unsigned char>(c) < 0x20) {
-                char esc[8];
-                std::snprintf(esc, sizeof esc, "\\u%04x", c);
-                out += esc;
-            } else {
-                out += c;
-            }
-        }
-    }
-}
+// Was written out here, and separately in the WebSocket broadcast hub. The two
+// had drifted - this copy escaped \b and \f as  and  rather than
+// the short forms, which is still legal JSON, which is why it went unnoticed.
+// utils/json.hpp keeps the one copy now.
+using ::snicholls::utils::json_escape;
 
 inline const char* basename(const char* path) noexcept
 {
@@ -9159,6 +9407,17 @@ public:
     {
         return send_frame(ws_opcode::binary, std::move(payload));
     }
+
+    // Zero-extra-copy fan-out. Hand the SAME immutable payload buffer to many
+    // sockets: the payload is not copied into the send call, the deliver closure
+    // holds a shared reference to it, and the wire frame is encoded from it on
+    // the loop thread. A relay with N subscribers builds the payload once and
+    // shares it across all of them (server frames are unmasked, so the payload
+    // bytes are identical for every subscriber) instead of copying it N times.
+    bool send_text_shared(std::shared_ptr<const std::string> payload) const
+    {
+        return send_frame_shared(ws_opcode::text, std::move(payload));
+    }
     bool ping(std::string payload = {}) const
     {
         return send_frame(ws_opcode::ping, std::move(payload));
@@ -9218,6 +9477,41 @@ private:
                 }
             }
             const std::string f = detail::ws_frame(op, body.data(), body.size(), true, rsv1);
+            sess->push_app(f.data(), f.size());
+        };
+
+        if (s_->poster.on_loop_thread()) {
+            deliver();
+            return true;
+        }
+        return s_->poster.post(std::move(deliver));
+    }
+
+    // Shared-payload variant of send_frame: the closure holds a reference to an
+    // immutable payload buffer instead of owning a copy, so one buffer fans out
+    // to many sockets without a per-socket payload copy. Compression is stateful
+    // and per-connection, so that path (only) copies into a private buffer.
+    bool send_frame_shared(ws_opcode op, std::shared_ptr<const std::string> payload) const
+    {
+        if (!s_ || !payload)
+            return false;
+        auto sess = s_->session.lock();
+        if (!sess)
+            return false;
+
+        auto st = s_;
+        auto deliver = [st, sess, op, body = std::move(payload)]() mutable {
+            bool rsv1 = false;
+            const bool control = (static_cast<std::uint8_t>(op) & 0x08) != 0;
+            const std::string* src = body.get();
+            std::string z;
+            if (!control && st->ext) {
+                if (st->ext->compress(*body, z)) {
+                    src  = &z;
+                    rsv1 = true;
+                }
+            }
+            const std::string f = detail::ws_frame(op, src->data(), src->size(), true, rsv1);
             sess->push_app(f.data(), f.size());
         };
 
@@ -9533,6 +9827,1335 @@ inline handler websocket_route(ws_handler on_open, ws_config cfg = ws_config{})
 #endif // SNICHOLLS_HAS_HTTP_SERVER
 #endif /* websocket_hpp */
 // end websocket.hpp
+// (inlined) #include "http/ws_broadcast_hub.hpp"             // IWYU pragma: export (fan-out over that)
+// ----------------------------------------------------------------------
+// begin ws_broadcast_hub.hpp
+// ----------------------------------------------------------------------
+//
+//  ws_broadcast_hub.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - a webhook -> WebSocket broadcast hub
+//
+//  The pattern this file packages is everywhere: something outside the process
+//  emits an event over HTTP (a webhook, a cron ping, another service), and a
+//  crowd of browsers wants to see it live over WebSocket. The plumbing in the
+//  middle is always the same - fan one message out to many sockets, keep a
+//  little history so a page that just loaded is not blank, and never let one
+//  slow reader stall the loop or grow memory without bound. So it is written
+//  once, here, with no idea what the messages mean: topics are opaque strings
+//  and payloads are opaque bytes. Point it at any source and it works.
+//
+//  It is built entirely on the library's own pieces. Fan-out reuses the
+//  copy-on-write snapshot moveable_signal uses (grab the subscriber list under
+//  a brief lock, then deliver without it). Per-topic history is a
+//  snicholls::circular_buffer. Every counter is a moveable_atomic and every
+//  lock a moveable_mutex, so the whole hub is one movable value over a shared
+//  core - the same shape as http::server itself.
+//
+//      snicholls::http::server srv;
+//      snicholls::http::ws_broadcast_hub hub;
+//      hub.mount(srv);                          // GET /ws?topic=..  +  POST /ingest/:topic
+//      srv.listen("0.0.0.0", 8080);
+//      srv.run();
+//
+//      // from anywhere, at any time:
+//      hub.publish("prices", "{\"BTC\":64000}");
+//
+//  Delivery envelope (frame_mode == envelope_json, the default). Each WebSocket
+//  text frame a subscriber receives is exactly one JSON object:
+//
+//      {"seq":<uint64>,"ts_ms":<uint64>,"topic":"<string>","payload":"<string>"}
+//
+//    seq      global, monotonic, starts at 1; one per published message, in
+//             delivery order (so a client can spot a gap or a reorder)
+//    ts_ms    server wall-clock time of publication, Unix epoch milliseconds
+//    topic    the topic the message was published to (JSON-string escaped)
+//    payload  the raw published bytes, carried verbatim as a JSON-string value
+//             (escaped so any UTF-8 text is legal JSON). Not re-parsed - to the
+//             hub it is an opaque string.
+//
+//  In frame_mode == raw the payload bytes are sent verbatim as the frame, with
+//  no envelope - for a source that already frames its own messages.
+//
+//  Guarded on SNICHOLLS_HAS_WEBSOCKET: where the WebSocket delegate compiles to
+//  nothing (non-POSIX in phase 1) so does this.
+//
+
+#pragma once
+
+// (inlined) #include "websocket.hpp"
+
+#if !SNICHOLLS_HAS_WEBSOCKET
+#define SNICHOLLS_HAS_WS_BROADCAST_HUB 0
+#else
+#define SNICHOLLS_HAS_WS_BROADCAST_HUB 1
+
+// (inlined) #include "../concurrent/circular_buffer.hpp"
+// (inlined) #include "../moveable/atomic.hpp"
+// (inlined) #include "../moveable/mutex.hpp"
+// (inlined) #include "../utils/json.hpp"
+// (inlined) #include "../utils/time.hpp"
+// ----------------------------------------------------------------------
+// begin time.hpp
+// ----------------------------------------------------------------------
+//
+//  utils/time.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - wall-clock helpers shared across the library.
+//
+//  Wall clock, deliberately: `unix_millis` is for timestamps that leave the
+//  process - a JSON frame sent to a browser, a line in a flight record, an
+//  event id another machine will sort by. It is NOT for measuring elapsed
+//  time. `system_clock` can jump backwards when NTP corrects it, so a duration
+//  taken from two of these can be negative. Use `steady_clock` for anything
+//  you intend to subtract, which is what the benchmarks and timeouts do.
+//
+
+#ifndef ts_moveables_utils_time_hpp
+#define ts_moveables_utils_time_hpp
+
+#include <chrono>
+#include <cstdint>
+
+namespace snicholls {
+namespace utils {
+
+// Milliseconds since the Unix epoch, as the wire and the browser expect it.
+inline std::uint64_t unix_millis() noexcept
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+} // namespace utils
+} // namespace snicholls
+
+#endif /* ts_moveables_utils_time_hpp */
+// end time.hpp
+
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <deque>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace snicholls {
+namespace http {
+
+namespace detail {
+
+// Both of these used to be written out here. They now live in utils/ because
+// the logger had its own copy of the escaper and the two had already drifted -
+// see utils/json.hpp for which way, and why that kind of duplicate survives.
+using ::snicholls::utils::json_escape;
+using ::snicholls::utils::unix_millis;
+
+} // namespace detail
+
+// How each delivered frame is shaped (see the file header for the envelope).
+enum class ws_hub_framing : std::uint8_t {
+    envelope_json,      // {"seq":..,"ts_ms":..,"topic":"..","payload":".."}
+    raw                 // payload bytes sent verbatim, no envelope
+};
+
+// The hub's knobs. Defined at namespace scope (aliased as ws_broadcast_hub::
+// config below) so its default member initializers are complete before the hub
+// class is defined - a nested type's initializers cannot be value-initialised
+// while the enclosing class is still being parsed.
+struct ws_hub_config {
+    // Topic that receives every published message regardless of its topic.
+    // A client connecting with this topic is a firehose subscriber.
+    std::string    wildcard_topic    = "*";
+
+    std::size_t    max_subscribers   = 10000;             // total, across all topics
+    std::size_t    ring_capacity     = 64;                // per-topic replay history (rounded up to a power of two)
+    std::size_t    max_message_bytes = 1u * 1024 * 1024;  // ingest + frame size cap
+
+    // Per-connection outbound bound. A reader slower than the publish rate has
+    // its queue trimmed oldest-first, never grown without limit.
+    std::size_t    max_queue_msgs    = 256;
+    std::size_t    max_queue_bytes   = 8u * 1024 * 1024;
+    // Stop handing frames to a socket once this many bytes are already queued
+    // for it; resume as it drains. Backpressure, not blocking.
+    std::size_t    send_high_water   = 1u * 1024 * 1024;
+
+    bool           replay_on_connect = true;
+    ws_hub_framing frame_mode        = ws_hub_framing::envelope_json;
+};
+
+struct ws_hub_stats {
+    std::uint64_t published   = 0;      // messages accepted by publish()
+    std::uint64_t delivered   = 0;      // frames handed to a socket
+    std::uint64_t dropped     = 0;      // frames trimmed by backpressure
+    std::uint64_t subscribers = 0;      // live subscribers now
+    std::uint64_t seq         = 0;      // last sequence number issued
+};
+
+// ---------------------------------------------------------------------- the hub
+//
+// Movable, like http::server: a cheap handle over a shared core, so it can be
+// built in a factory and moved into place, and the route handlers it hands out
+// keep the core alive for exactly as long as the server holds them. Copying is
+// deleted - two handles publishing into one core is fine, but that is what a
+// deliberate share() would be, not an accidental copy.
+
+class ws_broadcast_hub {
+public:
+    using framing = ws_hub_framing;     // ws_broadcast_hub::framing::{envelope_json,raw}
+    using config  = ws_hub_config;      // ws_broadcast_hub::config
+    using stats   = ws_hub_stats;       // ws_broadcast_hub::stats
+
+    ws_broadcast_hub() : ws_broadcast_hub(config{}) {}
+    explicit ws_broadcast_hub(config cfg)
+        : h_(std::make_shared<impl>(std::move(cfg))) {}
+
+    ws_broadcast_hub(ws_broadcast_hub&&) noexcept = default;
+    ws_broadcast_hub& operator=(ws_broadcast_hub&&) noexcept = default;
+    ws_broadcast_hub(const ws_broadcast_hub&) = delete;
+    ws_broadcast_hub& operator=(const ws_broadcast_hub&) = delete;
+
+    // Fan a message out to every subscriber of `topic` and every wildcard
+    // subscriber, and record it in that topic's replay history. O(subscribers),
+    // never blocks: a slow reader is trimmed, not waited on. Safe from any
+    // thread - if the hub was mount()ed and this is a foreign thread, the
+    // delivery is marshalled onto the loop so backpressure reads stay accurate.
+    // Returns the number of connected subscribers the message was fanned out to.
+    std::size_t publish(std::string_view topic, std::string_view payload)
+    {
+        return h_->publish(topic, payload);
+    }
+
+    // A websocket_route for GET: the topic is the `topic` query parameter
+    // (default: the wildcard topic). On connect the client is registered, the
+    // topic's replay history is streamed, then live publishes follow in order.
+    handler ws_route() const
+    {
+        auto h = h_;
+        ws_config wscfg;
+        wscfg.max_message = h_->cfg.max_message_bytes;
+        wscfg.max_frame   = h_->cfg.max_message_bytes;
+        return websocket_route([h](websocket ws) { h->on_connect(std::move(ws)); }, wscfg);
+    }
+
+    // A plain HTTP handler for the ingest side: the request body is the payload,
+    // the topic is the `:topic` path parameter if the route has one, else the
+    // `topic` query parameter, else the wildcard topic. Answers 202 immediately
+    // (the raw "webhook -> ws pump" case). Reusable for any POST source.
+    handler ingest_handler() const
+    {
+        auto h = h_;
+        return [h](const request& req, responder res) {
+            std::string topic = req.has_param("topic") ? req.param("topic")
+                                                       : req.query_param("topic");
+            if (topic.empty())
+                topic = h->cfg.wildcard_topic;
+            accept(h, topic, req, std::move(res));
+        };
+    }
+
+    // Fixed-topic ingest: every POST to this handler publishes to `topic`,
+    // regardless of path or query. Register it on as many distinct paths as you
+    // like to run several independent webhook endpoints on one server -
+    //     srv.post("/hook1", hub.ingest_handler("hook1"));
+    //     srv.post("/hook2", hub.ingest_handler("hook2"));
+    // each feeding its own topic (and the wildcard firehose). Call mount() once
+    // first (or set the poster) if you also publish() from a foreign thread.
+    handler ingest_handler(std::string topic) const
+    {
+        auto h = h_;
+        auto t = std::make_shared<const std::string>(std::move(topic));
+        return [h, t](const request& req, responder res) {
+            accept(h, *t, req, std::move(res));
+        };
+    }
+
+    // Register both sides on a server in one call, and remember the loop so
+    // publish() from a worker thread can marshal onto it. Call before run()
+    // (or from the loop thread after).
+    void mount(server& srv,
+               const std::string& ws_path     = "/ws",
+               const std::string& ingest_path = "/ingest/:topic")
+    {
+        h_->poster = srv.loop().make_poster();
+        srv.get(ws_path, ws_route());
+        srv.post(ingest_path, ingest_handler());
+    }
+
+    std::size_t subscribers() const { return static_cast<std::size_t>(h_->sub_count.load()); }
+    std::size_t subscribers(std::string_view topic) const { return h_->topic_size(topic); }
+    stats snapshot() const { return h_->snapshot(); }
+    const config& configuration() const { return h_->cfg; }
+
+private:
+    // One connected client. Never copied or moved - always held by shared_ptr,
+    // so the on_close slot can weak-reference it and the fan-out can hold it
+    // alive across the brief window between snapshot and delivery. Its queue is
+    // guarded by its own mutex, so publishes to different clients never contend.
+    // One immutable framed message, shared across every subscriber's queue and
+    // the replay ring — a publish copies a shared_ptr, never the frame bytes.
+    using frame_ptr = std::shared_ptr<const std::string>;
+
+    struct subscriber {
+        websocket                ws;
+        std::string              topic;
+        moveable_mutex<>         mtx;
+        std::deque<frame_ptr>    queue;                 // shared frames awaiting the socket
+        std::size_t              queued_bytes = 0;
+        moveable_atomic_uint64_t sent{0};
+        moveable_atomic_uint64_t dropped{0};
+    };
+
+    using sub_ptr      = std::shared_ptr<subscriber>;
+    using sub_list     = std::vector<sub_ptr>;
+    using sub_snapshot = std::shared_ptr<const sub_list>;    // copy-on-write, like moveable_signal
+
+    struct impl : std::enable_shared_from_this<impl> {
+        config cfg;
+
+        moveable_mutex<> mtx;                                        // guards topics + rings
+        std::unordered_map<std::string, sub_snapshot>              topics;   // topic -> subscriber snapshot
+        std::unordered_map<std::string, circular_buffer<frame_ptr>> rings; // topic -> replay history
+
+        event_loop::poster       poster;                            // set by mount(); may be empty
+
+        moveable_atomic_uint64_t seq{0};
+        moveable_atomic_uint64_t sub_count{0};
+        moveable_atomic_uint64_t published{0};
+        moveable_atomic_uint64_t delivered{0};
+        moveable_atomic_uint64_t dropped{0};
+
+        explicit impl(config c) : cfg(std::move(c))
+        {
+            if (cfg.ring_capacity == 0)
+                cfg.ring_capacity = 1;              // circular_buffer needs a positive capacity
+        }
+
+        // -------------------------------------------------------- publish path
+
+        std::size_t publish(std::string_view topic_v, std::string_view payload_v)
+        {
+            // From a foreign thread on a mounted hub, hop onto the loop so that
+            // send_high_water sees each socket's true backlog (which the loop
+            // publishes) rather than a stale value. The fan-out count is still
+            // computed synchronously so the caller gets a real answer.
+            if (poster.valid() && !poster.on_loop_thread()) {
+                std::string topic(topic_v), payload(payload_v);
+                const std::size_t n = count_targets(topic);
+                auto self = shared_from_this();
+                self->poster.post([self, topic = std::move(topic),
+                                   payload = std::move(payload)]() mutable {
+                    self->do_publish(topic, payload);
+                });
+                return n;
+            }
+            return do_publish(std::string(topic_v), std::string(payload_v));
+        }
+
+        std::size_t do_publish(const std::string& topic, const std::string& payload)
+        {
+            sub_snapshot topic_subs, wild_subs;
+            frame_ptr msg;
+            {
+                std::lock_guard<moveable_mutex<>> g(mtx);
+                const std::uint64_t s  = seq.fetch_add(1) + 1;      // 1-based, ordered under the lock
+                const std::uint64_t ts = detail::unix_millis();
+                msg = std::make_shared<const std::string>(frame(topic, payload, s, ts));
+
+                if (cfg.replay_on_connect) {
+                    ring_push(ring_for(topic), msg);
+                    if (topic != cfg.wildcard_topic)
+                        ring_push(ring_for(cfg.wildcard_topic), msg);
+                }
+                topic_subs = snapshot_for(topic);
+                if (topic != cfg.wildcard_topic)
+                    wild_subs = snapshot_for(cfg.wildcard_topic);
+            }
+            published.fetch_add(1);
+
+            std::size_t n = 0;
+            std::vector<subscriber*> dead;
+            auto fan = [&](const sub_list& list) {
+                for (const auto& sp : list) {
+                    if (!sp->ws.connected()) {          // abrupt disconnects have no close frame
+                        dead.push_back(sp.get());
+                        continue;
+                    }
+                    deliver(*sp, msg);
+                    ++n;
+                }
+            };
+            if (topic_subs) fan(*topic_subs);
+            if (wild_subs)  fan(*wild_subs);
+            if (!dead.empty())
+                for (auto* p : dead) remove(p);          // lazy reap of dead sockets
+            return n;
+        }
+
+        std::string frame(const std::string& topic, const std::string& payload,
+                          std::uint64_t s, std::uint64_t ts)
+        {
+            if (cfg.frame_mode == framing::raw)
+                return payload;
+            std::string e;
+            e.reserve(payload.size() + topic.size() + 64);
+            e += "{\"seq\":";      detail::append_uint(e, static_cast<unsigned long long>(s));
+            e += ",\"ts_ms\":";    detail::append_uint(e, static_cast<unsigned long long>(ts));
+            e += ",\"topic\":\"";  detail::json_escape(topic, e);   e += '"';
+            e += ",\"payload\":\"";detail::json_escape(payload, e); e += "\"}";
+            return e;
+        }
+
+        // Enqueue one frame for one subscriber and push what the socket will
+        // take. Trim oldest-first if the queue is over its bound. Loop-agnostic:
+        // the per-subscriber lock makes it safe from any calling thread.
+        void deliver(subscriber& sub, const frame_ptr& msg)
+        {
+            std::lock_guard<moveable_mutex<>> g(sub.mtx);
+            sub.queue.push_back(msg);                    // shares the frame, no byte copy
+            sub.queued_bytes += msg->size();
+            while (sub.queue.size() > cfg.max_queue_msgs ||
+                   (sub.queued_bytes > cfg.max_queue_bytes && sub.queue.size() > 1)) {
+                sub.queued_bytes -= sub.queue.front()->size();
+                sub.queue.pop_front();
+                sub.dropped.fetch_add(1);
+                dropped.fetch_add(1);
+            }
+            pump_locked(sub);
+        }
+
+        // Hand queued frames to the socket while it is keeping up. send_text is
+        // non-blocking (it queues or marshals), so this never stalls the loop.
+        void pump_locked(subscriber& sub)
+        {
+            while (!sub.queue.empty() && sub.ws.backlog() < cfg.send_high_water) {
+                frame_ptr m = std::move(sub.queue.front());
+                sub.queue.pop_front();
+                sub.queued_bytes -= m->size();
+                const bool ok = sub.ws.send_text_shared(std::move(m));   // no per-socket payload copy
+                sub.sent.fetch_add(1);
+                delivered.fetch_add(1);
+                if (!ok)
+                    break;                              // socket gone; the rest is reaped later
+            }
+        }
+
+        // ------------------------------------------------------ connect / close
+
+        void on_connect(websocket ws)
+        {
+            std::string topic = ws.handshake().query_param("topic");
+            if (topic.empty())
+                topic = cfg.wildcard_topic;
+
+            auto sub = std::make_shared<subscriber>();
+            sub->ws    = ws.share();
+            sub->topic = topic;
+
+            bool over = false;
+            {
+                std::lock_guard<moveable_mutex<>> g(mtx);
+                if (sub_count.load() >= cfg.max_subscribers) {
+                    over = true;
+                } else {
+                    // Seed the replay history while the subscriber is still
+                    // invisible to publishers, then register it - both under the
+                    // one lock. So any publish is ordered strictly before or
+                    // after this pair: it either lands in the history we just
+                    // copied, or is delivered live after it. No gap, no dup, and
+                    // replay always precedes live in the queue.
+                    if (cfg.replay_on_connect) {
+                        std::vector<frame_ptr> hist;
+                        ring_snapshot(ring_for(topic), hist);
+                        for (auto& m : hist) {
+                            sub->queued_bytes += m->size();
+                            sub->queue.push_back(std::move(m));
+                        }
+                        while (sub->queue.size() > cfg.max_queue_msgs) {
+                            sub->queued_bytes -= sub->queue.front()->size();
+                            sub->queue.pop_front();
+                        }
+                    }
+                    register_locked(topic, sub);
+                    sub_count.fetch_add(1);
+                }
+            }
+            if (over) {
+                ws.close(ws_policy_violation, "subscriber limit reached");
+                return;
+            }
+
+            // Unsubscribe on a graceful close. Weak on both sides: a strong
+            // subscriber here would be owned by the ws_state that owns this
+            // slot, and neither would ever free (the library's own cycle rule).
+            std::weak_ptr<subscriber> wsub  = sub;
+            std::weak_ptr<impl>       wself = weak_from_this();
+            ws.on_close([wself, wsub](websocket, std::uint16_t, const std::string&) {
+                auto self = wself.lock();
+                auto s    = wsub.lock();
+                if (self && s)
+                    self->remove(s.get());
+            });
+
+            std::lock_guard<moveable_mutex<>> g(sub->mtx);   // drain the replay now
+            pump_locked(*sub);
+        }
+
+        // caller holds mtx
+        void register_locked(const std::string& topic, const sub_ptr& sub)
+        {
+            auto cur  = snapshot_for(topic);
+            auto next = std::make_shared<sub_list>();
+            if (cur) {
+                next->reserve(cur->size() + 1);
+                *next = *cur;
+            }
+            next->push_back(sub);
+            topics[topic] = std::move(next);
+        }
+
+        void remove(subscriber* ptr)
+        {
+            std::lock_guard<moveable_mutex<>> g(mtx);
+            auto it = topics.find(ptr->topic);
+            if (it == topics.end() || !it->second)
+                return;
+            const sub_list& cur = *it->second;
+            auto next = std::make_shared<sub_list>();
+            next->reserve(cur.size());
+            bool removed = false;
+            for (const auto& sp : cur) {
+                if (sp.get() == ptr)
+                    removed = true;
+                else
+                    next->push_back(sp);
+            }
+            if (next->empty())
+                topics.erase(it);
+            else
+                it->second = std::move(next);
+            if (removed)
+                sub_count.fetch_sub(1);
+        }
+
+        // ------------------------------------------------------------- queries
+
+        std::size_t count_targets(const std::string& topic)
+        {
+            std::lock_guard<moveable_mutex<>> g(mtx);
+            std::size_t n = 0;
+            if (auto s = snapshot_for(topic))
+                n += s->size();
+            if (topic != cfg.wildcard_topic)
+                if (auto w = snapshot_for(cfg.wildcard_topic))
+                    n += w->size();
+            return n;
+        }
+
+        std::size_t topic_size(std::string_view topic)
+        {
+            std::lock_guard<moveable_mutex<>> g(mtx);
+            auto it = topics.find(std::string(topic));
+            return (it == topics.end() || !it->second) ? 0 : it->second->size();
+        }
+
+        stats snapshot() const
+        {
+            stats s;
+            s.published   = published.load();
+            s.delivered   = delivered.load();
+            s.dropped     = dropped.load();
+            s.subscribers = sub_count.load();
+            s.seq         = seq.load();
+            return s;
+        }
+
+        // --------------------------------------------------- internals (mtx held)
+
+        sub_snapshot snapshot_for(const std::string& topic)
+        {
+            auto it = topics.find(topic);
+            return it == topics.end() ? nullptr : it->second;
+        }
+
+        circular_buffer<frame_ptr>& ring_for(const std::string& topic)
+        {
+            auto it = rings.find(topic);
+            if (it == rings.end())
+                it = rings.emplace(std::piecewise_construct,
+                                   std::forward_as_tuple(topic),
+                                   std::forward_as_tuple(cfg.ring_capacity)).first;
+            return it->second;
+        }
+
+        // Keep the last N: overwrite the oldest when full. Single-threaded here
+        // (mtx held), so the SPSC ring's push/pop are used without contention.
+        static void ring_push(circular_buffer<frame_ptr>& cb, const frame_ptr& msg)
+        {
+            if (cb.full()) {
+                frame_ptr discard;
+                cb.try_pop(discard);
+            }
+            cb.try_push(msg);
+        }
+
+        // Non-destructive read of the whole ring, oldest -> newest: drain it and
+        // refill it in the same order. Safe because mtx serialises all access.
+        static void ring_snapshot(circular_buffer<frame_ptr>& cb, std::vector<frame_ptr>& out)
+        {
+            frame_ptr s;
+            while (cb.try_pop(s))
+                out.push_back(std::move(s));
+            for (const auto& m : out)
+                cb.try_push(m);
+        }
+    };
+
+    // Publish the body to `topic` and answer 202 with the fan-out count. Shared
+    // by both ingest_handler overloads so the accept semantics stay in one place.
+    static void accept(const std::shared_ptr<impl>& h, const std::string& topic,
+                       const request& req, responder res)
+    {
+        if (req.body.size() > h->cfg.max_message_bytes) {
+            res.send(413, "text/plain; charset=utf-8", "413 Payload Too Large\n");
+            return;
+        }
+        const std::size_t n = h->publish(topic, req.body);
+
+        response r(202);
+        std::string b = "{\"accepted\":true,\"topic\":\"";
+        detail::json_escape(topic, b);
+        b += "\",\"subscribers\":";
+        detail::append_uint(b, static_cast<unsigned long long>(n));
+        b += "}\n";
+        r.content(std::move(b), "application/json");
+        res.send(std::move(r));
+    }
+
+    std::shared_ptr<impl> h_;
+};
+
+} // namespace http
+} // namespace snicholls
+
+#endif // SNICHOLLS_HAS_WEBSOCKET
+// end ws_broadcast_hub.hpp
+// (inlined) #include "http/websocket_client.hpp"            // IWYU pragma: export (the outbound half)
+// ----------------------------------------------------------------------
+// begin websocket_client.hpp
+// ----------------------------------------------------------------------
+//
+//  websocket_client.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - the outbound half of WebSocket, with survivability
+//
+//  Everything in this library so far has been the server side: browsers connect
+//  to us. This is the other direction - we connect out and stay connected. That
+//  is what turns the broadcast hub into a *relay*: N upstream feeds in, one
+//  fan-out core, M browsers out, on one reactor and one thread.
+//
+//      snicholls::event_loop loop;
+//      snicholls::http::ws_broadcast_hub hub;
+//
+//      snicholls::http::websocket_client up;
+//      up.on_message([&hub](const ws_message& m) { hub.publish("prices", m.data); });
+//      up.connect(loop, "ws://feed.internal:9000/stream");
+//
+//  The reason this is a component and not ten lines in a demo is the part that
+//  is easy to skip: staying connected. A relay that dies when its upstream
+//  restarts is not a relay, it is an outage waiting for a deploy. So reconnect
+//  is the default and not a feature you remember to add:
+//
+//    - **Exponential backoff with full jitter.** Delay is random in
+//      [0, min(cap, base * 2^attempt)]. The jitter is not decoration - when a
+//      feed restarts, every relay that was connected to it reconnects at once,
+//      and undithered backoff synchronises them into a thundering herd that
+//      knocks the feed straight back over.
+//    - **Backoff resets on a *working* session, not on a successful connect.**
+//      A server that accepts and immediately drops would otherwise reset the
+//      delay every time and spin at full rate. `session_grace` is how long a
+//      connection must survive to count as working.
+//    - **A close from us is final.** `close()` means stop; only failures
+//      reconnect. Otherwise shutdown races the backoff timer forever.
+//
+//  RFC 6455 obligations that differ from the server side, because this is the
+//  end that gets them wrong:
+//
+//    - **Client frames MUST be masked** (§5.3) with a fresh 32-bit key per
+//      frame. Unmasked client frames are a protocol error a real server will
+//      close on, so `ws_frame_masked` is the only encoder used here.
+//    - **Server frames MUST NOT be masked** (§5.1), and a client receiving a
+//      masked frame must fail the connection - so that is checked, not assumed.
+//    - The handshake response is *verified*: `Sec-WebSocket-Accept` must equal
+//      base64(SHA-1(key + GUID)). Skipping that check means happily talking
+//      framed binary at any endpoint that answered 101, which is how a relay
+//      ends up silently pointed at the wrong service.
+//
+//  POSIX only, following the event loop; on Windows this compiles to nothing
+//  and SNICHOLLS_HAS_WEBSOCKET_CLIENT is 0.
+//
+
+#ifndef ts_moveables_websocket_client_hpp
+#define ts_moveables_websocket_client_hpp
+
+// (inlined) #include "websocket.hpp"
+
+#if !SNICHOLLS_HAS_WEBSOCKET
+#define SNICHOLLS_HAS_WEBSOCKET_CLIENT 0
+#else
+#define SNICHOLLS_HAS_WEBSOCKET_CLIENT 1
+
+// (inlined) #include "../event/loop.hpp"
+// (inlined) #include "../moveable/signal.hpp"
+
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace snicholls {
+namespace http {
+
+namespace detail {
+
+// The client-side encoder. Identical to ws_frame except the mask bit is set and
+// the payload is XORed with a per-frame key - RFC 6455 §5.3 requires a fresh,
+// unpredictable key on every frame, so the caller passes one in rather than
+// this reaching for a global generator.
+inline std::string ws_frame_masked(ws_opcode op, const char* data, std::size_t n,
+                                   std::uint32_t mask, bool fin = true)
+{
+    std::string f;
+    f.reserve(n + 14);
+    f.push_back(char((fin ? 0x80 : 0x00) | static_cast<std::uint8_t>(op)));
+    if (n < 126) {
+        f.push_back(char(0x80 | n));
+    } else if (n <= 0xFFFF) {
+        f.push_back(char(0x80 | 126));
+        f.push_back(char((n >> 8) & 0xff));
+        f.push_back(char(n & 0xff));
+    } else {
+        f.push_back(char(0x80 | 127));
+        for (int i = 7; i >= 0; --i)
+            f.push_back(char((static_cast<std::uint64_t>(n) >> (i * 8)) & 0xff));
+    }
+    unsigned char k[4] = {
+        static_cast<unsigned char>((mask >> 24) & 0xff),
+        static_cast<unsigned char>((mask >> 16) & 0xff),
+        static_cast<unsigned char>((mask >> 8) & 0xff),
+        static_cast<unsigned char>(mask & 0xff)};
+    f.append(reinterpret_cast<const char*>(k), 4);
+    const std::size_t base = f.size();
+    f.append(data, n);
+    for (std::size_t i = 0; i < n; ++i)
+        f[base + i] = char(static_cast<unsigned char>(f[base + i]) ^ k[i & 3]);
+    return f;
+}
+
+// ws://host:port/path — enough URL parsing for this and no more. Returns false
+// on anything it does not understand rather than guessing, because a guess here
+// means connecting somewhere the caller did not ask for.
+struct ws_url {
+    std::string host;
+    std::string port = "80";
+    std::string path = "/";
+    bool secure = false;
+};
+
+inline bool parse_ws_url(const std::string& url, ws_url& out)
+{
+    std::size_t i = 0;
+    if (url.compare(0, 5, "ws://") == 0) {
+        i = 5;
+        out.secure = false;
+        out.port = "80";
+    } else if (url.compare(0, 6, "wss://") == 0) {
+        i = 6;
+        out.secure = true;
+        out.port = "443";
+    } else {
+        return false;
+    }
+    const std::size_t slash = url.find('/', i);
+    std::string authority = url.substr(i, slash == std::string::npos ? std::string::npos : slash - i);
+    out.path = (slash == std::string::npos) ? "/" : url.substr(slash);
+    if (authority.empty())
+        return false;
+    // A bracketed IPv6 literal keeps its colons; only the last colon outside
+    // brackets separates the port
+    if (authority[0] == '[') {
+        const std::size_t close = authority.find(']');
+        if (close == std::string::npos)
+            return false;
+        out.host = authority.substr(1, close - 1);
+        if (close + 1 < authority.size() && authority[close + 1] == ':')
+            out.port = authority.substr(close + 2);
+    } else {
+        const std::size_t colon = authority.rfind(':');
+        if (colon == std::string::npos) {
+            out.host = authority;
+        } else {
+            out.host = authority.substr(0, colon);
+            out.port = authority.substr(colon + 1);
+        }
+    }
+    return !out.host.empty() && !out.port.empty();
+}
+
+} // namespace detail
+
+struct ws_client_config {
+    // Reconnect. Delay is random in [0, min(max_backoff, min_backoff << attempt)]
+    // - full jitter, so a fleet of relays does not resynchronise on a restart.
+    std::chrono::milliseconds min_backoff{100};
+    std::chrono::milliseconds max_backoff{30000};
+
+    // How long a connection must last before its attempt counter is forgiven.
+    // Without this, a server that accepts then immediately drops resets backoff
+    // on every attempt and the client spins at full speed.
+    std::chrono::milliseconds session_grace{5000};
+
+    std::size_t max_message = 16u * 1024 * 1024;   // reassembled, across fragments
+    bool auto_reconnect = true;
+
+    // Sent as-is in the handshake: Authorization, Sec-WebSocket-Protocol, and
+    // anything else an upstream needs.
+    std::vector<std::pair<std::string, std::string>> headers;
+};
+
+// Why the connection ended, so a relay can log something useful rather than
+// "disconnected".
+enum class ws_client_status : std::uint8_t {
+    connect_failed,     // TCP never came up
+    handshake_failed,   // not a WebSocket endpoint, or the accept key was wrong
+    protocol_error,     // the peer broke RFC 6455
+    closed_by_peer,     // a clean close frame arrived
+    closed_locally,     // close() was called; no reconnect follows
+    transport_error     // the socket died mid-session
+};
+
+inline const char* to_string(ws_client_status s) noexcept
+{
+    switch (s) {
+    case ws_client_status::connect_failed:   return "connect_failed";
+    case ws_client_status::handshake_failed: return "handshake_failed";
+    case ws_client_status::protocol_error:   return "protocol_error";
+    case ws_client_status::closed_by_peer:   return "closed_by_peer";
+    case ws_client_status::closed_locally:   return "closed_locally";
+    default:                                 return "transport_error";
+    }
+}
+
+struct ws_client_stats {
+    std::uint64_t connects      = 0;   // successful handshakes
+    std::uint64_t reconnects    = 0;   // reconnect attempts started
+    std::uint64_t messages_in   = 0;
+    std::uint64_t messages_out  = 0;
+    std::uint64_t bytes_in      = 0;
+    bool          connected     = false;
+    std::uint32_t attempt       = 0;   // consecutive failures; 0 when healthy
+};
+
+// ---------------------------------------------------------------- the client
+//
+// A moveable handle over a shared core, like http::server and ws_broadcast_hub:
+// build it configured, move it into place, and the callbacks it parked stay
+// wired to the same core.
+
+class websocket_client {
+public:
+    using config = ws_client_config;
+    using status = ws_client_status;
+    using stats  = ws_client_stats;
+
+    websocket_client() : websocket_client(config{}) {}
+    explicit websocket_client(config cfg) : c_(std::make_shared<core>(std::move(cfg))) {}
+
+    websocket_client(websocket_client&&) noexcept = default;
+    websocket_client& operator=(websocket_client&&) noexcept = default;
+    websocket_client(const websocket_client&) = delete;
+    websocket_client& operator=(const websocket_client&) = delete;
+
+    ~websocket_client() = default;
+
+    // Connect-and-park, the same idiom as everything else here: the callback is
+    // held by the core, so it lives exactly as long as the client does.
+    template <typename F> void on_message(F&& f) { c_->on_message.connect(std::forward<F>(f)); }
+    template <typename F> void on_open(F&& f)    { c_->on_open.connect(std::forward<F>(f)); }
+    template <typename F> void on_close(F&& f)   { c_->on_close.connect(std::forward<F>(f)); }
+
+    // Start connecting. Returns false only if the URL is not one we understand -
+    // a refused connection is not a failure here, it is the first attempt.
+    bool connect(event_loop& loop, const std::string& url)
+    {
+        if (!detail::parse_ws_url(url, c_->url))
+            return false;
+        if (c_->url.secure)
+            return false;               // wss:// needs a TLS transport - see the header note
+        c_->loop = &loop;
+        c_->url_text = url;
+        c_->stopped = false;
+        auto c = c_;
+        loop.post([c] { c->begin_connect(); });
+        return true;
+    }
+
+    // Stop for good. No reconnect follows - a deliberate close is not a failure.
+    void close()
+    {
+        auto c = c_;
+        if (!c->loop)
+            return;
+        c->loop->post([c] { c->shutdown(ws_client_status::closed_locally, true); });
+    }
+
+    // Queue a text message. Safe from any thread; returns false only when the
+    // client is stopped, since a message sent while reconnecting is queued.
+    bool send_text(std::string payload)
+    {
+        auto c = c_;
+        if (!c->loop || c->stopped)
+            return false;
+        c->loop->post([c, p = std::move(payload)]() mutable {
+            c->queue_out(ws_opcode::text, std::move(p));
+        });
+        return true;
+    }
+
+    stats snapshot() const { return c_->snapshot(); }
+    bool connected() const noexcept { return c_->open; }
+    const std::string& url() const noexcept { return c_->url_text; }
+
+private:
+    struct core {
+        explicit core(config c) : cfg(std::move(c)), rng(std::random_device{}()) {}
+
+        config cfg;
+        event_loop* loop = nullptr;
+        detail::ws_url url;
+        std::string url_text;
+
+        int fd = -1;
+        event_loop::fd_watch watch;
+        event_loop::timer retry;
+
+        bool stopped = false;
+        bool open = false;              // handshake complete
+        bool handshaking = false;
+        std::uint32_t attempt = 0;
+        std::chrono::steady_clock::time_point session_start{};
+
+        std::string in;                 // raw bytes from the socket
+        std::string out;                // bytes awaiting the socket
+        std::size_t sent = 0;
+        std::string accept_expected;
+
+        // Fragment reassembly, per RFC 6455 §5.4
+        std::string frag;
+        ws_opcode frag_op = ws_opcode::text;
+        bool fragmented = false;
+
+        std::mt19937 rng;
+        moveable_signal<const ws_message&> on_message;
+        moveable_signal<> on_open;
+        moveable_signal<ws_client_status> on_close;
+
+        ws_client_stats st;
+
+        ws_client_stats snapshot() const
+        {
+            ws_client_stats s = st;
+            s.connected = open;
+            s.attempt = attempt;
+            return s;
+        }
+
+        std::uint32_t mask_key() { return static_cast<std::uint32_t>(rng()); }
+
+        // ---------------------------------------------------------- connect
+
+        void begin_connect()
+        {
+            if (stopped)
+                return;
+            addrinfo hints{};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            addrinfo* res = nullptr;
+            if (::getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &res) != 0 || !res)
+                return fail(ws_client_status::connect_failed);
+
+            int s = -1;
+            for (addrinfo* a = res; a; a = a->ai_next) {
+                s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+                if (s < 0)
+                    continue;
+                ::fcntl(s, F_SETFL, O_NONBLOCK);
+                const int on = 1;
+                ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+                const int rc = ::connect(s, a->ai_addr, a->ai_addrlen);
+                if (rc == 0 || errno == EINPROGRESS)
+                    break;
+                ::close(s);
+                s = -1;
+            }
+            ::freeaddrinfo(res);
+            if (s < 0)
+                return fail(ws_client_status::connect_failed);
+
+            fd = s;
+            in.clear();
+            out.clear();
+            sent = 0;
+            frag.clear();
+            fragmented = false;
+
+            // Wait for writability: on a non-blocking socket that is how the
+            // connect completes, success or refusal alike.
+            watch = loop->watch(fd, fd_interest::write);
+            auto self = this;
+            watch.on_writable([self] { self->on_connected(); });
+            watch.on_error([self] { self->fail(ws_client_status::connect_failed); });
+        }
+
+        void on_connected()
+        {
+            int err = 0;
+            socklen_t len = sizeof err;
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0)
+                return fail(ws_client_status::connect_failed);
+
+            // A 16-byte nonce, base64'd. The accept key we expect back is
+            // derived from it now so the reply can be checked rather than
+            // trusted.
+            unsigned char nonce[16];
+            for (int i = 0; i < 16; ++i)
+                nonce[i] = static_cast<unsigned char>(rng() & 0xff);
+            const std::string key = detail::base64(nonce, sizeof nonce);
+            const auto digest = detail::sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+            accept_expected = detail::base64(digest.data(), digest.size());
+
+            std::string req = "GET " + url.path + " HTTP/1.1\r\nHost: " + url.host;
+            if (url.port != "80")
+                req += ":" + url.port;
+            req += "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
+            req += "Sec-WebSocket-Key: " + key + "\r\n";
+            req += "Sec-WebSocket-Version: 13\r\n";
+            for (const auto& h : cfg.headers)
+                req += h.first + ": " + h.second + "\r\n";
+            req += "\r\n";
+
+            out += req;
+            handshaking = true;
+            watch.set_interest(fd_interest::read_write);
+            auto self = this;
+            watch.on_readable([self] { self->on_readable(); });
+            flush();
+        }
+
+        // --------------------------------------------------------- transport
+
+        void flush()
+        {
+            while (sent < out.size()) {
+                const ssize_t n = ::send(fd, out.data() + sent, out.size() - sent, 0);
+                if (n > 0) {
+                    sent += std::size_t(n);
+                    continue;
+                }
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    watch.set_interest(fd_interest::read_write);
+                    return;
+                }
+                return fail(ws_client_status::transport_error);
+            }
+            out.clear();
+            sent = 0;
+            watch.set_interest(fd_interest::read);
+        }
+
+        void on_readable()
+        {
+            for (;;) {
+                char buf[16 * 1024];
+                const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+                if (n > 0) {
+                    in.append(buf, std::size_t(n));
+                    st.bytes_in += std::uint64_t(n);
+                    if (std::size_t(n) < sizeof buf)
+                        break;
+                    continue;
+                }
+                if (n == 0)
+                    return fail(open ? ws_client_status::closed_by_peer
+                                     : ws_client_status::handshake_failed);
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    break;
+                return fail(ws_client_status::transport_error);
+            }
+            if (handshaking && !finish_handshake())
+                return;
+            if (open)
+                drain_frames();
+        }
+
+        bool finish_handshake()
+        {
+            const std::size_t end = in.find("\r\n\r\n");
+            if (end == std::string::npos) {
+                if (in.size() > 64 * 1024) {
+                    fail(ws_client_status::handshake_failed);
+                    return false;
+                }
+                return false;               // more to come
+            }
+            const std::string head = in.substr(0, end);
+            in.erase(0, end + 4);
+
+            if (head.compare(0, 12, "HTTP/1.1 101") != 0) {
+                fail(ws_client_status::handshake_failed);
+                return false;
+            }
+            // Verify the accept key. Anything can answer 101; only the endpoint
+            // that saw our nonce can produce this.
+            std::string lower = head;
+            for (char& ch : lower)
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            const std::size_t at = lower.find("sec-websocket-accept:");
+            if (at == std::string::npos) {
+                fail(ws_client_status::handshake_failed);
+                return false;
+            }
+            std::size_t vs = head.find(':', at) + 1;
+            while (vs < head.size() && (head[vs] == ' ' || head[vs] == '\t'))
+                ++vs;
+            std::size_t ve = head.find('\r', vs);
+            if (ve == std::string::npos)
+                ve = head.size();
+            if (head.substr(vs, ve - vs) != accept_expected) {
+                fail(ws_client_status::handshake_failed);
+                return false;
+            }
+
+            handshaking = false;
+            open = true;
+            ++st.connects;
+            // `attempt` is deliberately NOT cleared here. Connecting is not the
+            // same as working: a server that accepts and drops would reset the
+            // backoff on every attempt and turn reconnect into a hot loop. It
+            // is cleared in shutdown(), once a session has outlived
+            // session_grace and thereby earned it.
+            session_start = std::chrono::steady_clock::now();
+            on_open();
+            return true;
+        }
+
+        // ------------------------------------------------------------ frames
+
+        void drain_frames()
+        {
+            for (;;) {
+                if (in.size() < 2)
+                    return;
+                const unsigned char* p = reinterpret_cast<const unsigned char*>(in.data());
+                const bool fin = (p[0] & 0x80) != 0;
+                const bool rsv = (p[0] & 0x70) != 0;
+                const ws_opcode op = static_cast<ws_opcode>(p[0] & 0x0f);
+                const bool masked = (p[1] & 0x80) != 0;
+                std::uint64_t len = p[1] & 0x7f;
+                std::size_t hdr = 2;
+
+                // RFC 6455 §5.1: a server must never mask. Extensions are not
+                // negotiated here, so a reserved bit is equally a protocol error.
+                if (masked || rsv)
+                    return fail(ws_client_status::protocol_error);
+
+                if (len == 126) {
+                    if (in.size() < 4) return;
+                    len = (std::uint64_t(p[2]) << 8) | p[3];
+                    hdr = 4;
+                } else if (len == 127) {
+                    if (in.size() < 10) return;
+                    len = 0;
+                    for (int i = 0; i < 8; ++i)
+                        len = (len << 8) | p[2 + i];
+                    hdr = 10;
+                }
+                const bool control = (static_cast<std::uint8_t>(op) & 0x08) != 0;
+                if (control && (len > 125 || !fin))
+                    return fail(ws_client_status::protocol_error);
+                if (len > cfg.max_message)
+                    return fail(ws_client_status::protocol_error);
+                if (in.size() < hdr + len)
+                    return;                 // wait for the rest
+
+                std::string payload = in.substr(hdr, std::size_t(len));
+                in.erase(0, hdr + std::size_t(len));
+
+                if (!handle_frame(op, fin, control, std::move(payload)))
+                    return;
+                if (!open)
+                    return;                 // handle_frame tore it down
+            }
+        }
+
+        bool handle_frame(ws_opcode op, bool fin, bool control, std::string payload)
+        {
+            if (control) {
+                if (op == ws_opcode::ping) {
+                    queue_out(ws_opcode::pong, std::move(payload));
+                } else if (op == ws_opcode::close) {
+                    // Echo the close, then go. A peer close is not a failure,
+                    // but it does reconnect - the upstream may just be cycling.
+                    queue_out(ws_opcode::close, std::string());
+                    shutdown(ws_client_status::closed_by_peer, false);
+                    return false;
+                }
+                return true;                // pong: nothing to do
+            }
+
+            if (op == ws_opcode::continuation) {
+                if (!fragmented) {
+                    fail(ws_client_status::protocol_error);
+                    return false;
+                }
+                frag += payload;
+            } else {
+                if (fragmented) {           // a new data frame mid-fragment
+                    fail(ws_client_status::protocol_error);
+                    return false;
+                }
+                frag = std::move(payload);
+                frag_op = op;
+                fragmented = !fin;
+            }
+            if (frag.size() > cfg.max_message) {
+                fail(ws_client_status::protocol_error);
+                return false;
+            }
+            if (!fin)
+                return true;                // more fragments coming
+
+            fragmented = false;
+            ws_message m;
+            m.is_text = (frag_op == ws_opcode::text);
+            m.data = std::move(frag);
+            frag.clear();
+            ++st.messages_in;
+            on_message(m);
+            return true;
+        }
+
+        void queue_out(ws_opcode op, std::string payload)
+        {
+            if (fd < 0)
+                return;                     // reconnecting; the caller's message is dropped
+            out += detail::ws_frame_masked(op, payload.data(), payload.size(), mask_key());
+            if (op == ws_opcode::text || op == ws_opcode::binary)
+                ++st.messages_out;
+            if (open || handshaking)
+                flush();
+        }
+
+        // ------------------------------------------------------- teardown
+
+        void fail(ws_client_status why) { shutdown(why, false); }
+
+        void shutdown(ws_client_status why, bool final_)
+        {
+            const bool was_open = open;
+            open = false;
+            handshaking = false;
+            watch.reset();
+            if (fd >= 0) {
+                ::close(fd);
+                fd = -1;
+            }
+            in.clear();
+            out.clear();
+            sent = 0;
+
+            if (final_)
+                stopped = true;
+
+            // A session that lasted counts as working, so the next failure
+            // starts its backoff from scratch rather than from wherever the
+            // last outage left the counter.
+            if (was_open &&
+                std::chrono::steady_clock::now() - session_start >= cfg.session_grace)
+                attempt = 0;
+            else if (was_open || why != ws_client_status::closed_locally)
+                ++attempt;
+
+            on_close(why);
+
+            if (!stopped && cfg.auto_reconnect)
+                schedule_retry();
+        }
+
+        void schedule_retry()
+        {
+            // Full jitter: uniform in [0, ceiling]. Undithered backoff makes a
+            // fleet reconnect in lockstep and re-break whatever just recovered.
+            std::uint64_t ceiling = std::uint64_t(cfg.min_backoff.count());
+            const std::uint32_t shift = attempt < 20 ? attempt : 20;
+            ceiling <<= shift;
+            const std::uint64_t cap = std::uint64_t(cfg.max_backoff.count());
+            if (ceiling > cap || ceiling == 0)
+                ceiling = cap;
+            std::uniform_int_distribution<std::uint64_t> pick(0, ceiling);
+            const auto delay = std::chrono::milliseconds(pick(rng));
+
+            ++st.reconnects;
+            retry = loop->after(delay);
+            auto self = this;
+            retry.on_fire([self] { self->begin_connect(); });
+        }
+    };
+
+    std::shared_ptr<core> c_;
+};
+
+} // namespace http
+} // namespace snicholls
+
+#endif /* SNICHOLLS_HAS_WEBSOCKET */
+#endif /* ts_moveables_websocket_client_hpp */
+// end websocket_client.hpp
 // (inlined) #include "concurrent/synchronized.hpp"                 // IWYU pragma: export
 // (inlined) #include "concurrent/synchronized_heterogeneous.hpp"   // IWYU pragma: export
 // ----------------------------------------------------------------------

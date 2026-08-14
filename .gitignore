@@ -12,3 +12,9 @@ xcuserdata/
 
 # Agent worktrees (git worktree metadata, never committed)
 .claude/
+
+# Non-shipping experiments and parked WIP. Kept out of the repo rather than
+# deleted: these A/B harnesses are the evidence behind published numbers.
+# See scratch/README.md. Anything here that starts backing a claim in the
+# README should be promoted to a real benchmarks/ target so CI keeps it honest.
+scratch/

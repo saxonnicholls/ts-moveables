@@ -99,6 +99,7 @@
 
 #include "../moveable/signal.hpp"
 #include "../concurrent/mpmc_queue.hpp"
+#include "../utils/json.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -276,26 +277,11 @@ inline std::uint64_t next_seq() noexcept
 }
 
 // Just enough escaping for a JSON string - quotes, backslash, control chars
-inline void json_escape(const std::string& in, std::string& out)
-{
-    for (char c : in) {
-        switch (c) {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n";  break;
-        case '\r': out += "\\r";  break;
-        case '\t': out += "\\t";  break;
-        default:
-            if (static_cast<unsigned char>(c) < 0x20) {
-                char esc[8];
-                std::snprintf(esc, sizeof esc, "\\u%04x", c);
-                out += esc;
-            } else {
-                out += c;
-            }
-        }
-    }
-}
+// Was written out here, and separately in the WebSocket broadcast hub. The two
+// had drifted - this copy escaped \b and \f as  and  rather than
+// the short forms, which is still legal JSON, which is why it went unnoticed.
+// utils/json.hpp keeps the one copy now.
+using ::snicholls::utils::json_escape;
 
 inline const char* basename(const char* path) noexcept
 {

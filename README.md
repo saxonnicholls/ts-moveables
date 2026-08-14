@@ -9,6 +9,7 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[`synchronized<T>`](#synchronizedt)** — a value bonded to its mutex, reachable only under the lock, plus ready-made thread-safe heterogeneous containers (variant / tuple / any / type map / bag)
 - **[`circular_buffer`](#circular_buffer)** — a wait-free SPSC ring with two honest cache-line-separated atomics; ~2 ns/op batched
 - **[`disruptor`](#disruptor)** — the LMAX pattern: pre-allocated events, consumer dependency graphs, batch consumption, single **and** multi-producer; ~1 ns/event batched
+- **[`intern_pool`](#intern_pool)** — content-addressed interning: identical values collapse to one shared, immutable instance (equal data ⇒ one pointer), self-cleaning via weak references, collision-safe by exact compare
 - **[`moveable_signal`](#moveable_signal)** — thread-safe signal/slot whose connections survive moves, with no lock held while slots run
 - **[`event_loop`](#event_loop)** — a clean, typed POSIX reactor (epoll / kqueue) whose dispatch is signals: handler lifetimes safe by construction, moveable watches and timers, replayable by design
 - **[`time_master`](#time_master)** — the legendary periodic scheduler, rebuilt on the loop: drift-free *and* burst-free timers, events added and cancelled from any thread while running, and the whole scheduler is a moveable value
@@ -16,6 +17,8 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[`logging`](#logging)** — log and telemetry from any thread with no locks and no logger threaded through your call graph: bounded lock-free hand-off so producers never block, independent lanes so a slow sink cannot stall a fast one, and live JSON over the WebSocket
 - **[`http_server`](#http_server)** — a non-blocking HTTP/1.1 server (plus [WebSocket](#websocket) and TLS) on that reactor, with runtime delegates instead of `#ifdef`s and handlers that can answer *later*: 10,000 concurrent connections on one thread, available as a single drop-in header
 - **[`http2`](#http2)** — HTTP/2 as a protocol delegate: framing, HPACK with compile-time Huffman tables, flow control, multiplexing. **h2spec: 147 of 147**
+- **[`ws_broadcast_hub`](#ws_broadcast_hub)** — webhook → WebSocket fan-out on the reactor: any number of POST endpoints in, a crowd of topic-subscribed browsers out, per-topic replay history. One immutable frame is shared across every subscriber, so publish cost is flat in payload size
+- **[`websocket_client`](#websocket_client)** — the outbound half: connect *out* to N upstream feeds and stay connected. Exponential backoff with full jitter, the accept key verified rather than assumed, and client frames masked as RFC 6455 requires
 - **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs
 
 One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rule: every type keeps the **integrity of its state** across a move — a move happens on a quiescent object or fails loudly — which hands classes composed from these types the [rule of zero](https://en.cppreference.com/cpp/language/rule_of_three) back: write no special member functions, and the compiler generates correct moves. The overhead: composition wrappers are the same size as what they wrap (the tests `static_assert` it), the safety checks are a `try_lock` probe or a relaxed flag, and everything is header-only, C++17 and later, dependency-free, `cassert`-tested, and ThreadSanitizer-verified across the CI matrix.
@@ -130,6 +133,7 @@ Moved-from objects are always left valid and usable.
 | `concurrent/synchronized.hpp` | `synchronized<T, M>` / `synchronized_waitable<T, M>` | `folly::Synchronized` / P0290 | locked | locked / checked |
 | `concurrent/synchronized_heterogeneous.hpp` | `synchronized_variant<Ts...>`, `synchronized_tuple<Ts...>`, `synchronized_any`, `synchronized_type_map`, `synchronized_bag` | — | locked | locked |
 | `concurrent/circular_buffer.hpp` | `circular_buffer<T>` / `circular_buffer<T, N>` | `boost::lockfree::spsc_queue` (immovable) | checked | checked, contents transfer |
+| `concurrent/intern_pool.hpp` | `intern_pool<T, Hash, Eq>` — content-addressed interning (hash-consing) | `boost::flyweight` | — (would fork identity) | quiescent; canonical pointers survive |
 | `concurrent/mpmc_queue.hpp` | `mpmc_queue<T>` (bounded, lock-free) | Vyukov bounded MPMC / moodycamel | — | quiescent, contents transfer |
 | `concurrent/work_stealing_deque.hpp` | `work_stealing_deque<T>` (bounded Chase-Lev) | Chase-Lev / Taskflow internals | — | — (internal, stable) |
 | `concurrent/disruptor.hpp` | `disruptor<T, WaitStrategy>` + `multi_producer_disruptor<T>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
@@ -138,7 +142,9 @@ Moved-from objects are always left valid and usable.
 | `event/time_master.hpp` | `time_master` — named, cancellable, repeating timers on the loop | Boost.Asio timer wrappers | — | moveable handle (heap core) |
 | `http/server.hpp` | `server` + `responder` / `response_stream`, HTTP/1.1 delegate | cpp-httplib (blocking) / Asio | — | moveable handle (heap core) |
 | `http/http2.hpp` | `http2_protocol` — framing, HPACK, flow control | nghttp2 | — | owned by the connection |
+| `http/websocket_client.hpp` | `websocket_client` — outbound WebSocket with auto-reconnect | libwebsockets client / Boost.Beast | — | moveable handle (heap core) |
 | `http/websocket.hpp`, `http/websocket_deflate.hpp` | RFC 6455 protocol delegate + RFC 7692 `permessage-deflate` | uWebSockets / libwebsockets | — | owned by the connection |
+| `http/ws_broadcast_hub.hpp` | `ws_broadcast_hub` — webhook → WebSocket fan-out with per-topic replay | — | — | moveable handle (heap core) |
 | `tls/openssl.hpp`, `tls/mbedtls.hpp` | memory-BIO transport delegates (**opt-in** — these link a library) | Asio SSL streams | — | owned by the connection |
 | `logging/logger.hpp` | `logger` + `lane`, `record`, console / JSON / file sinks, `journal` / `replayer` | spdlog | — | moveable handle (heap core) |
 | `interfaces/*.hpp` | `transport_delegate`, `protocol_delegate`, `task_pool`, `ws_extension` — the extension points | — | — | — (pure interfaces) |
@@ -273,6 +279,35 @@ d.publish([&](Trade& t) { t = incoming; });
 ```
 
 Both disciplines get the same dependency graphs, batch publication, wait strategies and mid-flight handle moves; the multi-producer path has its own tests for exactly-once delivery, out-of-order publication being gated, wraparound (where the availability marks must distinguish laps), dependency graphs and moves.
+
+## intern_pool
+
+Content-addressed interning ("hash-consing"): identical values collapse to a
+single shared, immutable instance, so equal data is stored once and compared by
+pointer.
+
+```cpp
+snicholls::intern_pool<std::string> pool;
+auto a = pool.intern(body);          // first time: adopts `body`
+auto b = pool.intern(body);          // same bytes: returns the SAME pointer
+assert(a.get() == b.get());          // equal data ⇒ one pointer
+```
+
+The pool holds **weak** references, so a value is freed as soon as the last user
+drops it — memory is bounded by the live working set, never by history, and there
+is no eviction policy to tune. It is **collision-safe**: the hash only selects a
+bucket, an exact equality compare decides membership, so two different values can
+never alias even in the same bucket (a probabilistic filter cannot promise that).
+Templated on `Hash` / `Eq`, so a faster byte hash drops in without touching the
+pool; `find()` probes without allocating and `snapshot()` reports interned / hits
+/ live.
+
+Its natural home is collapsing repeats at an ingress boundary (idempotency, keyed
+by a short id) — one buffer however many times the same message arrives. It is
+deliberately *not* wired into the hub's publish hot path: hashing a full frame on
+every publish costs more than the allocation a hit would save, so the win there is
+the shared-frame fan-out (see [`ws_broadcast_hub`](#ws_broadcast_hub)), not
+interning. Right tool, placed where it pays.
 
 ## moveable_signal
 
@@ -642,6 +677,67 @@ srv.get("/chat", snicholls::http::websocket_route(on_open, ws));
 Context takeover, both `no_context_takeover` flags and both window-bits parameters are negotiated per connection. A `server_max_window_bits` of 8 is **declined** rather than silently widened to 9 — zlib cannot do a raw 8-bit window, and claiming 8 while using 9 would be an interop lie. There is a decompression-bomb cap, because a few compressed bytes can expand without limit.
 
 And because transport and protocol are separate axes, **`wss://` needed no code at all** — it is this over the [TLS transport](#https-tls), and the two never meet. That is asserted by a test, not assumed.
+
+## websocket_client
+
+Every WebSocket piece above is the server side: browsers connect to us. This is the other direction — we connect **out** and stay connected. That is what turns the [broadcast hub](#ws_broadcast_hub) into a *relay*: N upstream feeds in, one fan-out core, M browsers out, on one reactor and one thread.
+
+```cpp
+snicholls::event_loop loop;
+snicholls::http::ws_broadcast_hub hub;
+
+snicholls::http::websocket_client up;
+up.on_message([&hub](const auto& m) { hub.publish("prices", m.data); });
+up.connect(loop, "ws://feed.internal:9000/stream");
+```
+
+**Staying connected is the whole component.** A relay that dies when its upstream restarts is not a relay, it is an outage waiting for a deploy — so reconnect is the default rather than something you remember to add:
+
+- **Exponential backoff with full jitter** — the delay is random in `[0, min(cap, base × 2^attempt)]`. The jitter is not decoration: when a feed restarts, every relay attached to it reconnects at once, and undithered backoff synchronises them into a thundering herd that knocks the feed straight back over.
+- **Backoff resets on a *working* session, not a successful connect.** A server that accepts and immediately drops would otherwise reset the delay on every attempt and spin at full rate. `session_grace` is how long a connection must survive to count.
+- **`close()` is final.** Only failures reconnect, so shutdown does not race the backoff timer forever.
+
+**Three RFC 6455 obligations that differ at this end**, because it is the end that gets them wrong. Client frames **must** be masked (§5.3) with a fresh key per frame — an unmasked one is a protocol error a real server closes on. Server frames must **not** be masked (§5.1), so a masked inbound frame fails the connection rather than being quietly unmasked. And the handshake is **verified**: `Sec-WebSocket-Accept` must equal `base64(SHA-1(key + GUID))`. Skipping that means happily talking framed binary at anything that answered `101` — which is how a relay ends up silently pointed at the wrong service. There is a test that a plain `200 OK` is not mistaken for an upgrade.
+
+Survivability is tested the only way it means anything: the test connects, **kills the upstream**, restarts it on the same port, and requires the client to come back on its own and still carry traffic.
+
+`wss://` parses but is not yet connected — it needs the TLS transport on the client path, which is the natural next step and is filed in [FUTURE_DIRECTIONS](FUTURE_DIRECTIONS.md).
+
+## ws_broadcast_hub
+
+A `webhook → WebSocket` fan-out built on the [event_loop](#event_loop),
+[http_server](#http_server) and [websocket](#websocket): any number of POST
+endpoints publish messages in, a crowd of browsers subscribe by topic and receive
+them live, and a small per-topic history is replayed to whoever connects next. The
+hub knows nothing about what the messages mean — topics are strings, payloads are
+bytes.
+
+```cpp
+snicholls::http::server           server;
+snicholls::http::ws_broadcast_hub hub;
+
+hub.mount(server);                              // GET /ws?topic=..  +  POST /ingest/:topic
+
+// or run several independent webhook endpoints, each feeding its own topic:
+server.post("/hook1", hub.ingest_handler("hook1"));
+server.post("/hook2", hub.ingest_handler("hook2"));
+
+server.listen("0.0.0.0", 8080);   // browser: new WebSocket("ws://host:8080/ws?topic=hook1")
+```
+
+**One frame, shared across the crowd.** A publish frames the message once and
+hands every subscriber a `shared_ptr<const std::string>` to that one buffer — the
+per-subscriber queues and the replay ring hold the shared pointer, never a copy.
+So publish cost is **flat in payload size**: fanning a message to 1000 subscribers
+costs the publishing thread ~23 µs whether the payload is 64 bytes or 8 KB (copying
+it per subscriber previously cost ~2 ms at 8 KB — a ~94× gap). On one thread that is
+~44 million fan-out deliveries/second; end-to-end you then meet the kernel's
+`send()` path, which is the real ceiling for remote subscribers (batch it with
+`io_uring`/`sendmmsg`, or use a shared-memory ring for same-host consumers).
+`websocket::send_text_shared` exposes the same zero-extra-copy send for any fan-out.
+
+Per-subscriber queues are **bounded** (trim-oldest with a high-water mark — never
+unbounded growth, and the publisher never blocks on the slowest reader).
 
 ## http_server
 

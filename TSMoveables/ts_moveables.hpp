@@ -22,6 +22,7 @@
 #include "moveable/latch.hpp"               // IWYU pragma: export
 #include "moveable/barrier.hpp"             // IWYU pragma: export
 #include "concurrent/circular_buffer.hpp"              // IWYU pragma: export
+#include "concurrent/intern_pool.hpp"                  // IWYU pragma: export
 #include "concurrent/mpmc_queue.hpp"                   // IWYU pragma: export
 #include "concurrent/disruptor.hpp"                    // IWYU pragma: export
 #include "moveable/signal.hpp"              // IWYU pragma: export
@@ -31,6 +32,8 @@
 #include "event/time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
 #include "http/server.hpp"                  // IWYU pragma: export (follows the event loop)
 #include "http/websocket.hpp"                    // IWYU pragma: export (a protocol delegate on it)
+#include "http/ws_broadcast_hub.hpp"             // IWYU pragma: export (fan-out over that)
+#include "http/websocket_client.hpp"            // IWYU pragma: export (the outbound half)
 #include "concurrent/synchronized.hpp"                 // IWYU pragma: export
 #include "concurrent/synchronized_heterogeneous.hpp"   // IWYU pragma: export
 
