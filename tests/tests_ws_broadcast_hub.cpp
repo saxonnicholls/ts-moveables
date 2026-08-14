@@ -444,6 +444,62 @@ void test_hub_backpressure_bounded()
     pass("ws_broadcast_hub: slow client is bounded, oldest dropped");
 }
 
+
+// Order is the guarantee a broadcast lives or dies on, and "four messages
+// arrived in order on one socket" does not establish it. What has to hold at
+// volume, across every subscriber at once, is:
+//
+//   1. seq is strictly increasing and GAPLESS per subscriber - a gap means a
+//      silent drop, a repeat or reorder means the fan-out lost its place;
+//   2. every subscriber observes the SAME total order, not merely a sorted one.
+//      Per-subscriber queues are independent, so this is the property that
+//      would break first if fan-out ever went concurrent per subscriber.
+void test_hub_total_order_is_identical_for_every_subscriber()
+{
+    static const int kMessages = 300;
+    static const int kSubs = 8;
+
+    hub_server s;
+    std::vector<ws_client> subs(kSubs);
+    for (int i = 0; i < kSubs; ++i) {
+        assert(subs[std::size_t(i)].connect_to(s.port, "/ws?topic=ord"));
+        assert(subs[std::size_t(i)].status() == 101);
+    }
+    spin_until([&] { return s.hub.subscribers() == kSubs; });
+
+    for (int i = 0; i < kMessages; ++i)
+        assert(http_post(s.port, "/ingest/ord", "m" + std::to_string(i)) == 202);
+
+    // Read every subscriber's stream in full, recording the sequence it saw
+    std::vector<std::vector<std::uint64_t>> seen(kSubs);
+    for (int i = 0; i < kSubs; ++i) {
+        for (int k = 0; k < kMessages; ++k) {
+            std::string frame;
+            assert(subs[std::size_t(i)].read_data_frame(frame));
+            const std::size_t at = frame.find("\"seq\":");
+            assert(at != std::string::npos);
+            seen[std::size_t(i)].push_back(std::strtoull(frame.c_str() + at + 6, nullptr, 10));
+        }
+    }
+
+    // 1. strictly increasing, and consecutive - no gaps, no repeats
+    for (int i = 0; i < kSubs; ++i) {
+        const auto& v = seen[std::size_t(i)];
+        assert(v.size() == std::size_t(kMessages));
+        for (std::size_t k = 1; k < v.size(); ++k)
+            assert(v[k] == v[k - 1] + 1);
+    }
+
+    // 2. and it is the same order for everyone, not just a sorted one each
+    for (int i = 1; i < kSubs; ++i)
+        assert(seen[std::size_t(i)] == seen[0]);
+
+    // Nothing was quietly dropped to achieve it
+    assert(s.hub.snapshot().dropped == 0);
+
+    pass("ws_broadcast_hub: one total order, gapless, identical across 8 subscribers");
+}
+
 } // namespace
 
 void run_ws_broadcast_hub_tests()
@@ -452,6 +508,7 @@ void run_ws_broadcast_hub_tests()
     test_hub_topic_isolation();
     test_hub_wildcard_and_fanout();
     test_hub_replay_on_connect();
+    test_hub_total_order_is_identical_for_every_subscriber();
     test_hub_unsubscribe_on_close();
     test_hub_direct_publish_api();
     test_hub_raw_framing();

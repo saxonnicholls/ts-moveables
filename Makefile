@@ -215,6 +215,13 @@ build/ws_hub_broadcast: benchmarks/ws_hub_broadcast.cpp $(HEADERS) | build
 bench-wshub: build/ws_hub_broadcast
 	./build/ws_hub_broadcast
 
+build/ws_relay_scaling: benchmarks/ws_relay_scaling.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    benchmarks/ws_relay_scaling.cpp -o $@ $(LDLIBS)
+
+bench-relay: build/ws_relay_scaling
+	./build/ws_relay_scaling
+
 # Head to head vs cpp-httplib. Fetches their header on demand into
 # benchmarks/third_party/ (gitignored) - the library stays dependency-free.
 build/http_compare: benchmarks/http_compare.cpp $(HEADERS) | build
@@ -265,4 +272,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub amalgamate check-amalgamate clean
+.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-relay amalgamate check-amalgamate clean
