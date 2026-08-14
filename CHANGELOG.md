@@ -7,7 +7,7 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
-## [Unreleased]
+## [1.1.0] — 2026-08-14
 
 ### Added
 
@@ -191,4 +191,5 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.1.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.0
 [1.0.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.0.0

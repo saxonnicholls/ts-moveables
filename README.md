@@ -18,6 +18,7 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[`http_server`](#http_server)** — a non-blocking HTTP/1.1 server (plus [WebSocket](#websocket) and TLS) on that reactor, with runtime delegates instead of `#ifdef`s and handlers that can answer *later*: 10,000 concurrent connections on one thread, available as a single drop-in header
 - **[`http2`](#http2)** — HTTP/2 as a protocol delegate: framing, HPACK with compile-time Huffman tables, flow control, multiplexing. **h2spec: 147 of 147**
 - **[`ws_broadcast_hub`](#ws_broadcast_hub)** — webhook → WebSocket fan-out on the reactor: any number of POST endpoints in, a crowd of topic-subscribed browsers out, per-topic replay history. One immutable frame is shared across every subscriber, so publish cost is flat in payload size
+- **[How much traffic can it carry?](#how-much-traffic-can-it-carry)** — the relay measured against a model: **~100 k deliveries/s** or **~0.9 GB/s** on one thread, **~10 KB per subscriber**, cost linear in M and flat in N
 - **[`websocket_client`](#websocket_client)** — the outbound half: connect *out* to N upstream feeds and stay connected. Exponential backoff with full jitter, the accept key verified rather than assumed, and client frames masked as RFC 6455 requires
 - **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs
 
@@ -677,6 +678,43 @@ srv.get("/chat", snicholls::http::websocket_route(on_open, ws));
 Context takeover, both `no_context_takeover` flags and both window-bits parameters are negotiated per connection. A `server_max_window_bits` of 8 is **declined** rather than silently widened to 9 — zlib cannot do a raw 8-bit window, and claiming 8 while using 9 would be an interop lie. There is a decompression-bomb cap, because a few compressed bytes can expand without limit.
 
 And because transport and protocol are separate axes, **`wss://` needed no code at all** — it is this over the [TLS transport](#https-tls), and the two never meet. That is asserted by a test, not assumed.
+
+## How much traffic can it carry?
+
+Measured on this machine (32-core x86-64, macOS, loopback) with `make bench-relay`, which runs a real N-in / M-out relay — N `websocket_client`s feeding a `ws_broadcast_hub` that fans out to M subscribers, **all on one loop and one thread**.
+
+![Relay scaling: cost is linear in M, flat in N, and throughput by payload](docs/relay_scaling.svg)
+
+**The model, and how well it holds.** Per inbound message the loop does a fixed amount of work and then a per-subscriber amount:
+
+> **cost = a + b·M**, with **a ≈ 74 µs** fixed and **b ≈ 9.4 µs** per subscriber
+
+| M subscribers | measured | model | residual |
+|---|---|---|---|
+| 100 | 1000 µs | 1001 µs | **−0.1 %** |
+| 200 | 1982 µs | 1997 µs | **+0.5 %** |
+
+Linearity in M is the shared-frame design showing up as a straight line: the JSON envelope is built **once** per publish, and only the per-socket encode and copy repeat. If the envelope were still built per subscriber, that line would bend.
+
+**Capacity, by payload.** Deliveries hold near 100 k/s until the payload gets big enough for bandwidth to take over:
+
+| payload | inbound msg/s | deliveries/s | out |
+|---|---|---|---|
+| 64 B | 2,087 | 104,000 | 6 MB/s |
+| 256 B | 2,031 | 102,000 | 25 MB/s |
+| 1 KB | 1,974 | 99,000 | 96 MB/s |
+| 4 KB | 1,747 | 87,000 | 341 MB/s |
+| 16 KB | 1,174 | 59,000 | **917 MB/s** |
+
+Two regimes, and knowing which you are in is the whole game: **small messages are syscall-bound** (~100 k `send()`s per second per thread, and `b` is that syscall, not our code), **large messages are bandwidth-bound** (~0.9 GB/s). Inbound capacity is simply `deliveries/s ÷ M`.
+
+**Memory: ~10 KB per subscriber.** 2,000 subscribers took RSS from 0.9 MB to 20.6 MB, so **10,000 connections ≈ 100 MB** — dominated by socket buffers, not our per-subscriber state. Measured in a fresh process per `make bench-relay-memory`, because RSS deltas taken between sweeps in one process read near zero: the allocator reuses pages it already faulted in.
+
+**N is free — and that answers the threading question.** Cost is flat across N=1…8 at fixed M (1 % spread), so the inbound side costs nothing the fan-out does not. That made the obvious next experiment worth running rather than assuming: giving eight inbound sockets eight loops and eight threads, instead of sharing the relay's one, came out at **−1 %**. Nothing, slightly worse.
+
+So the shape is **not** N threads in and M threads out. N is free, and "M threads" would mean a thread per browser — the blocking model this library exists to replace. The parallelism worth having is a *bounded* pool sharding the fan-out, which is what [`work_stealing_task_pool`](#thread_pool) is for; that is filed rather than built, because at ~100 k deliveries/s the ceiling is the kernel's `send()` path and a pool only helps once you have cores to spend on it.
+
+**Order survives all of it**, and that is asserted rather than hoped: with **32 concurrent publisher threads**, every subscriber sees one gapless total order — `seq` strictly increasing by exactly one — and *the same* order as every other subscriber, not merely a sorted view of its own. That last property is what breaks first if fan-out is ever made concurrent per subscriber, which is exactly the change the pool above would tempt someone into.
 
 ## websocket_client
 

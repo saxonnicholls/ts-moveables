@@ -62,18 +62,33 @@ void test_weak_self_clean()
 {
     intern_pool<std::string> pool;
 
-    const void* first = nullptr;
     {
         auto a = pool.intern(std::string("ephemeral"));
-        first = a.get();
         assert(pool.snapshot().live == 1);
-    } // a drops here -> weak ref expires
+        assert(pool.find(std::string("ephemeral")) == a);   // alive, and canonical
+    } // a drops here -> the pool held only a weak ref, so the value is gone
+
+    // The invariant is that the pool keeps no STRONG reference: the moment the
+    // last owner drops, the value is unreachable through the pool.
+    //
+    // This deliberately does NOT compare the new instance's address against the
+    // old one. That was the original check and it failed across Linux and macOS
+    // on both architectures, for a reason worth writing down: freeing a block
+    // and immediately allocating one the same size is exactly when an allocator
+    // hands back the address it just freed - the LIFO free-list hot path. So
+    // "a different address" asserts the opposite of what a good allocator does.
+    // It is also indeterminate to even read the old pointer's value once its
+    // object has ended. Reachability is the property; identity of a dead
+    // address is not.
+    assert(pool.find(std::string("ephemeral")) == nullptr);
 
     pool.sweep();
     assert(pool.snapshot().live == 0);          // reclaimed, no leak
 
     auto b = pool.intern(std::string("ephemeral"));
-    assert(b.get() != first);                   // a genuinely new instance
+    assert(b != nullptr);
+    assert(*b == "ephemeral");
+    assert(pool.find(std::string("ephemeral")) == b);       // the new one is canonical now
     assert(pool.snapshot().live == 1);
     pass("intern_pool: weak refs self-clean; memory bounded by the live set");
 }

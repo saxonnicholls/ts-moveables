@@ -78,6 +78,9 @@ int main()
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 using namespace snicholls;
 using namespace snicholls::http;
@@ -85,7 +88,39 @@ using namespace snicholls::http;
 namespace {
 
 bool markdown = false;
+bool csv = false;
+std::size_t memory_subs = 0;   // --memory M: isolated memory run, then exit
 std::size_t reader_threads = 4;
+
+// CURRENT resident set, in bytes - deliberately not ru_maxrss.
+//
+// getrusage reports the PEAK since process start, which is monotonic: the first
+// sweep sets a high-water mark and every later measurement in the same process
+// reports a delta of zero. That is not "no memory used", it is the wrong
+// instrument, and it read as a column of zeros before this was fixed.
+std::uint64_t rss_bytes()
+{
+#if defined(__APPLE__)
+    mach_task_basic_info info{};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+        return 0;
+    return static_cast<std::uint64_t>(info.resident_size);
+#else
+    // /proc/self/statm field 2 is resident pages
+    std::FILE* f = std::fopen("/proc/self/statm", "r");
+    if (!f)
+        return 0;
+    unsigned long total = 0, resident = 0;
+    const int got = std::fscanf(f, "%lu %lu", &total, &resident);
+    std::fclose(f);
+    if (got != 2)
+        return 0;
+    return static_cast<std::uint64_t>(resident) *
+           static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+#endif
+}
 
 double seconds_since(std::chrono::steady_clock::time_point t0)
 {
@@ -159,9 +194,12 @@ struct drain {
 };
 
 struct cell {
-    std::size_t n = 0, m = 0;
+    std::size_t n = 0, m = 0, payload = 0;
     double per_msg_us = 0;      // relay cost per INBOUND message
     double deliveries = 0;      // frames/s the relay handed to sockets
+    double inbound = 0;         // inbound messages/s the relay sustained
+    double mb_s = 0;            // payload bytes/s leaving the relay
+    double rss_per_sub = 0;     // peak RSS growth per attached subscriber, bytes
     bool complete = false;      // did every expected frame arrive
 };
 
@@ -242,6 +280,7 @@ cell run_relay(std::size_t n_in, std::size_t m_out, std::uint64_t msgs, std::siz
     }
 
     // --- M subscribers on the relay
+    const std::uint64_t rss_before = rss_bytes();
     std::vector<int> subs;
     subs.reserve(m_out);
     for (std::size_t i = 0; i < m_out; ++i) {
@@ -251,6 +290,7 @@ cell run_relay(std::size_t n_in, std::size_t m_out, std::uint64_t msgs, std::siz
     }
     const std::size_t m = subs.size();
     while (hub.subscribers() < m) std::this_thread::yield();
+    const std::uint64_t rss_after = rss_bytes();
 
     const std::size_t dthreads = std::min<std::size_t>(m, reader_threads);
     std::vector<drain> drains(dthreads ? dthreads : 1);
@@ -291,9 +331,16 @@ cell run_relay(std::size_t n_in, std::size_t m_out, std::uint64_t msgs, std::siz
     cell r;
     r.n = n_in;
     r.m = m;
+    r.payload = payload;
     r.complete = (got >= want);
+    const double sec = (secs > 0 ? secs : 1);
     r.per_msg_us = secs * 1e6 / double(msgs ? msgs : 1);
-    r.deliveries = double(got) / (secs > 0 ? secs : 1);
+    r.deliveries = double(got) / sec;
+    r.inbound = double(msgs) / sec;
+    r.mb_s = double(got) * double(payload) / sec / (1024.0 * 1024.0);
+    // Current RSS either side of attaching the subscribers.
+    r.rss_per_sub = m ? double(rss_after > rss_before ? rss_after - rss_before : 0) / double(m)
+                      : 0.0;
     return r;
 }
 
@@ -328,13 +375,59 @@ int main(int argc, char** argv)
     std::size_t payload = 256;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--markdown") == 0) markdown = true;
+        else if (std::strcmp(argv[i], "--csv") == 0) csv = true;
+        else if (std::strcmp(argv[i], "--memory") == 0 && i + 1 < argc) memory_subs = std::size_t(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--msgs") == 0 && i + 1 < argc) msgs = std::strtoull(argv[++i], nullptr, 10);
         else if (std::strcmp(argv[i], "--payload") == 0 && i + 1 < argc) payload = std::size_t(std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--readers") == 0 && i + 1 < argc) reader_threads = std::size_t(std::atoi(argv[++i]));
     }
 
+    // Memory has to be measured in a process that has done nothing else.
+    //
+    // RSS deltas taken between sweeps in one process are worthless here: the
+    // allocator reuses pages it already faulted in, so the second measurement
+    // of the same thing reads near zero. Page granularity compounds it - 50
+    // subscribers is a handful of pages, inside the noise. So this mode runs
+    // ONE configuration in a fresh process, with M large enough that the delta
+    // is unambiguous, and reports nothing else.
+    if (memory_subs) {
+        const std::uint64_t before = rss_bytes();
+        const cell c = run_relay(1, memory_subs, 200, 256);
+        const std::uint64_t after = rss_bytes();
+        const double per = c.m ? double(after - before) / double(c.m) : 0.0;
+        if (markdown) {
+            std::printf("### `make bench-relay-memory` - what a subscriber costs\n\n");
+            std::printf("| subscribers | RSS before | RSS after | per subscriber |\n|---|---|---|---|\n");
+            std::printf("| %zu | %.1f MB | %.1f MB | **%.0f bytes** |\n", c.m,
+                        before / 1048576.0, after / 1048576.0, per);
+            std::printf("\nMeasured in a fresh process against a single configuration: RSS deltas "
+                        "taken between sweeps in one process read near zero, because the allocator "
+                        "reuses pages it already faulted in.\n");
+        } else {
+            std::printf("memory - %zu subscribers on one relay, fresh process\n\n", c.m);
+            std::printf("  RSS before attach   %8.1f MB\n", before / 1048576.0);
+            std::printf("  RSS after  attach   %8.1f MB\n", after / 1048576.0);
+            std::printf("  per subscriber      %8.0f bytes\n", per);
+        }
+        return 0;
+    }
+
     const std::size_t m_sweep[] = {1, 10, 50, 100, 200};
     const std::size_t n_sweep[] = {1, 2, 4, 8};
+    const std::size_t p_sweep[] = {64, 256, 1024, 4096, 16384};
+
+    if (csv) {
+        std::printf("series,n,m,payload,per_msg_us,inbound_msgs_s,deliveries_s,mb_s,rss_per_sub\n");
+        auto emit = [](const char* series, const cell& c) {
+            std::printf("%s,%zu,%zu,%zu,%.3f,%.1f,%.1f,%.3f,%.0f\n", series, c.n, c.m, c.payload,
+                        c.per_msg_us, c.inbound, c.deliveries, c.mb_s, c.rss_per_sub);
+        };
+        for (std::size_t m : m_sweep) emit("m_sweep", run_relay(4, m, msgs, payload));
+        for (std::size_t n : n_sweep) emit("n_sweep", run_relay(n, 50, msgs, payload));
+        for (std::size_t b : p_sweep) emit("payload_sweep", run_relay(4, 50, msgs, b));
+        return 0;
+    }
+
 
     std::vector<cell> by_m;
     for (std::size_t m : m_sweep)
@@ -419,6 +512,25 @@ int main(int argc, char** argv)
         const double gain = shared.per_msg_us > 0
             ? 100.0 * (shared.per_msg_us - owned.per_msg_us) / shared.per_msg_us : 0.0;
         std::printf("%s  eight extra threads bought %+.0f%%\n", markdown ? "\n" : "", gain);
+    }
+
+    // Throughput in bytes, which is the number an operator actually budgets.
+    if (markdown)
+        std::printf("\n**Throughput by payload size** (N=4, M=50):\n\n"
+                    "| payload | inbound msg/s | deliveries/s | MB/s out | bytes/subscriber |\n"
+                    "|---|---|---|---|---|\n");
+    else
+        std::printf("\n  throughput by payload (N=4, M=50):\n"
+                    "  %-9s %14s %14s %11s %13s\n",
+                    "payload", "inbound msg/s", "deliveries/s", "MB/s out", "bytes/sub");
+    for (std::size_t b : p_sweep) {
+        const cell c = run_relay(4, 50, msgs, b);
+        if (markdown)
+            std::printf("| %zu B | %.0f | %.0f | %.1f | %.0f |\n",
+                        c.payload, c.inbound, c.deliveries, c.mb_s, c.rss_per_sub);
+        else
+            std::printf("  %-9zu %14.0f %14.0f %11.1f %13.0f\n",
+                        c.payload, c.inbound, c.deliveries, c.mb_s, c.rss_per_sub);
     }
 
     double lo = 1e30, hi = 0;

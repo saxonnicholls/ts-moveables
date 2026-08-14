@@ -500,6 +500,86 @@ void test_hub_total_order_is_identical_for_every_subscriber()
     pass("ws_broadcast_hub: one total order, gapless, identical across 8 subscribers");
 }
 
+
+// The previous test publishes from one thread, which is the case that cannot
+// fail. This is the one that can: many threads calling publish() at once, which
+// is exactly how a relay with N inbound feeds behaves.
+//
+// Concurrency makes the interleaving nondeterministic - which message gets seq
+// 7 is a race, and that is fine. What must NOT be nondeterministic is the
+// order once assigned. Three things are proved here, and together they are
+// what "the hub preserves order" has to mean:
+//
+//   1. seq is a genuine total order: the set delivered is exactly 1..K, so no
+//      number was issued twice and none was skipped;
+//   2. every subscriber sees it strictly increasing and gapless;
+//   3. every subscriber sees the SAME sequence - the identical interleaving,
+//      not merely a sorted view of its own.
+//
+// (3) is the one that would break first: it fails the moment fan-out stops
+// being serialised per message, which is precisely the change someone will be
+// tempted to make to parallelise the M side.
+void test_hub_order_holds_under_concurrent_publishers()
+{
+    // 32, because that is what this machine has and the race is only as good
+    // as the contention it actually creates. CI runners have far fewer cores,
+    // where 32 threads oversubscribe and interleave differently - which is a
+    // second useful shape for the same invariant, not a weaker one.
+    static const int kThreads = 32;
+    static const int kPerThread = 60;
+    static const int kSubs = 6;
+    static const int kTotal = kThreads * kPerThread;
+
+    hub_server s;
+    std::vector<ws_client> subs(kSubs);
+    for (int i = 0; i < kSubs; ++i)
+        assert(subs[std::size_t(i)].connect_to(s.port, "/ws?topic=race"));
+    spin_until([&] { return s.hub.subscribers() == kSubs; });
+
+    // Every thread publishes into the same hub at the same time
+    std::vector<std::thread> pubs;
+    for (int t = 0; t < kThreads; ++t)
+        pubs.emplace_back([&s, t] {
+            for (int i = 0; i < kPerThread; ++i)
+                s.hub.publish("race", "t" + std::to_string(t) + "-" + std::to_string(i));
+        });
+    for (auto& t : pubs)
+        t.join();
+
+    std::vector<std::vector<std::uint64_t>> seen(kSubs);
+    for (int i = 0; i < kSubs; ++i) {
+        for (int k = 0; k < kTotal; ++k) {
+            std::string frame;
+            assert(subs[std::size_t(i)].read_data_frame(frame));
+            const std::size_t at = frame.find("\"seq\":");
+            assert(at != std::string::npos);
+            seen[std::size_t(i)].push_back(std::strtoull(frame.c_str() + at + 6, nullptr, 10));
+        }
+    }
+
+    // 2. gapless and strictly increasing for everyone
+    for (int i = 0; i < kSubs; ++i) {
+        const auto& v = seen[std::size_t(i)];
+        assert(v.size() == std::size_t(kTotal));
+        for (std::size_t k = 1; k < v.size(); ++k)
+            assert(v[k] == v[k - 1] + 1);
+    }
+
+    // 1. the numbers issued are exactly a contiguous run - none duplicated,
+    //    none skipped, under a genuine race for the counter
+    const std::uint64_t first = seen[0].front();
+    for (std::size_t k = 0; k < seen[0].size(); ++k)
+        assert(seen[0][k] == first + k);
+
+    // 3. and it is ONE order, seen identically by all of them
+    for (int i = 1; i < kSubs; ++i)
+        assert(seen[std::size_t(i)] == seen[0]);
+
+    assert(s.hub.snapshot().dropped == 0);
+
+    pass("ws_broadcast_hub: 32 concurrent publishers, one gapless total order, identical for all");
+}
+
 } // namespace
 
 void run_ws_broadcast_hub_tests()
@@ -509,6 +589,7 @@ void run_ws_broadcast_hub_tests()
     test_hub_wildcard_and_fanout();
     test_hub_replay_on_connect();
     test_hub_total_order_is_identical_for_every_subscriber();
+    test_hub_order_holds_under_concurrent_publishers();
     test_hub_unsubscribe_on_close();
     test_hub_direct_publish_api();
     test_hub_raw_framing();

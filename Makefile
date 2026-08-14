@@ -222,6 +222,12 @@ build/ws_relay_scaling: benchmarks/ws_relay_scaling.cpp $(HEADERS) | build
 bench-relay: build/ws_relay_scaling
 	./build/ws_relay_scaling
 
+# Memory has to be measured in a process that has done nothing else - RSS
+# deltas between sweeps in one process read near zero, because the allocator
+# reuses pages it already faulted in.
+bench-relay-memory: build/ws_relay_scaling
+	./build/ws_relay_scaling --memory 2000
+
 # Head to head vs cpp-httplib. Fetches their header on demand into
 # benchmarks/third_party/ (gitignored) - the library stays dependency-free.
 build/http_compare: benchmarks/http_compare.cpp $(HEADERS) | build
@@ -272,4 +278,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-relay amalgamate check-amalgamate clean
+.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-relay bench-relay-memory amalgamate check-amalgamate clean
