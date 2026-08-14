@@ -63,6 +63,7 @@
 #define SNICHOLLS_HAS_WEBSOCKET_CLIENT 1
 
 #include "../event/loop.hpp"
+#include "../moveable/atomic.hpp"
 #include "../moveable/signal.hpp"
 
 #include <cctype>
@@ -264,9 +265,9 @@ public:
             return false;
         if (c_->url.secure)
             return false;               // wss:// needs a TLS transport - see the header note
-        c_->loop = &loop;
+        c_->loop.store(&loop, std::memory_order_relaxed);
         c_->url_text = url;
-        c_->stopped = false;
+        c_->stopped.store(false, std::memory_order_relaxed);
         auto c = c_;
         loop.post([c] { c->begin_connect(); });
         return true;
@@ -276,9 +277,10 @@ public:
     void close()
     {
         auto c = c_;
-        if (!c->loop)
+        event_loop* l = c->loop.load(std::memory_order_relaxed);
+        if (!l)
             return;
-        c->loop->post([c] { c->shutdown(ws_client_status::closed_locally, true); });
+        l->post([c] { c->shutdown(ws_client_status::closed_locally, true); });
     }
 
     // Queue a text message. Safe from any thread; returns false only when the
@@ -286,24 +288,32 @@ public:
     bool send_text(std::string payload)
     {
         auto c = c_;
-        if (!c->loop || c->stopped)
+        event_loop* l = c->loop.load(std::memory_order_relaxed);
+        if (!l || c->stopped.load(std::memory_order_relaxed))
             return false;
-        c->loop->post([c, p = std::move(payload)]() mutable {
+        l->post([c, p = std::move(payload)]() mutable {
             c->queue_out(ws_opcode::text, std::move(p));
         });
         return true;
     }
 
     stats snapshot() const { return c_->snapshot(); }
-    bool connected() const noexcept { return c_->open; }
-    const std::string& url() const noexcept { return c_->url_text; }
+    bool connected() const noexcept { return c_->open.load(std::memory_order_relaxed); }
+    // By value, not by reference: the member is rewritten by connect(), and a
+    // reference into it would both race that write and dangle past the
+    // client's life. Reflects the most recent connect().
+    std::string url() const { return c_->url_text; }
 
 private:
     struct core {
         explicit core(config c) : cfg(std::move(c)), rng(std::random_device{}()) {}
 
         config cfg;
-        event_loop* loop = nullptr;
+        // Set by connect() on the caller's thread, read by close() and
+        // send_text() on whatever thread calls them. Atomic because "the caller
+        // will obviously connect first" is a contract, not a guarantee, and a
+        // torn or stale pointer here is a crash rather than a wrong answer.
+        moveable_atomic<event_loop*> loop{nullptr};
         detail::ws_url url;
         std::string url_text;
 
@@ -311,10 +321,21 @@ private:
         event_loop::fd_watch watch;
         event_loop::timer retry;
 
-        bool stopped = false;
-        bool open = false;              // handshake complete
-        bool handshaking = false;
-        std::uint32_t attempt = 0;
+        // Written on the loop thread, read from the caller's: connected() and
+        // send_text() are public and callable from anywhere, and snapshot() is
+        // the whole point of a stats call. TSan caught these as plain bools -
+        // the same class of bug as the ws_state::open race Autobahn turned up,
+        // which is a reason to fix the pattern and not just this instance.
+        //
+        // Relaxed throughout, and deliberately: nothing is *published* through
+        // these. They carry no payload the reader then dereferences, so the
+        // ordering they need is none - only that the read is not torn and the
+        // compiler cannot hoist it out of a spin.
+        moveable_atomic<bool> stopped{false};
+        moveable_atomic<bool> open{false};       // handshake complete
+        moveable_atomic_uint32_t attempt{0};
+
+        bool handshaking = false;       // loop thread only
         std::chrono::steady_clock::time_point session_start{};
 
         std::string in;                 // raw bytes from the socket
@@ -332,13 +353,22 @@ private:
         moveable_signal<> on_open;
         moveable_signal<ws_client_status> on_close;
 
-        ws_client_stats st;
+        moveable_atomic_uint64_t n_connects{0};
+        moveable_atomic_uint64_t n_reconnects{0};
+        moveable_atomic_uint64_t n_messages_in{0};
+        moveable_atomic_uint64_t n_messages_out{0};
+        moveable_atomic_uint64_t n_bytes_in{0};
 
         ws_client_stats snapshot() const
         {
-            ws_client_stats s = st;
-            s.connected = open;
-            s.attempt = attempt;
+            ws_client_stats s;
+            s.connects     = n_connects.load(std::memory_order_relaxed);
+            s.reconnects   = n_reconnects.load(std::memory_order_relaxed);
+            s.messages_in  = n_messages_in.load(std::memory_order_relaxed);
+            s.messages_out = n_messages_out.load(std::memory_order_relaxed);
+            s.bytes_in     = n_bytes_in.load(std::memory_order_relaxed);
+            s.connected    = open.load(std::memory_order_relaxed);
+            s.attempt      = attempt.load(std::memory_order_relaxed);
             return s;
         }
 
@@ -348,7 +378,7 @@ private:
 
         void begin_connect()
         {
-            if (stopped)
+            if (stopped.load(std::memory_order_relaxed))
                 return;
             addrinfo hints{};
             hints.ai_family = AF_UNSPEC;
@@ -384,7 +414,7 @@ private:
 
             // Wait for writability: on a non-blocking socket that is how the
             // connect completes, success or refusal alike.
-            watch = loop->watch(fd, fd_interest::write);
+            watch = loop.load(std::memory_order_relaxed)->watch(fd, fd_interest::write);
             auto self = this;
             watch.on_writable([self] { self->on_connected(); });
             watch.on_error([self] { self->fail(ws_client_status::connect_failed); });
@@ -455,13 +485,13 @@ private:
                 const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
                 if (n > 0) {
                     in.append(buf, std::size_t(n));
-                    st.bytes_in += std::uint64_t(n);
+                    n_bytes_in.fetch_add(std::uint64_t(n), std::memory_order_relaxed);
                     if (std::size_t(n) < sizeof buf)
                         break;
                     continue;
                 }
                 if (n == 0)
-                    return fail(open ? ws_client_status::closed_by_peer
+                    return fail(open.load(std::memory_order_relaxed) ? ws_client_status::closed_by_peer
                                      : ws_client_status::handshake_failed);
                 if (errno == EINTR)
                     continue;
@@ -471,7 +501,7 @@ private:
             }
             if (handshaking && !finish_handshake())
                 return;
-            if (open)
+            if (open.load(std::memory_order_relaxed))
                 drain_frames();
         }
 
@@ -514,8 +544,8 @@ private:
             }
 
             handshaking = false;
-            open = true;
-            ++st.connects;
+            open.store(true, std::memory_order_relaxed);
+            n_connects.fetch_add(1, std::memory_order_relaxed);
             // `attempt` is deliberately NOT cleared here. Connecting is not the
             // same as working: a server that accepts and drops would reset the
             // backoff on every attempt and turn reconnect into a hot loop. It
@@ -570,7 +600,7 @@ private:
 
                 if (!handle_frame(op, fin, control, std::move(payload)))
                     return;
-                if (!open)
+                if (!open.load(std::memory_order_relaxed))
                     return;                 // handle_frame tore it down
             }
         }
@@ -617,7 +647,7 @@ private:
             m.is_text = (frag_op == ws_opcode::text);
             m.data = std::move(frag);
             frag.clear();
-            ++st.messages_in;
+            n_messages_in.fetch_add(1, std::memory_order_relaxed);
             on_message(m);
             return true;
         }
@@ -628,8 +658,8 @@ private:
                 return;                     // reconnecting; the caller's message is dropped
             out += detail::ws_frame_masked(op, payload.data(), payload.size(), mask_key());
             if (op == ws_opcode::text || op == ws_opcode::binary)
-                ++st.messages_out;
-            if (open || handshaking)
+                n_messages_out.fetch_add(1, std::memory_order_relaxed);
+            if (open.load(std::memory_order_relaxed) || handshaking)
                 flush();
         }
 
@@ -639,8 +669,8 @@ private:
 
         void shutdown(ws_client_status why, bool final_)
         {
-            const bool was_open = open;
-            open = false;
+            const bool was_open = open.load(std::memory_order_relaxed);
+            open.store(false, std::memory_order_relaxed);
             handshaking = false;
             watch.reset();
             if (fd >= 0) {
@@ -652,20 +682,20 @@ private:
             sent = 0;
 
             if (final_)
-                stopped = true;
+                stopped.store(true, std::memory_order_relaxed);
 
             // A session that lasted counts as working, so the next failure
             // starts its backoff from scratch rather than from wherever the
             // last outage left the counter.
             if (was_open &&
                 std::chrono::steady_clock::now() - session_start >= cfg.session_grace)
-                attempt = 0;
+                attempt.store(0, std::memory_order_relaxed);
             else if (was_open || why != ws_client_status::closed_locally)
-                ++attempt;
+                attempt.fetch_add(1, std::memory_order_relaxed);
 
             on_close(why);
 
-            if (!stopped && cfg.auto_reconnect)
+            if (!stopped.load(std::memory_order_relaxed) && cfg.auto_reconnect)
                 schedule_retry();
         }
 
@@ -674,7 +704,8 @@ private:
             // Full jitter: uniform in [0, ceiling]. Undithered backoff makes a
             // fleet reconnect in lockstep and re-break whatever just recovered.
             std::uint64_t ceiling = std::uint64_t(cfg.min_backoff.count());
-            const std::uint32_t shift = attempt < 20 ? attempt : 20;
+            const std::uint32_t a_ = attempt.load(std::memory_order_relaxed);
+            const std::uint32_t shift = a_ < 20 ? a_ : 20;
             ceiling <<= shift;
             const std::uint64_t cap = std::uint64_t(cfg.max_backoff.count());
             if (ceiling > cap || ceiling == 0)
@@ -682,8 +713,8 @@ private:
             std::uniform_int_distribution<std::uint64_t> pick(0, ceiling);
             const auto delay = std::chrono::milliseconds(pick(rng));
 
-            ++st.reconnects;
-            retry = loop->after(delay);
+            n_reconnects.fetch_add(1, std::memory_order_relaxed);
+            retry = loop.load(std::memory_order_relaxed)->after(delay);
             auto self = this;
             retry.on_fire([self] { self->begin_connect(); });
         }
