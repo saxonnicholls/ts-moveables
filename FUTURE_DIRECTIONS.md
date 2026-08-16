@@ -449,6 +449,47 @@ needed at the current scale.
 
 ---
 
+## 11. Gaps in the gates themselves
+
+Everything above is about what the library does. This is about what the checks
+around it *fail* to notice, which is a different and easier thing to leave
+unrecorded. All three were found while shipping 1.1.1 and none is fixed.
+
+**The amalgamation gate proves less than it appears to.** `check-amalgamate`
+regenerates `single_include/`, compiles a drop-in and runs it — but the drop-in
+is a one-line HTTP/1.1 server. So it verifies that *the amalgamation is not
+stale* and *the file compiles*, and nothing about what is in it. That is exactly
+how `http/http2.hpp` came to be missing from the umbrella header for an entire
+release: HTTP/2 was graded 147/147 by h2spec on every push while being absent
+from the file the README tells people to copy, and the gate could not see it
+because it never asked for h2. The fix is for the drop-in check to name each
+shipped component — construct an `http2_protocol`, a `ws_broadcast_hub`, a
+`websocket_client`, an `intern_pool` — so that "the single header contains the
+library" becomes an assertion rather than an assumption. A smoke test that only
+exercises the part that already worked cannot report on the part that did not.
+
+**Autobahn can take an x86-64 Linux runner down, and we do not know why.** Four
+runs died the same way: the step sits at `running Autobahn cases` for the best
+part of an hour, then the runner "lost communication with the server". It
+follows the grader rather than the compiler — moving the step from the GCC job
+to the Clang job moved the failure with it. The same pinned image, spec and echo
+server complete locally in about seven minutes with every case clean, so this is
+not the WebSocket code and not the suite finding a fault. It is now bounded
+(`timeout-minutes: 20`) and the step distinguishes "the grader could not run"
+from "the grader found failures", so a hang costs one step instead of every
+result on that runner. The hang itself is undiagnosed. Worth trying: a smaller
+case set per invocation, `--network host` alternatives, or a newer image.
+
+**A local Autobahn run under-reports, so it is not a substitute for CI.** CI
+grades 517 cases; the same command on macOS with Docker Desktop reaches 404 —
+same pinned image, same spec, different container networking (`--network host`
+on Linux against `host.docker.internal` here). Passing locally is therefore
+evidence of very little, and the 517 in the README is CI's number. Anyone
+tempted to conclude "Autobahn is fine, it passes on my machine" should know that
+roughly a fifth of the suite never ran.
+
+---
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:
@@ -475,4 +516,6 @@ Written down so nobody — including us — spends a busy week on them:
 | 11 | `event_loop` phase 2 comforts — POSIX signals as emissions, `WSAPoll` backend | Medium | Next |
 | 12 | QUIC + HTTP/3 (§8 phase 5) — wrap, do not write | Large ×2 | After phase 5's interop bar is agreed |
 | 13 | Two-machine head-to-head vs nginx (§8 phase 6a) | Medium | Needs a second machine, not more code |
+| 14 | Make the amalgamation gate name each shipped component (§11) | Small | Next — it missed HTTP/2 for a whole release |
+| 15 | Diagnose the Autobahn runner hang (§11) | Medium | Bounded for now; cause unknown |
 | 14 | `ws_broadcast_hub` fan-out + `intern_pool` (§10) | Medium | ✅ **Shipped** — shared-frame fan-out (up to ~94× at 8 KB × 1000), fixed-topic multi-webhook, `intern_pool`. Syscall batching / shared-mem transport / conflation deferred (§10) |

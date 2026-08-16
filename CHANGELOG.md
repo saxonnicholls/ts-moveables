@@ -11,6 +11,19 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ### Fixed
 
+- **CI hardening found while shipping this release.** Autobahn was being graded
+  *twice* — its `if:` matched both x86-64 Linux jobs while the comment above it
+  said once was enough — and the step is now bounded (`timeout-minutes: 20`)
+  after four runs where it hung and took the whole runner down with it, losing
+  every other result on that machine. The step also now distinguishes "the
+  grader could not run" from "the grader found failures", which
+  `run_autobahn.sh` has always reported separately but the workflow collapsed
+  together. The hang itself is undiagnosed and recorded in FUTURE_DIRECTIONS §11,
+  along with two other gaps in the gates: the amalgamation check compiles only a
+  one-line HTTP/1.1 program (which is why it never noticed the missing HTTP/2),
+  and a local Autobahn run reaches 404 of the 517 cases CI grades, so passing
+  locally is not evidence about that suite.
+
 - **`http/http2.hpp` was missing from the umbrella header**, so HTTP/2 — graded
   147/147 by h2spec and headlined in the README — was unreachable both from
   `#include "ts_moveables.hpp"` and from the amalgamated `single_include/`
