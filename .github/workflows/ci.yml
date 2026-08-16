@@ -113,37 +113,6 @@ jobs:
             ./build/replay_loop_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # The relay's capacity, its memory per subscriber, and the figure in the
-      # README - regenerated here rather than trusted. A committed chart nobody
-      # can reproduce is a screenshot. x86-64 Linux only: the numbers are
-      # machine-specific and one runner's are enough to catch a regression in
-      # shape, while running it six times just adds noise to the summary.
-      - name: Relay scaling + memory (informational)
-        if: ${{ matrix.os == 'ubuntu-latest' && matrix.cxx == 'g++' }}
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          make build/ws_relay_scaling CXX=${{ matrix.cxx }}
-          ./build/ws_relay_scaling --msgs 800 --csv > relay.csv
-          python3 scripts/plot_relay.py relay.csv docs/relay_scaling.svg
-          {
-            echo "## Relay N-in / M-out - ${{ matrix.name }}"
-            echo ""
-            ./build/ws_relay_scaling --msgs 800 --markdown
-            echo ""
-            ./build/ws_relay_scaling --memory 2000 --markdown
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload the regenerated figure
-        if: ${{ matrix.os == 'ubuntu-latest' && matrix.cxx == 'g++' }}
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: relay-scaling-figure
-          path: |
-            docs/relay_scaling.svg
-            relay.csv
-
       # Autobahn|Testsuite: the external RFC 6455 grader. x86-64 Linux only -
       # it needs Docker with --network host to reach the echo server, and the
       # official image is published for amd64 only. Protocol conformance does
@@ -271,6 +240,42 @@ jobs:
       - name: Address + UB Sanitizers
         if: ${{ matrix.asan }}
         run: make asan CXX=${{ matrix.cxx }} STD=c++20
+
+      # LAST in this job, deliberately. It is informational, it is the
+      # heaviest thing here, and it opens thousands of sockets - so it must
+      # not sit upstream of a conformance suite whose container can then be
+      # OOM-killed by the pressure it leaves behind. That is exactly what
+      # happened: Autobahn's container exited 137 with our code unchanged.
+      # The relay's capacity, its memory per subscriber, and the figure in the
+      # README - regenerated here rather than trusted. A committed chart nobody
+      # can reproduce is a screenshot. x86-64 Linux only: the numbers are
+      # machine-specific and one runner's are enough to catch a regression in
+      # shape, while running it six times just adds noise to the summary.
+      - name: Relay scaling + memory (informational)
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.cxx == 'g++' }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make build/ws_relay_scaling CXX=${{ matrix.cxx }}
+          ./build/ws_relay_scaling --msgs 800 --csv > relay.csv
+          python3 scripts/plot_relay.py relay.csv docs/relay_scaling.svg
+          {
+            echo "## Relay N-in / M-out - ${{ matrix.name }}"
+            echo ""
+            ./build/ws_relay_scaling --msgs 800 --markdown
+            echo ""
+            ./build/ws_relay_scaling --memory 2000 --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the regenerated figure
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.cxx == 'g++' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-scaling-figure
+          path: |
+            docs/relay_scaling.svg
+            relay.csv
 
   cmake:
     name: CMake ${{ matrix.os }}

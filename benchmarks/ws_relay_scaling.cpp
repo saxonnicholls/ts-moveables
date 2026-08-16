@@ -225,9 +225,16 @@ cell run_relay(std::size_t n_in, std::size_t m_out, std::uint64_t msgs, std::siz
     ws_hub_config hcfg;
     hcfg.replay_on_connect = false;
     hcfg.max_subscribers = m_out + 16;
-    hcfg.max_queue_msgs = 1u << 16;
-    hcfg.max_queue_bytes = 512u * 1024 * 1024;
-    hcfg.send_high_water = 64u * 1024 * 1024;   // let the drain threads, not backpressure, set the pace
+    // Generous enough that backpressure does not set the pace, BOUNDED enough
+    // that a slow machine cannot turn "generous" into hundreds of megabytes.
+    // These were 512 MB and 64 MB, which is a ceiling rather than a budget: on
+    // a 32-core box the drain threads keep up and it never grows, on a 2-core
+    // CI runner they fall behind and it does - and the next container on that
+    // runner is the one that gets OOM-killed. The benchmark already reports
+    // INCOMPLETE if frames are dropped, so a real bound is safe to have.
+    hcfg.max_queue_msgs = 4096;
+    hcfg.max_queue_bytes = 4u * 1024 * 1024;
+    hcfg.send_high_water = 2u * 1024 * 1024;
 
     server relay;
     ws_broadcast_hub hub{hcfg};
