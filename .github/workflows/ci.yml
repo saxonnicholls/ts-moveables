@@ -117,8 +117,13 @@ jobs:
       # it needs Docker with --network host to reach the echo server, and the
       # official image is published for amd64 only. Protocol conformance does
       # not vary by architecture, so grading it once is enough.
+      # Pinned to ONE job, which is what the comment above always claimed but
+      # the condition did not do: `os == 'ubuntu-latest'` matches both the GCC
+      # and Clang x86-64 entries, so the suite was being graded twice. Clang
+      # rather than GCC because the GCC job also carries the relay benchmark,
+      # and that pairing is the combination whose runner kept dying.
       - name: Autobahn WebSocket conformance
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.cxx == 'clang++' }}
         run: |
           make build/ws_echo_server CXX=${{ matrix.cxx }}
           ./scripts/run_autobahn.sh
