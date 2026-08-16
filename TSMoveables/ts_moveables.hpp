@@ -31,6 +31,7 @@
 #include "event/loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 #include "event/time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
 #include "http/server.hpp"                  // IWYU pragma: export (follows the event loop)
+#include "http/http2.hpp"                       // IWYU pragma: export (a protocol delegate too)
 #include "http/websocket.hpp"                    // IWYU pragma: export (a protocol delegate on it)
 #include "http/ws_broadcast_hub.hpp"             // IWYU pragma: export (fan-out over that)
 #include "http/websocket_client.hpp"            // IWYU pragma: export (the outbound half)

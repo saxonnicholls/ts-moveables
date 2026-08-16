@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ts_moveables
-    VERSION 1.1.0
+    VERSION 1.1.1
     DESCRIPTION "Thread Safe Moveable Objects - moveable wrappers for the immovable C++ synchronisation primitives"
     HOMEPAGE_URL "https://github.com/saxonnicholls/ts-moveables"
     LANGUAGES CXX)

@@ -7,6 +7,20 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [1.1.1] — 2026-08-16
+
+### Fixed
+
+- **`http/http2.hpp` was missing from the umbrella header**, so HTTP/2 — graded
+  147/147 by h2spec and headlined in the README — was unreachable both from
+  `#include "ts_moveables.hpp"` and from the amalgamated `single_include/`
+  drop-in that the README tells people to copy. Nothing was wrong with the
+  HTTP/2 code; it simply was not wired into the two entry points most users
+  consume, and no comment anywhere claimed the omission was deliberate. Caught
+  by auditing the release assets rather than by a test, which is why
+  `check-amalgamate` now has company: the drop-in smoke test compiled a
+  one-line HTTP/1.1 program and so could never have noticed.
+
 ## [1.1.0] — 2026-08-14
 
 ### Added
@@ -191,5 +205,6 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.1.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.1
 [1.1.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.0
 [1.0.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.0.0
