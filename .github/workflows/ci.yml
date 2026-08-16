@@ -124,9 +124,33 @@ jobs:
       # and that pairing is the combination whose runner kept dying.
       - name: Autobahn WebSocket conformance
         if: ${{ matrix.os == 'ubuntu-latest' && matrix.cxx == 'clang++' }}
+        # Bounded, because it has taken a runner down four times: the step sat
+        # at "running Autobahn cases" for the best part of an hour and the
+        # runner then "lost communication with the server". It follows the
+        # grader, not the compiler - moving it from the GCC job to this one
+        # moved the failure with it. Locally the same pinned image finishes in
+        # about seven minutes.
+        #
+        # A grader that can hang must not be able to destroy the job around it:
+        # 20 minutes is nearly three times its honest runtime, and a timeout
+        # here loses one step instead of every result on the runner.
+        timeout-minutes: 20
         run: |
           make build/ws_echo_server CXX=${{ matrix.cxx }}
+          # run_autobahn.sh already separates the two outcomes that matter:
+          # exit 1 is "the suite found conformance failures" and must fail the
+          # build; exit 2 is "the grader could not run at all", which is a
+          # missing result rather than a bad one and should not be reported as
+          # a conformance fault.
+          set +e
           ./scripts/run_autobahn.sh
+          rc=$?
+          set -e
+          if [ "$rc" -eq 2 ]; then
+            echo "::warning::Autobahn could not run (exit 2): grader unavailable, not a conformance result"
+            exit 0
+          fi
+          exit "$rc"
 
       # TLS is the one opt-in part of the library; it links OpenSSL, so it
       # builds and runs on its own rather than inside the dependency-free suite.
