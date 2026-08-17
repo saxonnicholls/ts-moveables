@@ -50,6 +50,8 @@
 #endif
 
 #include "../../TSMoveables/http/websocket.hpp"
+#include "../../TSMoveables/http/websocket_client.hpp"
+#include "../../TSMoveables/moveable/mutex.hpp"
 
 #if SNICHOLLS_HAS_TLS
 
@@ -635,6 +637,155 @@ void run_backend(const self_signed& cred)
     test_file_credentials<Backend>(cred);
 }
 
+
+// ------------------------------------------------------ wss:// on the client
+//
+// OpenSSL only - there is no mbedTLS client context yet - so these sit outside
+// the per-backend sweep.
+//
+// The round trip is the least interesting of the three. A client that connects
+// is not the achievement; a client that REFUSES is. Verification off, or
+// verification without a hostname check, gives you a connection to whoever
+// answered, encrypted to them, and looking exactly like success.
+
+struct wss_fixture {
+    std::string ca_path;
+    explicit wss_fixture(const self_signed& cred)
+    {
+        char dir[] = "/tmp/tsm_wssXXXXXX";
+        assert(::mkdtemp(dir) != nullptr);
+        ca_path = std::string(dir) + "/ca.pem";
+        std::ofstream(ca_path) << cred.cert_pem;   // self-signed: it IS its own CA
+    }
+};
+
+// Drive one connection attempt to a verdict: opened, or closed with a reason.
+struct wss_attempt {
+    std::atomic<bool> opened{false};
+    std::atomic<bool> closed{false};
+    std::atomic<int>  last{-1};
+    std::string got;
+    moveable_mutex<> mtx;
+};
+
+bool run_wss(const std::string& url, ws_client_config cfg, wss_attempt& a,
+             const char* send_text = nullptr)
+{
+    event_loop loop;
+    websocket_client c{std::move(cfg)};
+    c.on_open([&a] { a.opened.store(true); });
+    c.on_close([&a](ws_client_status why) {
+        a.last.store(int(why));
+        a.closed.store(true);
+    });
+    c.on_message([&a](const ws_message& m) {
+        std::lock_guard<moveable_mutex<>> g(a.mtx);
+        a.got = m.data;
+    });
+    if (!c.connect(loop, url))
+        return false;
+    std::thread th([&loop] { loop.run(); });
+    spin_until_for([&a] { return a.opened.load() || a.closed.load(); });
+    if (a.opened.load() && send_text) {
+        c.send_text(send_text);
+        spin_until_for([&a] {
+            std::lock_guard<moveable_mutex<>> g(a.mtx);
+            return !a.got.empty();
+        });
+    }
+    c.close();
+    loop.stop();
+    th.join();
+    return true;
+}
+
+void test_wss_round_trip(const self_signed& cred)
+{
+    https_server<openssl_backend> s(cred);
+    wss_fixture fx(cred);
+
+    openssl_client_config ccfg;
+    ccfg.ca_file = fx.ca_path;                  // trust this one certificate
+    auto tls = std::make_shared<openssl_client_context>(ccfg);
+
+    ws_client_config cfg;
+    cfg.auto_reconnect = false;
+    cfg.transport_factory = [tls](const std::string& host) {
+        return std::unique_ptr<transport_delegate>(tls->connect(host).release());
+    };
+
+    wss_attempt a;
+    // "localhost", not 127.0.0.1: the certificate's CN is localhost, and the
+    // name dialled is the name checked
+    assert(run_wss("wss://localhost:" + std::to_string(s.port) + "/ws", cfg, a, "over-tls"));
+    assert(a.opened.load());
+    {
+        std::lock_guard<moveable_mutex<>> g(a.mtx);
+        assert(a.got == "secure-echo:over-tls");
+    }
+    pass("wss: websocket_client over TLS, round trip, chain and host verified");
+}
+
+void test_wss_refuses_untrusted_certificate(const self_signed& cred)
+{
+    https_server<openssl_backend> s(cred);
+
+    // No ca_file: the default trust store, which has never heard of this
+    // self-signed certificate. Connecting anyway would mean the verification
+    // is decorative.
+    auto tls = std::make_shared<openssl_client_context>(openssl_client_config{});
+
+    ws_client_config cfg;
+    cfg.auto_reconnect = false;
+    cfg.transport_factory = [tls](const std::string& host) {
+        return std::unique_ptr<transport_delegate>(tls->connect(host).release());
+    };
+
+    wss_attempt a;
+    assert(run_wss("wss://localhost:" + std::to_string(s.port) + "/ws", cfg, a));
+    assert(!a.opened.load());                   // the whole point
+    assert(a.closed.load());
+    pass("wss: an untrusted certificate is refused, not accepted quietly");
+}
+
+void test_wss_refuses_hostname_mismatch(const self_signed& cred)
+{
+    https_server<openssl_backend> s(cred);
+    wss_fixture fx(cred);
+
+    // The certificate IS trusted this time - same file as the round trip - but
+    // it is issued for "localhost" and we dial 127.0.0.1. A valid certificate
+    // for the wrong host is exactly what an interception proxy presents, so
+    // trusting the chain alone is not enough.
+    openssl_client_config ccfg;
+    ccfg.ca_file = fx.ca_path;
+    auto tls = std::make_shared<openssl_client_context>(ccfg);
+
+    ws_client_config cfg;
+    cfg.auto_reconnect = false;
+    cfg.transport_factory = [tls](const std::string& host) {
+        return std::unique_ptr<transport_delegate>(tls->connect(host).release());
+    };
+
+    wss_attempt a;
+    assert(run_wss("wss://127.0.0.1:" + std::to_string(s.port) + "/ws", cfg, a));
+    assert(!a.opened.load());
+    assert(a.closed.load());
+    pass("wss: a trusted certificate for the wrong host is still refused");
+}
+
+void test_wss_without_a_transport_is_refused_not_downgraded()
+{
+    // The failure that would matter most: a wss:// URL quietly connecting in
+    // plaintext. connect() must refuse rather than downgrade.
+    event_loop loop;
+    websocket_client c;                         // no transport_factory
+    assert(!c.connect(loop, "wss://example.com/feed"));
+    assert(c.connect(loop, "ws://example.com/feed"));   // ws:// still fine
+    c.close();
+    pass("wss: without a transport it is refused, never silently downgraded");
+}
+
 } // namespace
 
 int main()
@@ -642,6 +793,12 @@ int main()
     self_signed cred;
 
     run_backend<openssl_backend>(cred);
+
+    std::cout << "\n-- wss: outbound TLS (OpenSSL client)\n";
+    test_wss_round_trip(cred);
+    test_wss_refuses_untrusted_certificate(cred);
+    test_wss_refuses_hostname_mismatch(cred);
+    test_wss_without_a_transport_is_refused_not_downgraded();
 
 #if defined(SNICHOLLS_TEST_MBEDTLS)
     run_backend<mbedtls_backend>(cred);

@@ -63,10 +63,12 @@
 #define SNICHOLLS_HAS_WEBSOCKET_CLIENT 1
 
 #include "../event/loop.hpp"
+#include "../interfaces/transport_delegate.hpp"
 #include "../moveable/atomic.hpp"
 #include "../moveable/signal.hpp"
 
 #include <cctype>
+#include <functional>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -194,6 +196,21 @@ struct ws_client_config {
     // Sent as-is in the handshake: Authorization, Sec-WebSocket-Protocol, and
     // anything else an upstream needs.
     std::vector<std::pair<std::string, std::string>> headers;
+
+    // How bytes reach the wire. Empty means plaintext, and `ws://` needs
+    // nothing else. `wss://` requires one, and this header deliberately does
+    // not know what TLS is - the same two-axis split the server uses, which is
+    // what keeps the core dependency-free and the backend a run-time choice:
+    //
+    //     snicholls::http::openssl_client_context tls;
+    //     cfg.transport_factory = [&tls](const std::string& host) {
+    //         return tls.connect(host);        // verifies the chain AND the host
+    //     };
+    //
+    // The hostname is passed in because a client transport needs it for two
+    // things it cannot get anywhere else: the certificate check and SNI.
+    std::function<std::unique_ptr<transport_delegate>(const std::string& host)>
+        transport_factory;
 };
 
 // Why the connection ended, so a relay can log something useful rather than
@@ -263,8 +280,11 @@ public:
     {
         if (!detail::parse_ws_url(url, c_->url))
             return false;
-        if (c_->url.secure)
-            return false;               // wss:// needs a TLS transport - see the header note
+        // wss:// needs a transport. Refusing here rather than connecting in
+        // plaintext is the point: silently downgrading a wss:// URL would be
+        // the worst possible failure - it looks encrypted and is not.
+        if (c_->url.secure && !c_->cfg.transport_factory)
+            return false;
         c_->loop.store(&loop, std::memory_order_relaxed);
         c_->url_text = url;
         c_->stopped.store(false, std::memory_order_relaxed);
@@ -317,7 +337,26 @@ private:
         detail::ws_url url;
         std::string url_text;
 
+        // Every address the name resolved to, tried in order. A non-blocking
+        // connect() to a dead address returns EINPROGRESS, exactly like a live
+        // one - the refusal only surfaces later via SO_ERROR - so "use the
+        // first that did not fail immediately" silently commits to the wrong
+        // one. `localhost` resolving to ::1 ahead of 127.0.0.1 while only IPv4
+        // is listening is the everyday version of that, and it fails 100% of
+        // the time on a host that has both records.
+        struct candidate {
+            int family = 0, socktype = 0, protocol = 0;
+            sockaddr_storage addr{};
+            socklen_t len = 0;
+        };
+        std::vector<candidate> addrs;
+        std::size_t addr_at = 0;
+
         int fd = -1;
+        // Null for plaintext. When present every byte in either direction goes
+        // through it, and `in`/`out` become wire buffers with the plaintext on
+        // the other side of the transform.
+        std::unique_ptr<transport_delegate> transport;
         event_loop::fd_watch watch;
         event_loop::timer retry;
 
@@ -387,37 +426,72 @@ private:
             if (::getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &res) != 0 || !res)
                 return fail(ws_client_status::connect_failed);
 
-            int s = -1;
+            addrs.clear();
+            addr_at = 0;
             for (addrinfo* a = res; a; a = a->ai_next) {
-                s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+                if (a->ai_addrlen > sizeof(sockaddr_storage))
+                    continue;
+                candidate c;
+                c.family = a->ai_family;
+                c.socktype = a->ai_socktype;
+                c.protocol = a->ai_protocol;
+                c.len = a->ai_addrlen;
+                std::memcpy(&c.addr, a->ai_addr, a->ai_addrlen);
+                addrs.push_back(c);
+            }
+            ::freeaddrinfo(res);
+            if (addrs.empty())
+                return fail(ws_client_status::connect_failed);
+
+            try_next_address();
+        }
+
+        // One attempt per resolved address, in order, until one completes the
+        // handshake or the list runs out.
+        void try_next_address()
+        {
+            watch.reset();
+            if (fd >= 0) {
+                ::close(fd);
+                fd = -1;
+            }
+            while (addr_at < addrs.size()) {
+                const candidate& c = addrs[addr_at++];
+                const int s = ::socket(c.family, c.socktype, c.protocol);
                 if (s < 0)
                     continue;
                 ::fcntl(s, F_SETFL, O_NONBLOCK);
                 const int on = 1;
                 ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
-                const int rc = ::connect(s, a->ai_addr, a->ai_addrlen);
-                if (rc == 0 || errno == EINPROGRESS)
-                    break;
-                ::close(s);
-                s = -1;
+                const int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&c.addr), c.len);
+                if (rc != 0 && errno != EINPROGRESS) {
+                    ::close(s);
+                    continue;                   // refused outright; next address
+                }
+
+                fd = s;
+                in.clear();
+                out.clear();
+                sent = 0;
+                frag.clear();
+                fragmented = false;
+
+                // A fresh transport per attempt: TLS state cannot outlive the
+                // connection it belongs to, and a reconnect is a new session.
+                transport.reset();
+                if (cfg.transport_factory) {
+                    transport = cfg.transport_factory(url.host);
+                    if (!transport)
+                        return fail(ws_client_status::connect_failed);
+                }
+
+                watch = loop.load(std::memory_order_relaxed)->watch(fd, fd_interest::write);
+                auto self = this;
+                watch.on_writable([self] { self->on_connected(); });
+                watch.on_error([self] { self->try_next_address(); });
+                return;
             }
-            ::freeaddrinfo(res);
-            if (s < 0)
-                return fail(ws_client_status::connect_failed);
-
-            fd = s;
-            in.clear();
-            out.clear();
-            sent = 0;
-            frag.clear();
-            fragmented = false;
-
-            // Wait for writability: on a non-blocking socket that is how the
-            // connect completes, success or refusal alike.
-            watch = loop.load(std::memory_order_relaxed)->watch(fd, fd_interest::write);
-            auto self = this;
-            watch.on_writable([self] { self->on_connected(); });
-            watch.on_error([self] { self->fail(ws_client_status::connect_failed); });
+            fail(ws_client_status::connect_failed);   // every address exhausted
         }
 
         void on_connected()
@@ -425,7 +499,7 @@ private:
             int err = 0;
             socklen_t len = sizeof err;
             if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0)
-                return fail(ws_client_status::connect_failed);
+                return try_next_address();      // this address refused; try the next
 
             // A 16-byte nonce, base64'd. The accept key we expect back is
             // derived from it now so the reply can be checked rather than
@@ -447,7 +521,12 @@ private:
                 req += h.first + ": " + h.second + "\r\n";
             req += "\r\n";
 
-            out += req;
+            // TLS speaks first: the ClientHello has to be on the wire before
+            // the HTTP upgrade request, which then rides inside the session.
+            if (transport && !transport->start(out))
+                return fail(ws_client_status::transport_error);
+            if (!write_app(req.data(), req.size()))
+                return fail(ws_client_status::transport_error);
             handshaking = true;
             watch.set_interest(fd_interest::read_write);
             auto self = this;
@@ -456,6 +535,18 @@ private:
         }
 
         // --------------------------------------------------------- transport
+
+        // The one door out. Plaintext appends straight to the wire buffer; TLS
+        // hands the bytes to the engine and appends whatever ciphertext it
+        // produces. Nothing else in this class may touch `out` directly.
+        bool write_app(const char* data, std::size_t n)
+        {
+            if (!transport) {
+                out.append(data, n);
+                return true;
+            }
+            return transport->app_out(data, n, out);
+        }
 
         void flush()
         {
@@ -484,8 +575,17 @@ private:
                 char buf[16 * 1024];
                 const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
                 if (n > 0) {
-                    in.append(buf, std::size_t(n));
                     n_bytes_in.fetch_add(std::uint64_t(n), std::memory_order_relaxed);
+                    if (transport) {
+                        // Ciphertext in: plaintext lands in `in`, and anything
+                        // the handshake still owes the peer lands in `out`.
+                        if (!transport->wire_in(buf, std::size_t(n), in, out))
+                            return fail(open.load(std::memory_order_relaxed)
+                                            ? ws_client_status::transport_error
+                                            : ws_client_status::handshake_failed);
+                    } else {
+                        in.append(buf, std::size_t(n));
+                    }
                     if (std::size_t(n) < sizeof buf)
                         break;
                     continue;
@@ -499,6 +599,10 @@ private:
                     break;
                 return fail(ws_client_status::transport_error);
             }
+            // The TLS handshake produces bytes in response to bytes; without
+            // this the exchange stalls with both ends waiting to be spoken to.
+            if (transport && !out.empty())
+                flush();
             if (handshaking && !finish_handshake())
                 return;
             if (open.load(std::memory_order_relaxed))
@@ -656,7 +760,10 @@ private:
         {
             if (fd < 0)
                 return;                     // reconnecting; the caller's message is dropped
-            out += detail::ws_frame_masked(op, payload.data(), payload.size(), mask_key());
+            const std::string f =
+                detail::ws_frame_masked(op, payload.data(), payload.size(), mask_key());
+            if (!write_app(f.data(), f.size()))
+                return fail(ws_client_status::transport_error);
             if (op == ws_opcode::text || op == ws_opcode::binary)
                 n_messages_out.fetch_add(1, std::memory_order_relaxed);
             if (open.load(std::memory_order_relaxed) || handshaking)

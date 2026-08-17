@@ -90,10 +90,16 @@ inline std::string openssl_error()
 
 // ------------------------------------------------------------ the delegate
 
+// Which end of the handshake this is. The byte plumbing either side of it is
+// identical - memory BIOs in, memory BIOs out - so the role is a parameter
+// rather than a second class. Only two things differ: which state OpenSSL is
+// put into, and that a client must SPEAK FIRST, which is what start() is for.
+enum class tls_role { server, client };
+
 class openssl_transport final : public transport_delegate {
 public:
-    // Takes an SSL* already configured for server-side accept
-    explicit openssl_transport(SSL* ssl) : ssl_(ssl)
+    explicit openssl_transport(SSL* ssl, tls_role role = tls_role::server)
+        : ssl_(ssl), role_(role)
     {
         // Memory BIOs both ways: OpenSSL reads ciphertext we hand it and
         // writes ciphertext we collect, and never touches a descriptor
@@ -102,7 +108,10 @@ public:
         BIO_set_mem_eof_return(rbio_, -1);      // "no data yet", not "end of stream"
         BIO_set_mem_eof_return(wbio_, -1);
         SSL_set_bio(ssl_, rbio_, wbio_);        // SSL takes ownership of both
-        SSL_set_accept_state(ssl_);
+        if (role_ == tls_role::client)
+            SSL_set_connect_state(ssl_);
+        else
+            SSL_set_accept_state(ssl_);
     }
 
     ~openssl_transport() override
@@ -129,7 +138,8 @@ public:
             return false;
 
         if (!established_) {
-            const int r = SSL_accept(ssl_);
+            const int r = (role_ == tls_role::client) ? SSL_connect(ssl_)
+                                                      : SSL_accept(ssl_);
             if (r == 1) {
                 established_ = true;
                 capture_alpn();
@@ -194,6 +204,29 @@ public:
         }
     }
 
+    // A server transport is driven entirely by arriving bytes. A client has
+    // nothing to react to yet: it must put the ClientHello on the wire first,
+    // and only then does the normal wire_in/app_out cycle take over. Harmless
+    // and a no-op for a server.
+    bool start(std::string& wire_out) override
+    {
+        if (role_ != tls_role::client || established_)
+            return true;
+        const int r = SSL_connect(ssl_);
+        if (r != 1) {
+            const int err = SSL_get_error(ssl_, r);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                drain(wire_out);
+                return false;
+            }
+        } else {
+            established_ = true;
+            capture_alpn();
+        }
+        drain(wire_out);
+        return true;
+    }
+
     bool peer_closed() const noexcept { return peer_closed_; }
 
 private:
@@ -239,6 +272,7 @@ private:
     BIO* wbio_ = nullptr;
     std::string pending_;                       // plaintext written pre-handshake
     std::string alpn_;
+    tls_role role_ = tls_role::server;
     bool established_ = false;
     bool peer_closed_ = false;
 };
@@ -360,6 +394,128 @@ private:
 
     std::unique_ptr<SSL_CTX, ctx_deleter> ctx_;
     std::vector<unsigned char> alpn_;
+};
+
+
+// ------------------------------------------------------- the client context
+//
+// The outbound half of TLS, and the half where the dangerous default lives.
+//
+// A server's job is to present a certificate. A client's job is to CHECK one,
+// and a client that skips the check is not "TLS without the fuss" - it is
+// plaintext that looks encrypted, because anyone who can answer the connection
+// can present any certificate they like and be believed. So verification is on
+// here and has to be turned off deliberately, by name, on a field whose name
+// says what it costs.
+//
+// Two checks, both required, and the second is the one people forget: the chain
+// must be trusted, AND the certificate must be FOR the host we asked for. A
+// valid certificate for a host you did not dial is exactly what an interception
+// proxy presents. OpenSSL will not do the second unless asked.
+//
+//      snicholls::http::openssl_client_context tls;   // verifies by default
+//      auto t = tls.connect("feed.example.com");
+//
+struct openssl_client_config {
+    // Off makes every other guarantee here meaningless. Named so that the
+    // grep for it in a review is unambiguous.
+    bool insecure_skip_verify = false;
+
+    // Empty means OpenSSL's default trust store, which is what a normal
+    // deployment wants. Set either to pin a private CA.
+    std::string ca_file;
+    std::string ca_path;
+
+    std::vector<std::string> alpn;           // e.g. {"http/1.1"}
+    bool send_sni = true;                    // most hosts require it to answer at all
+};
+
+class openssl_client_context {
+public:
+    explicit openssl_client_context(openssl_client_config cfg = openssl_client_config{})
+        : cfg_(std::move(cfg))
+    {
+        ctx_.reset(SSL_CTX_new(TLS_client_method()));
+        if (!ctx_)
+            throw std::runtime_error("openssl_client_context: SSL_CTX_new: " +
+                                     detail::openssl_error());
+        SSL_CTX_set_min_proto_version(ctx_.get(), TLS1_2_VERSION);
+        SSL_CTX_set_options(ctx_.get(), SSL_OP_NO_COMPRESSION);
+        SSL_CTX_set_mode(ctx_.get(), SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+                                     SSL_MODE_ENABLE_PARTIAL_WRITE);
+
+        if (!cfg_.insecure_skip_verify) {
+            SSL_CTX_set_verify(ctx_.get(), SSL_VERIFY_PEER, nullptr);
+            const bool have_explicit = !cfg_.ca_file.empty() || !cfg_.ca_path.empty();
+            if (have_explicit) {
+                if (SSL_CTX_load_verify_locations(
+                        ctx_.get(),
+                        cfg_.ca_file.empty() ? nullptr : cfg_.ca_file.c_str(),
+                        cfg_.ca_path.empty() ? nullptr : cfg_.ca_path.c_str()) != 1)
+                    throw std::runtime_error("openssl_client_context: trust store: " +
+                                             detail::openssl_error());
+            } else if (SSL_CTX_set_default_verify_paths(ctx_.get()) != 1) {
+                // Failing loudly beats verifying against an empty trust store,
+                // which would reject everything and read like a network fault
+                throw std::runtime_error("openssl_client_context: no default trust store: " +
+                                         detail::openssl_error());
+            }
+        }
+
+        if (!cfg_.alpn.empty()) {
+            std::string wire;
+            for (const auto& p : cfg_.alpn) {
+                wire.push_back(char(p.size()));
+                wire += p;
+            }
+            SSL_CTX_set_alpn_protos(ctx_.get(),
+                                    reinterpret_cast<const unsigned char*>(wire.data()),
+                                    unsigned(wire.size()));
+        }
+    }
+
+    openssl_client_context(openssl_client_context&&) noexcept = default;
+    openssl_client_context& operator=(openssl_client_context&&) noexcept = default;
+
+    // One transport for one connection. `hostname` is what the certificate is
+    // checked against and what SNI advertises, so it must be the name dialled -
+    // never an IP the name resolved to, which would defeat the check it feeds.
+    std::unique_ptr<openssl_transport> connect(const std::string& hostname) const
+    {
+        SSL* ssl = SSL_new(ctx_.get());
+        if (!ssl)
+            throw std::runtime_error("openssl_client_context: SSL_new: " +
+                                     detail::openssl_error());
+
+        if (!cfg_.insecure_skip_verify && !hostname.empty()) {
+            // The check people forget. Without it a valid certificate for ANY
+            // host passes, which is precisely what an interception proxy has.
+            if (SSL_set1_host(ssl, hostname.c_str()) != 1) {
+                SSL_free(ssl);
+                throw std::runtime_error("openssl_client_context: set1_host failed for " +
+                                         hostname);
+            }
+        }
+        if (cfg_.send_sni && !hostname.empty())
+            SSL_set_tlsext_host_name(ssl, hostname.c_str());
+
+        return std::unique_ptr<openssl_transport>(
+            new openssl_transport(ssl, tls_role::client));
+    }
+
+    SSL_CTX* native() const noexcept { return ctx_.get(); }
+
+private:
+    struct ctx_deleter {
+        void operator()(SSL_CTX* c) const noexcept
+        {
+            if (c)
+                SSL_CTX_free(c);
+        }
+    };
+
+    openssl_client_config cfg_;
+    std::unique_ptr<SSL_CTX, ctx_deleter> ctx_;
 };
 
 } // namespace http

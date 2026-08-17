@@ -7,6 +7,37 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Added
+
+- **`wss://` on `websocket_client`**, via a `transport_factory` on the config —
+  the same two-axis split the server uses, so the client header still does not
+  know what TLS is. `openssl_client_context` is the OpenSSL half:
+  `TLS_client_method`, TLS 1.2 floor, SNI, optional ALPN.
+  **Peer verification is on by default** and must be disabled by name
+  (`insecure_skip_verify`). Both required checks are made — the chain must be
+  trusted *and* the certificate must match the host dialled, the second being
+  the one usually forgotten and exactly what an interception proxy exploits.
+  A `wss://` URL with no transport is refused rather than downgraded to
+  plaintext. Four tests, and the two refusal tests were confirmed to fail when
+  verification is switched off, so they test the check rather than observing a
+  broken connection.
+- `transport_delegate::start()` — the outbound case. A server transport is
+  driven by bytes that arrive; a client must send the ClientHello before there
+  is anything to react to. Default no-op.
+
+### Fixed
+
+- **`websocket_client` gave up on the first resolved address.** A non-blocking
+  `connect()` to a dead address returns `EINPROGRESS` exactly like a live one -
+  the refusal only surfaces later through `SO_ERROR` - so taking the first
+  address that did not fail immediately silently commits to the wrong one. A
+  host with both AAAA and A records where only one is listening therefore
+  failed every time; `localhost` resolving to `::1` ahead of `127.0.0.1` is the
+  everyday version, and it is how this was found. The client now keeps the full
+  candidate list and falls through to the next address on refusal.
+
 ## [1.1.1] — 2026-08-16
 
 ### Fixed

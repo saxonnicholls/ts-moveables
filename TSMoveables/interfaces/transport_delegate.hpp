@@ -38,6 +38,12 @@ public:
     // The application wants to send bytes: append wire bytes to wire_out
     virtual bool app_out(const char* data, std::size_t n, std::string& wire_out) = 0;
 
+    // The outbound case. A server transport is driven entirely by bytes that
+    // arrive; a client one has to speak first - the ClientHello exists before
+    // there is anything to react to. Default no-op, because for a server and
+    // for plaintext there is nothing to say.
+    virtual bool start(std::string& /*wire_out*/) { return true; }
+
     virtual bool established() const noexcept { return true; }
     // The protocol ALPN settled on, or an **empty string** when nothing was
     // negotiated - a plaintext connection, or a client that offered no list.

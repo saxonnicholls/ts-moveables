@@ -739,7 +739,27 @@ up.connect(loop, "ws://feed.internal:9000/stream");
 
 Survivability is tested the only way it means anything: the test connects, **kills the upstream**, restarts it on the same port, and requires the client to come back on its own and still carry traffic.
 
-`wss://` parses but is not yet connected — it needs the TLS transport on the client path, which is the natural next step and is filed in [FUTURE_DIRECTIONS](FUTURE_DIRECTIONS.md).
+### `wss://` — and the default that matters
+
+The client takes a **transport factory**, the same two-axis split the server uses, so this header never learns what TLS is and the backend stays a run-time choice:
+
+```cpp
+snicholls::http::openssl_client_context tls;          // verifies by default
+snicholls::http::ws_client_config cfg;
+cfg.transport_factory = [&tls](const std::string& host) {
+    return tls.connect(host);
+};
+snicholls::http::websocket_client up{cfg};
+up.connect(loop, "wss://feed.example.com/stream");
+```
+
+**A client's job is to check a certificate, not to present one** — and a client that skips the check isn't "TLS without the fuss", it's plaintext that looks encrypted, because anyone who can answer the connection can present any certificate and be believed. So verification is **on by default** and has to be disabled by name, on a field called `insecure_skip_verify`.
+
+Two checks, both required, and the second is the one that gets forgotten: the chain must be trusted **and the certificate must be for the host you dialled**. A valid certificate for a host you didn't ask for is exactly what an interception proxy presents; OpenSSL will not check it unless asked. Both are tested, and the tests were confirmed to fail with verification disabled — an untrusted certificate is refused, and so is a trusted one issued for the wrong name.
+
+A `wss://` URL with no transport factory is **refused, never downgraded**. Silently connecting in plaintext would be the worst available failure.
+
+`ws_client_config::ca_file` pins a private CA; empty means the system trust store.
 
 ## ws_broadcast_hub
 
