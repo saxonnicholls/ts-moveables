@@ -761,6 +761,20 @@ A `wss://` URL with no transport factory is **refused, never downgraded**. Silen
 
 `ws_client_config::ca_file` pins a private CA; empty means the system trust store.
 
+**What TLS costs**, measured by `make bench-wss` — the same server, the same client, the same messages, once plaintext and once through OpenSSL, so the only difference is TLS:
+
+| payload | ws msg/s | wss msg/s | ws MB/s | wss MB/s | wss/ws |
+|---|---|---|---|---|---|
+| 64 B | 182,034 | 151,166 | 11 | 9 | **0.83×** |
+| 256 B | 167,997 | 146,999 | 41 | 36 | **0.88×** |
+| 1 KB | 169,515 | 138,474 | 166 | 135 | **0.82×** |
+| 4 KB | 150,794 | 108,202 | 589 | 423 | **0.72×** |
+| 16 KB | 100,523 | 58,570 | **1,571** | **915** | **0.58×** |
+
+So roughly **12–42%**, and the shape falsifies the obvious guess. TLS has a fixed per-record cost and a per-byte cost, and you would expect the fixed part to punish small messages hardest — the opposite is true here. The ratio is *best* at 256 B and *worst* at 16 KB, so what dominates is per-byte encryption, not per-record overhead. That is why this is a sweep and not a single percentage.
+
+Read the ratio rather than the rate: the rate is loopback on one machine.
+
 ## ws_broadcast_hub
 
 A `webhook → WebSocket` fan-out built on the [event_loop](#event_loop),

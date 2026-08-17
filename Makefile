@@ -147,6 +147,16 @@ build/tests_tls: tests/tls/tests_tls.cpp $(HEADERS) | build
 	    tests/tls/tests_tls.cpp -o $@ \
 	    -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto $(MBEDTLS_LDLIBS) $(LDLIBS)
 
+# ws vs wss on the same path. Lives with the TLS binaries because it links
+# OpenSSL; the core benchmarks stay dependency-free.
+build/ws_tls_throughput: benchmarks/tls/ws_tls_throughput.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    -I$(OPENSSL_PREFIX)/include benchmarks/tls/ws_tls_throughput.cpp -o $@ \
+	    -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto $(LDLIBS)
+
+bench-wss: build/ws_tls_throughput
+	./build/ws_tls_throughput
+
 test-tls: build/tests_tls
 	@echo "backends compiled: openssl$(if $(filter 1,$(MBEDTLS_FOUND)), + mbedtls, ONLY - mbedTLS absent)"
 	./build/tests_tls
@@ -278,4 +288,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-relay bench-relay-memory amalgamate check-amalgamate clean
+.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-relay bench-relay-memory bench-wss amalgamate check-amalgamate clean

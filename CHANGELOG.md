@@ -23,12 +23,24 @@ git tag, and `make check-version` fails if those three ever disagree.
   plaintext. Four tests, and the two refusal tests were confirmed to fail when
   verification is switched off, so they test the check rather than observing a
   broken connection.
+- `make bench-wss` — ws against wss on the same path, swept by payload size,
+  and in CI. The ratio is **0.58–0.88**, best at small payloads and worst at
+  large ones, which falsifies the obvious prediction: the fixed per-record cost
+  is not what dominates, per-byte encryption is.
 - `transport_delegate::start()` — the outbound case. A server transport is
   driven by bytes that arrive; a client must send the ClientHello before there
   is anything to react to. Default no-op.
 
 ### Fixed
 
+- **`websocket_client` memmoved its whole read buffer once per frame.** The
+  inbound path consumed frames with `in.erase(0, n)`, which shifts everything
+  behind the frame just consumed - so draining a window full of small frames
+  cost O(bytes x frames), quadratic in the batch. It now consumes with an
+  offset and compacts only when the consumed prefix is worth a single memmove,
+  the same idiom `h2_stream::out_buf` and the hub's queues already used.
+  Measured on the ws/wss benchmark: **+42% at 1 KB, +61% at 4 KB, +87% at
+  16 KB**, taking peak throughput from 838 MB/s to **1,571 MB/s**.
 - **`websocket_client` gave up on the first resolved address.** A non-blocking
   `connect()` to a dead address returns `EINPROGRESS` exactly like a live one -
   the refusal only surfaces later through `SO_ERROR` - so taking the first

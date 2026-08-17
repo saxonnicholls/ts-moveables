@@ -377,7 +377,12 @@ private:
         bool handshaking = false;       // loop thread only
         std::chrono::steady_clock::time_point session_start{};
 
+        // Consumed with an offset, never erase(0, n) per frame. Erasing the
+        // front of the buffer memmoves everything behind it, so draining a
+        // window full of small frames costs O(bytes x frames) - quadratic in
+        // the batch. Same idiom as h2_stream::out_buf and the hub's queues.
         std::string in;                 // raw bytes from the socket
+        std::size_t in_off = 0;         // how much of `in` is already consumed
         std::string out;                // bytes awaiting the socket
         std::size_t sent = 0;
         std::string accept_expected;
@@ -471,6 +476,7 @@ private:
 
                 fd = s;
                 in.clear();
+                in_off = 0;
                 out.clear();
                 sent = 0;
                 frag.clear();
@@ -611,7 +617,7 @@ private:
 
         bool finish_handshake()
         {
-            const std::size_t end = in.find("\r\n\r\n");
+            const std::size_t end = in.find("\r\n\r\n");   // handshake: offset is still 0
             if (end == std::string::npos) {
                 if (in.size() > 64 * 1024) {
                     fail(ws_client_status::handshake_failed);
@@ -621,6 +627,7 @@ private:
             }
             const std::string head = in.substr(0, end);
             in.erase(0, end + 4);
+            in_off = 0;
 
             if (head.compare(0, 12, "HTTP/1.1 101") != 0) {
                 fail(ws_client_status::handshake_failed);
@@ -665,9 +672,11 @@ private:
         void drain_frames()
         {
             for (;;) {
-                if (in.size() < 2)
-                    return;
-                const unsigned char* p = reinterpret_cast<const unsigned char*>(in.data());
+                const std::size_t avail = in.size() - in_off;
+                if (avail < 2)
+                    return compact_in();
+                const unsigned char* p =
+                    reinterpret_cast<const unsigned char*>(in.data()) + in_off;
                 const bool fin = (p[0] & 0x80) != 0;
                 const bool rsv = (p[0] & 0x70) != 0;
                 const ws_opcode op = static_cast<ws_opcode>(p[0] & 0x0f);
@@ -681,11 +690,11 @@ private:
                     return fail(ws_client_status::protocol_error);
 
                 if (len == 126) {
-                    if (in.size() < 4) return;
+                    if (avail < 4) return compact_in();
                     len = (std::uint64_t(p[2]) << 8) | p[3];
                     hdr = 4;
                 } else if (len == 127) {
-                    if (in.size() < 10) return;
+                    if (avail < 10) return compact_in();
                     len = 0;
                     for (int i = 0; i < 8; ++i)
                         len = (len << 8) | p[2 + i];
@@ -696,16 +705,26 @@ private:
                     return fail(ws_client_status::protocol_error);
                 if (len > cfg.max_message)
                     return fail(ws_client_status::protocol_error);
-                if (in.size() < hdr + len)
-                    return;                 // wait for the rest
+                if (avail < hdr + len)
+                    return compact_in();    // wait for the rest
 
-                std::string payload = in.substr(hdr, std::size_t(len));
-                in.erase(0, hdr + std::size_t(len));
+                std::string payload(in, in_off + hdr, std::size_t(len));
+                in_off += hdr + std::size_t(len);
 
                 if (!handle_frame(op, fin, control, std::move(payload)))
                     return;
                 if (!open.load(std::memory_order_relaxed))
                     return;                 // handle_frame tore it down
+            }
+        }
+
+        // Reclaim the consumed prefix once it is worth the single memmove -
+        // amortised O(1) per byte instead of one memmove per frame.
+        void compact_in()
+        {
+            if (in_off && in_off * 2 >= in.size()) {
+                in.erase(0, in_off);
+                in_off = 0;
             }
         }
 
@@ -785,6 +804,7 @@ private:
                 fd = -1;
             }
             in.clear();
+            in_off = 0;
             out.clear();
             sent = 0;
 

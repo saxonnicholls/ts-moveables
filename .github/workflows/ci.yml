@@ -190,6 +190,21 @@ jobs:
           make check-mbedtls MBEDTLS_PREFIX="$HOME/mbedtls-install"
           make test-tls CXX=${{ matrix.cxx }} STD=c++20 MBEDTLS_PREFIX="$HOME/mbedtls-install"
 
+      # What wss:// costs against ws:// on the same path. Informational, and on
+      # one job only - it is a ratio, and six runners would add noise rather
+      # than confidence.
+      - name: ws vs wss throughput (informational)
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.cxx == 'g++' }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make build/ws_tls_throughput CXX=${{ matrix.cxx }}
+          {
+            echo "## ws vs wss - ${{ matrix.name }}"
+            echo ""
+            ./build/ws_tls_throughput --msgs 8000 --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       # The single-file drop-in must build, run, and match the source headers -
       # a stale committed amalgamation is a broken promise, so fail on drift
       - name: Single-header amalgamation
