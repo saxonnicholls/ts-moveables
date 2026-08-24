@@ -356,6 +356,61 @@ void test_hub_replay_on_connect()
     pass("ws_broadcast_hub: replay-on-connect, then live, in order");
 }
 
+void test_hub_replay_bounded_by_bytes()
+{
+    // The ring is bounded by chunk COUNT and by BYTES, and the byte bound is
+    // the one that matters under fire: a chunk is whatever one producer
+    // batched (up to max_message_bytes), so a count alone is a worst case of
+    // ring_capacity x 1MB per topic - found the hard way, as 66MB of live
+    // heap in a single topic's ring after a 20-minute soak. Keep the count
+    // generous here and prove the bytes stay bounded, the survivors are the
+    // NEWEST run, and nothing between them was skipped.
+    ws_broadcast_hub::config cfg;
+    cfg.ring_capacity = 1024;                        // generous, as a dashboard wants
+    cfg.ring_bytes    = 64 * 1024;                   // the budget under test
+    hub_server s(cfg);
+
+    const int total = 64;
+    const std::size_t chunk = 8 * 1024;              // 64 x 8KB = 8x the budget
+    for (int i = 0; i < total; ++i) {
+        std::string body = "m" + std::to_string(i) + ":";
+        body.resize(chunk, 'x');
+        assert(http_post(s.port, "/ingest/fire", body) == 202);
+    }
+
+    // Accounted per ring, and every publish feeds two rings (topic + wildcard),
+    // so the hub-wide figure is bounded by twice the per-ring budget. The
+    // envelope adds bytes around each payload; one chunk of slack absorbs it.
+    const auto held = s.hub.snapshot().ring_bytes;
+    assert(held > 0);
+    assert(held <= 2 * (cfg.ring_bytes + chunk + 256));
+
+    // A fresh client replays only what fit: a contiguous run ending at the
+    // newest message, oldest evicted first.
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=fire"));
+    assert(http_post(s.port, "/ingest/fire", "end") == 202);   // sentinel: replay precedes live
+
+    std::vector<int> replayed;
+    for (;;) {
+        std::string f;
+        assert(c.read_data_frame(f));
+        if (contains(f, "\"payload\":\"end\""))
+            break;
+        const std::size_t at = f.find("\"payload\":\"m");
+        assert(at != std::string::npos);
+        replayed.push_back(std::atoi(f.c_str() + at + 12));
+    }
+    assert(!replayed.empty());
+    assert(replayed.size() < std::size_t(total));            // something was evicted
+    assert(replayed.size() * chunk <= cfg.ring_bytes);       // and what remains fits
+    assert(replayed.back() == total - 1);                    // newest survived
+    for (std::size_t k = 1; k < replayed.size(); ++k)        // as one gapless run
+        assert(replayed[k] == replayed[k - 1] + 1);
+
+    pass("ws_broadcast_hub: replay ring evicts oldest to hold its byte budget");
+}
+
 void test_hub_unsubscribe_on_close()
 {
     hub_server s;
@@ -594,6 +649,7 @@ void run_ws_broadcast_hub_tests()
     test_hub_topic_isolation();
     test_hub_wildcard_and_fanout();
     test_hub_replay_on_connect();
+    test_hub_replay_bounded_by_bytes();
     test_hub_total_order_is_identical_for_every_subscriber();
     test_hub_order_holds_under_concurrent_publishers();
     test_hub_unsubscribe_on_close();

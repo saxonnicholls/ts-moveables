@@ -107,6 +107,18 @@ struct ws_hub_config {
 
     std::size_t    max_subscribers   = 10000;             // total, across all topics
     std::size_t    ring_capacity     = 64;                // per-topic replay history (rounded up to a power of two)
+
+    // Per-topic replay budget in BYTES, beside the count above. A ring slot
+    // holds whatever one producer batched - up to max_message_bytes - so a
+    // count bound alone has a worst case of ring_capacity x 1MB per topic,
+    // and a firehose topic actually gets there: a 20-minute soak at ~290
+    // frames/s held 66MB of live heap in a single ring, still climbing,
+    // while the subscriber queues beside it (bounded by count AND bytes)
+    // stayed flat. The byte budget is what lets the count stay generous: a
+    // line-per-second topic keeps its minutes of replay depth, and the
+    // firehose evicts oldest until it fits. 0 disables the byte bound.
+    std::size_t    ring_bytes        = 8u * 1024 * 1024;
+
     std::size_t    max_message_bytes = 1u * 1024 * 1024;  // ingest + frame size cap
 
     // Per-connection outbound bound. A reader slower than the publish rate has
@@ -127,6 +139,11 @@ struct ws_hub_stats {
     std::uint64_t dropped     = 0;      // frames trimmed by backpressure
     std::uint64_t subscribers = 0;      // live subscribers now
     std::uint64_t seq         = 0;      // last sequence number issued
+    // Replay history held right now, as accounted per ring: a frame in both
+    // its topic's ring and the wildcard's counts twice, and actual heap is
+    // lower because rings share frames. The number to watch on a dashboard -
+    // it is the one that would have shown the pre-ring_bytes growth.
+    std::uint64_t ring_bytes  = 0;
 };
 
 // ---------------------------------------------------------------------- the hub
@@ -247,12 +264,22 @@ private:
     using sub_list     = std::vector<sub_ptr>;
     using sub_snapshot = std::shared_ptr<const sub_list>;    // copy-on-write, like moveable_signal
 
+    // One topic's replay history and how many bytes it is holding. The bytes
+    // ride beside the buffer rather than being recomputed on demand because
+    // eviction consults them on every push - the same reason subscriber
+    // queues carry queued_bytes.
+    struct ring_state {
+        circular_buffer<frame_ptr> cb;
+        std::size_t bytes = 0;
+        explicit ring_state(std::size_t cap) : cb(cap) {}
+    };
+
     struct impl : std::enable_shared_from_this<impl> {
         config cfg;
 
         moveable_mutex<> mtx;                                        // guards topics + rings
         std::unordered_map<std::string, sub_snapshot>              topics;   // topic -> subscriber snapshot
-        std::unordered_map<std::string, circular_buffer<frame_ptr>> rings; // topic -> replay history
+        std::unordered_map<std::string, ring_state>                rings;    // topic -> replay history
 
         event_loop::poster       poster;                            // set by mount(); may be empty
 
@@ -261,6 +288,9 @@ private:
         moveable_atomic_uint64_t published{0};
         moveable_atomic_uint64_t delivered{0};
         moveable_atomic_uint64_t dropped{0};
+        // Sum of every ring's bytes, mirrored into an atomic so snapshot()
+        // stays lock-free. Written only under mtx (push/evict), read anywhere.
+        moveable_atomic_uint64_t ring_held{0};
 
         explicit impl(config c) : cfg(std::move(c))
         {
@@ -504,6 +534,7 @@ private:
             s.dropped     = dropped.load();
             s.subscribers = sub_count.load();
             s.seq         = seq.load();
+            s.ring_bytes  = ring_held.load();
             return s;
         }
 
@@ -515,7 +546,7 @@ private:
             return it == topics.end() ? nullptr : it->second;
         }
 
-        circular_buffer<frame_ptr>& ring_for(const std::string& topic)
+        ring_state& ring_for(const std::string& topic)
         {
             auto it = rings.find(topic);
             if (it == rings.end())
@@ -525,26 +556,41 @@ private:
             return it->second;
         }
 
-        // Keep the last N: overwrite the oldest when full. Single-threaded here
-        // (mtx held), so the SPSC ring's push/pop are used without contention.
-        static void ring_push(circular_buffer<frame_ptr>& cb, const frame_ptr& msg)
+        // Keep the last N that fit the byte budget: count bound first, then
+        // evict oldest until under ring_bytes - but never the frame just
+        // pushed, so a chunk larger than the whole budget still replays
+        // itself. Single-threaded here (mtx held), so the SPSC ring's
+        // push/pop are used without contention.
+        void ring_push(ring_state& r, const frame_ptr& msg)
         {
-            if (cb.full()) {
-                frame_ptr discard;
-                cb.try_pop(discard);
+            if (r.cb.full())
+                ring_evict(r);
+            if (r.cb.try_push(msg)) {
+                r.bytes += msg->size();
+                ring_held.fetch_add(msg->size());
             }
-            cb.try_push(msg);
+            while (cfg.ring_bytes && r.bytes > cfg.ring_bytes && r.cb.size() > 1)
+                ring_evict(r);
+        }
+
+        void ring_evict(ring_state& r)
+        {
+            frame_ptr victim;
+            if (r.cb.try_pop(victim)) {
+                r.bytes -= victim->size();
+                ring_held.fetch_sub(victim->size());
+            }
         }
 
         // Non-destructive read of the whole ring, oldest -> newest: drain it and
         // refill it in the same order. Safe because mtx serialises all access.
-        static void ring_snapshot(circular_buffer<frame_ptr>& cb, std::vector<frame_ptr>& out)
+        static void ring_snapshot(ring_state& r, std::vector<frame_ptr>& out)
         {
             frame_ptr s;
-            while (cb.try_pop(s))
+            while (r.cb.try_pop(s))
                 out.push_back(std::move(s));
             for (const auto& m : out)
-                cb.try_push(m);
+                r.cb.try_push(m);
         }
     };
 

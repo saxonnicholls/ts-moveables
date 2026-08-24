@@ -33,6 +33,23 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ### Fixed
 
+- **`ws_broadcast_hub`'s replay ring was unbounded in bytes.** `ring_capacity`
+  bounded the ring by chunk *count* while the subscriber queues beside it were
+  bounded by count and bytes - and a chunk is whatever one producer batched,
+  up to `max_message_bytes`, so the worst case was `ring_capacity` x 1MB per
+  topic. Not theoretical: a 20-minute soak feeding one topic at ~290 frames/s
+  (super-log against 250 Binance streams) held 66MB of live reachable heap in
+  a single ring and climbed ~3MB/min, with `leaks` reporting zero - every
+  byte was still referenced, which is exactly why no leak tool would ever
+  have caught it. The ring now carries a byte budget, `config::ring_bytes`
+  (default 8MB, mirroring `max_queue_bytes`; 0 restores count-only), evicting
+  oldest-first until under budget but never the frame just pushed, so a chunk
+  larger than the whole budget still replays itself. Quiet topics keep their
+  full count-depth replay; only oversized history is trimmed. `stats` gains
+  `ring_bytes` - the number that would have shown this growth on any
+  dashboard - and the new unit test proves the bound holds, the survivors are
+  the newest, and the surviving run is gapless.
+
 - **`websocket_client` memmoved its whole read buffer once per frame.** The
   inbound path consumed frames with `in.erase(0, n)`, which shifts everything
   behind the frame just consumed - so draining a window full of small frames

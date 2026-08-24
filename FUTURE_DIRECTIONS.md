@@ -490,6 +490,41 @@ roughly a fifth of the suite never ran.
 
 ---
 
+## 12. gRPC — requested, not yet designed
+
+Saxon has asked for gRPC support (August 2026). Nothing is designed yet; this
+section exists so the request cannot get lost, and to record the decomposition
+before anyone assumes gRPC is one problem. It is three, and they fall on
+different sides of the native/wrap line this document keeps drawing:
+
+- **The transport is already ours.** gRPC is HTTP/2 with rules: requests are
+  POSTs, `content-type: application/grpc`, and the status arrives in HTTP
+  *trailers* — which the h2 layer must be able to send after the last DATA
+  frame. That trailer path is the first real gap to check in our native h2;
+  everything else (streams, flow control, HPACK) is shipped and h2spec-graded.
+- **The wire framing is bounded and native-sized.** A gRPC message is a 5-byte
+  prefix (1 compressed flag + 4 length, big-endian) on the DATA stream, plus
+  `grpc-status`/`grpc-message` trailers and the deadline/cancellation
+  semantics. This is days of work with an external grader available (the
+  interop tests in grpc/grpc), the same shape as the WebSocket story.
+- **Protobuf is where we wrap or decline.** Writing a protobuf compiler and
+  runtime is a project of its own (the QUIC rule applies). The choices, in
+  ascending coupling: (a) *gRPC framing only* — the app hands us serialised
+  message bytes, we never look inside; any codec, including protobuf via the
+  official library, JSON, or raw bytes. (b) Wrap protobuf as an optional
+  delegate, the `tls_delegate` pattern. (c) Wrap grpc++ wholesale — almost
+  certainly declined: it brings its own event loop and thread pools, which is
+  the architecture this library exists to avoid.
+
+Instinct, to be confirmed by a design pass: **(a) first** — a `grpc` layer on
+the native h2 server/client that does framing, trailers, deadlines and the
+interop handshake with payloads as opaque bytes, keeping the core
+dependency-free; protobuf arrives as an opt-in delegate for those who want
+typed stubs. Known gaps for the design pass: **there is no h2 client yet**
+(the server shipped first; a gRPC *client* needs one), trailer support must
+be verified in both directions, and the design must pick which subset of the
+grpc/grpc interop matrix is the honest first gate.
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:
