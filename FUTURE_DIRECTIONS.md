@@ -453,7 +453,8 @@ needed at the current scale.
 
 Everything above is about what the library does. This is about what the checks
 around it *fail* to notice, which is a different and easier thing to leave
-unrecorded. All three were found while shipping 1.1.1 and none is fixed.
+unrecorded. The first three were found while shipping 1.1.1; the sanitizer one
+came later, on a developer machine rather than in CI. None is fixed.
 
 **The amalgamation gate proves less than it appears to.** `check-amalgamate`
 regenerates `single_include/`, compiles a drop-in and runs it — but the drop-in
@@ -467,6 +468,21 @@ shipped component — construct an `http2_protocol`, a `ws_broadcast_hub`, a
 `websocket_client`, an `intern_pool` — so that "the single header contains the
 library" becomes an assertion rather than an assumption. A smoke test that only
 exercises the part that already worked cannot report on the part that did not.
+
+**`make tsan` and `make asan` do not run on Intel macOS 26 at all.** Every
+sanitized binary dies with SIGILL inside `__pthread_init` before reaching
+`main` — *BUG IN LIBPTHREAD: PTHREAD_SELF TSD not initialized* — including a
+`int main(){}` hello-world, so it is nothing about this library. It is not a
+toolchain mix-up either, which is the obvious first guess on a machine that has
+both: Apple clang 17.0.0 and Homebrew LLVM 21.1.2 fail identically on the same
+host (macOS 26.6, x86-64, no Rosetta involved), so the variable is the OS
+runtime rather than the compiler. The consequence is worth stating plainly
+because it is the kind of thing a developer discovers at the worst moment: on
+such a machine the sanitizer gates give **no local signal whatsoever**, and a
+concurrency change can only be graded by pushing. CI still runs both — TSan on
+four runners, ASan on Linux Clang — so the gates are intact; it is the local
+fast feedback that is missing, and anyone who reads a green `make test` as
+"TSan-clean" here is reading something the machine never checked.
 
 **Autobahn can take an x86-64 Linux runner down, and we do not know why.** Four
 runs died the same way: the step sits at `running Autobahn cases` for the best
