@@ -106,7 +106,14 @@ struct ws_hub_config {
     std::string    wildcard_topic    = "*";
 
     std::size_t    max_subscribers   = 10000;             // total, across all topics
-    std::size_t    ring_capacity     = 64;                // per-topic replay history (rounded up to a power of two)
+
+    // Per-topic replay history in chunks (rounded up to a power of two).
+    // Bounded in bytes by ring_bytes below, and the two bound different
+    // things: this one is how much history a quiet topic keeps, that one is
+    // how much memory a loud one may spend keeping it. Only together do they
+    // bound the right thing - which is why this can be generous. Set alone,
+    // it was doing both jobs and doing the second badly.
+    std::size_t    ring_capacity     = 64;
 
     // Per-topic replay budget in BYTES, beside the count above. A ring slot
     // holds whatever one producer batched - up to max_message_bytes - so a

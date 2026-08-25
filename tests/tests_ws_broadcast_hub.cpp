@@ -411,6 +411,54 @@ void test_hub_replay_bounded_by_bytes()
     pass("ws_broadcast_hub: replay ring evicts oldest to hold its byte budget");
 }
 
+void test_hub_replay_keeps_full_depth_when_small()
+{
+    // The other half of the pair, and the half a byte budget could quietly
+    // break: bounding bytes must not cost a *quiet* topic its history.
+    //
+    // That is not hypothetical. Before ring_bytes existed the only way to
+    // bound the hub's memory was to cut ring_capacity - super-log took it
+    // from 1024 to 128 to stop a firehose topic growing - and that bounds
+    // bytes only by accident, at the price of the streams that were never
+    // the problem: a one-line-per-second producer went from replaying about
+    // seventeen minutes on connect to about two. The whole point of bounding
+    // the two independently is that a generous count becomes free for quiet
+    // topics, so that freedom is worth a test rather than an assumption.
+    ws_broadcast_hub::config cfg;
+    cfg.ring_capacity = 256;                         // generous, as it may now be
+    cfg.ring_bytes    = 8 * 1024 * 1024;             // far above what this publishes
+    hub_server s(cfg);
+
+    const int total = 200;                           // under the count, nowhere near the bytes
+    for (int i = 0; i < total; ++i)
+        assert(http_post(s.port, "/ingest/quiet", "q" + std::to_string(i)) == 202);
+
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=quiet"));
+    assert(http_post(s.port, "/ingest/quiet", "end") == 202);   // sentinel: replay precedes live
+
+    std::vector<int> replayed;
+    for (;;) {
+        std::string f;
+        assert(c.read_data_frame(f));
+        if (contains(f, "\"payload\":\"end\""))
+            break;
+        const std::size_t at = f.find("\"payload\":\"q");
+        assert(at != std::string::npos);
+        replayed.push_back(std::atoi(f.c_str() + at + 12));
+    }
+
+    // Every message, oldest first, none evicted: the byte budget was never
+    // reached, so the count is the only bound that applied.
+    assert(replayed.size() == std::size_t(total));
+    assert(replayed.front() == 0);
+    assert(replayed.back() == total - 1);
+    for (std::size_t k = 1; k < replayed.size(); ++k)
+        assert(replayed[k] == replayed[k - 1] + 1);
+
+    pass("ws_broadcast_hub: a byte budget costs a quiet topic no replay depth");
+}
+
 void test_hub_unsubscribe_on_close()
 {
     hub_server s;
@@ -650,6 +698,7 @@ void run_ws_broadcast_hub_tests()
     test_hub_wildcard_and_fanout();
     test_hub_replay_on_connect();
     test_hub_replay_bounded_by_bytes();
+    test_hub_replay_keeps_full_depth_when_small();
     test_hub_total_order_is_identical_for_every_subscriber();
     test_hub_order_holds_under_concurrent_publishers();
     test_hub_unsubscribe_on_close();
