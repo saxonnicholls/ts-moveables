@@ -338,23 +338,51 @@ void run_conn(std::uint16_t port, std::size_t req_bytes, std::size_t depth,
 
 struct row {
     const char* label;
-    std::size_t conns, depth, req, resp;
+    std::size_t conns, depth, req, resp, reactors;
 };
 
+// `reactors > 1` starts that many servers on ONE port with SO_REUSEPORT and
+// lets the kernel spread accepts across them. The trap worth knowing: plain
+// SO_REUSEPORT load-balances on Linux but not on macOS/BSD, where it needs
+// SO_REUSEPORT_LB - server.hpp handles that, but it means a macOS result here
+// is not evidence for Linux.
 dist run_case(const row& r, int total)
 {
-    server_config cfg;
-    server srv{cfg};
+    const std::size_t n_react = r.reactors ? r.reactors : 1;
     const std::size_t resp = r.resp;
-    srv.protocol_factory([resp](const server_config&) {
-        return std::unique_ptr<protocol_delegate>(new rpc_protocol(resp));
-    });
-    const std::uint16_t port = srv.listen("127.0.0.1", 0);
-    if (!port)
-        std::exit(1);
-    std::thread th([&srv] { srv.run(); });
-    while (!srv.running())
-        std::this_thread::yield();
+
+    std::vector<std::unique_ptr<server>> servers;
+    std::vector<std::thread> loops;
+    // One counter per reactor. protocol_factory runs once per accepted
+    // connection, so this measures how the kernel actually spread them -
+    // without it, "reuse_port did not help" and "reuse_port did not balance"
+    // look identical, and they call for completely different responses.
+    std::vector<std::unique_ptr<std::atomic<int>>> accepted;
+    for (std::size_t i = 0; i < n_react; ++i)
+        accepted.push_back(std::unique_ptr<std::atomic<int>>(new std::atomic<int>(0)));
+
+    std::uint16_t port = 0;
+    for (std::size_t i = 0; i < n_react; ++i) {
+        server_config cfg;
+        cfg.reuse_port = (n_react > 1);
+        servers.push_back(std::unique_ptr<server>(new server(cfg)));
+        server& srv = *servers.back();
+        std::atomic<int>* mine = accepted[i].get();
+        srv.protocol_factory([resp, mine](const server_config&) {
+            mine->fetch_add(1, std::memory_order_relaxed);
+            return std::unique_ptr<protocol_delegate>(new rpc_protocol(resp));
+        });
+        const std::uint16_t p = srv.listen("127.0.0.1", port);
+        if (!p)
+            std::exit(1);
+        port = p;                       // every later reactor binds the same port
+    }
+    for (auto& up : servers) {
+        server* sp = up.get();
+        loops.emplace_back([sp] { sp->run(); });
+        while (!sp->running())
+            std::this_thread::yield();
+    }
 
     const int per_conn = std::max(1, total / int(r.conns));
     std::vector<conn_result> results(r.conns);
@@ -364,8 +392,35 @@ dist run_case(const row& r, int total)
     for (auto& t : ts)
         t.join();
 
-    srv.stop();
-    th.join();
+    for (auto& up : servers)
+        up->stop();
+    for (auto& t : loops)
+        t.join();
+
+    if (n_react > 1) {
+        int total_acc = 0, worst = 0;
+        for (auto& c : accepted) {
+            const int v = c->load();
+            total_acc += v;
+            worst = std::max(worst, v);
+        }
+        std::printf("      accepts per reactor:");
+        for (auto& c : accepted)
+            std::printf(" %d", c->load());
+        std::printf("\n");
+
+        // A benchmark that cannot tell when its own result is meaningless is
+        // worse than no benchmark. If the kernel put nearly everything on one
+        // reactor then this row measures one reactor plus idle threads, and
+        // reporting it as "reuse_port did not help" would be a straight
+        // falsehood - it never got the chance to.
+        if (total_acc && worst * 100 / total_acc >= 80)
+            std::printf("      *** NOT BALANCED - %d%% of accepts on one reactor. This row is\n"
+                        "          NOT evidence about reuse_port. Plain SO_REUSEPORT does not\n"
+                        "          load-balance on macOS/BSD (needs SO_REUSEPORT_LB); it does on\n"
+                        "          Linux. Re-run there before drawing any conclusion.\n",
+                        worst * 100 / total_acc);
+    }
 
     dist all;
     for (auto& c : results)
@@ -397,11 +452,15 @@ int main(int argc, char** argv)
             total = std::atoi(argv[++i]);
     }
 
+    const unsigned hw = std::max(2u, std::thread::hardware_concurrency());
+    const std::size_t many = std::min<std::size_t>(8, hw);
+
     const row rows[] = {
-        {"1 conn, 1 in flight",          1,  1,   100,  2048},
-        {"1 conn, 32 in flight",         1, 32,   100,  2048},
-        {"64 conns, 16 in flight",      64, 16,   100,  2048},
-        {"1 conn, 1 in flight, batched", 1,  1,  8192, 65536},
+        {"1 conn, 1 in flight",          1,  1,   100,  2048, 1},
+        {"1 conn, 32 in flight",         1, 32,   100,  2048, 1},
+        {"64 conns, 16 in flight",      64, 16,   100,  2048, 1},
+        {"64 x 16, N reactors (reuse_port)", 64, 16, 100, 2048, many},
+        {"1 conn, 1 in flight, batched", 1,  1,  8192, 65536, 1},
     };
 
     if (markdown) {

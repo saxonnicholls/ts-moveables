@@ -16,6 +16,8 @@
 #ifndef disruptor_hpp
 #define disruptor_hpp
 
+#include "../utils/cpu_relax.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -145,8 +147,8 @@ namespace snicholls
     struct busy_spin_wait_strategy {
         template <typename Pred>
         void wait(Pred ready) {
-            while (!ready()) {
-            }
+            while (!ready())
+                utils::cpu_relax();     // a hint, not a barrier - ready() carries the ordering
         }
         void signal() noexcept {}
     };
@@ -155,9 +157,11 @@ namespace snicholls
     struct yielding_wait_strategy {
         template <typename Pred>
         void wait(Pred ready) {
-            for (int i = 0; i < 256; ++i)
+            for (int i = 0; i < 256; ++i) {
                 if (ready())
                     return;
+                utils::cpu_relax();
+            }
             std::this_thread::yield();
         }
         void signal() noexcept {}

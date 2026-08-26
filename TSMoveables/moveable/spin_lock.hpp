@@ -12,6 +12,8 @@
 #ifndef moveable_spin_lock_hpp
 #define moveable_spin_lock_hpp
 
+#include "../utils/cpu_relax.hpp"
+
 #include <atomic>
 #include <thread>
 #include <stdexcept>
@@ -69,6 +71,10 @@ namespace snicholls
                     return;
                 int spins = 0;
                 while (held.load(std::memory_order_relaxed)) {
+                    // Tell the core we are spinning rather than working: it
+                    // drops issue rate, stops speculating on a line another
+                    // core is about to write, and lets an SMT sibling run.
+                    utils::cpu_relax();
                     if (++spins == 1024) {
                         spins = 0;
                         std::this_thread::yield();
