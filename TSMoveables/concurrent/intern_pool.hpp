@@ -32,6 +32,31 @@
 //  returns the existing pointer (and frees the duplicate), a miss allocates once.
 //  Shard by hash if a single lock ever becomes the bottleneck.
 //
+//  **What this is not: a symbol table.** The pull is obvious - "identical
+//  values collapse to one instance" sounds like exactly what assigning stable
+//  ids to symbols needs - and a careful reader evaluating it for that job
+//  found four reasons it is the wrong tool, none of which is a lock and none
+//  of which sharding would fix:
+//
+//    - It hands back a `shared_ptr<const T>`, not a dense integer. There is no
+//      id counter and no reverse map, so there is no bijection to a `uint32`
+//      that can index an array.
+//    - **The weak references make identity non-monotonic.** A value's canonical
+//      instance disappears when its last user drops it, and re-interning the
+//      same bytes afterwards yields a *different* pointer - which is the
+//      documented behaviour, and what the "the new one is canonical now" test
+//      asserts. An on-disk index needs ids stable for the life of the file.
+//    - `shared_ptr` control blocks live on the process heap, so nothing here
+//      can be placed in a memory-mapped file.
+//    - `maybe_sweep_()` walks the whole table under the lock, amortised once
+//      per `size()` inserts. Against a build inserting millions of symbols
+//      that is a periodic stop-the-world for every thread.
+//
+//  What survives the comparison, and is worth stealing if you do write a
+//  symbol table: the collision discipline below - the hash selects a bucket
+//  and an exact `Eq` decides membership, so two different payloads can never
+//  alias to one identity.
+//
 
 #pragma once
 

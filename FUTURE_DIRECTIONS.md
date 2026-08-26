@@ -121,6 +121,36 @@ The multi-producer mode is genuinely more expensive, and the numbers say so — 
 
 Tests cover four and six producers publishing concurrently with exactly-once delivery checked by tally (no lost or duplicated events) through rings small enough to wrap thousands of times; a deterministic out-of-order case where one producer is held inside its fill while another publishes the next sequence, asserting the consumer sees neither until the hole is filled; a producer genuinely blocked by a lagging consumer; a torn-read check on every event across wraparound; a dependency graph under multiple producers (the barrier path, which does not consult the marks at all); a mid-flight handle move with the consumer thread running throughout; and all three wait strategies. Every test wait is bounded (`spin_until_for`) so a broken invariant fails the suite instead of hanging it.
 
+### Two limits under heavy contention, found by external review
+
+Both were found by a reader evaluating this library as the substrate for a
+32-thread index build, and both are recorded here rather than fixed because
+each is a deliberate choice whose *assumption* is the thing to watch.
+
+**The wait strategy is consumer-only, and the header says so.** `wait_for_room`
+and `claim_multi` spin on a bare `std::this_thread::yield()` regardless of the
+`WaitStrategy` template parameter — "producers gate rarely in a well-sized
+ring, and it keeps the wait strategy consumer-only". That is a sound default
+and it keeps the single-producer path free of a strategy dispatch it would
+never use. The catch is that the parameter *reads* as though it governs both
+sides, so a user who selects a blocking strategy for throughput still gets a
+yield loop on the producer side, and the "gate rarely" premise is exactly what
+stops holding when many producers share a modest ring. Sizing the ring
+generously is the fix that costs nothing; making the strategy two-sided is the
+one to consider if a real workload ever shows producers gating hot.
+
+**There is no CPU pause hint anywhere in the library.** Nothing matching
+`_mm_pause`, `__yield`, `isb`, `wfe` or `__builtin_arm_*` exists in the tree:
+every spin is either bare or yields after N iterations. A bare CAS-retry loop
+under contention burns coherence traffic that a pause hint or exponential
+backoff would avoid, and the cost is worse on Apple Silicon than on x86. This
+touches `mpmc_queue`, the disruptor's claim loops and `work_stealing_deque`
+alike, so it is a library-wide gap rather than a disruptor one. It is not
+fixed here for the reason this document keeps giving: a spin-discipline change
+is a performance claim, and performance claims need benchmarks — which makes
+this a task for a machine that can run the sanitizer and benchmark gates,
+noted in section 11.
+
 ---
 
 ## 4. Thread-safe signal/slot — events without the lifetime bugs ✅ shipped
