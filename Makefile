@@ -238,6 +238,13 @@ bench-relay: build/ws_relay_scaling
 bench-relay-memory: build/ws_relay_scaling
 	./build/ws_relay_scaling --memory 2000
 
+build/rpc_latency: benchmarks/rpc_latency.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    benchmarks/rpc_latency.cpp -o $@ $(LDLIBS)
+
+bench-rpc: build/rpc_latency
+	./build/rpc_latency
+
 # Head to head vs cpp-httplib. Fetches their header on demand into
 # benchmarks/third_party/ (gitignored) - the library stays dependency-free.
 build/http_compare: benchmarks/http_compare.cpp $(HEADERS) | build
@@ -288,4 +295,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-relay bench-relay-memory bench-wss amalgamate check-amalgamate clean
+.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
