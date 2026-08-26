@@ -526,6 +526,25 @@ from "the grader found failures", so a hang costs one step instead of every
 result on that runner. The hang itself is undiagnosed. Worth trying: a smaller
 case set per invocation, `--network host` alternatives, or a newer image.
 
+**`reuse_port` is a config flag nobody has verified.** `server_config::reuse_port`
+exists, sets `SO_REUSEPORT_LB` where the platform has it, and has **no test**.
+Building `benchmarks/rpc_latency.cpp` produced the first evidence about it, and
+the evidence was negative: eight reactors on one port, 64 connections, and the
+accept histogram came back `0 0 0 0 0 0 0 64` — every connection on the last
+reactor, zero balancing. That is the documented macOS behaviour (plain
+`SO_REUSEPORT` permits the duplicate bind but does not load-balance; Linux does),
+so it is the platform behaving as the header's own comment says rather than a
+defect. But it means the *useful* case — Linux actually spreading accepts — has
+never been observed here, only assumed, and it cannot be observed on Apple
+Silicon. Nothing user-facing claims otherwise, which is the one saving grace:
+the flag is undocumented in the README as well as untested.
+
+Two things would close it: a test that binds N servers with `reuse_port` and
+asserts the accepts distributed (skipped, loudly, where the platform cannot),
+and the balanced row from `make bench-rpc` on Linux. A peer building on this
+stack has committed to running the second and reporting it back. Until then,
+"reuse_port helps" is an assumption in this repo and should be read as one.
+
 **A local Autobahn run under-reports, so it is not a substitute for CI.** CI
 grades 517 cases; the same command on macOS with Docker Desktop reaches 404 —
 same pinned image, same spec, different container networking (`--network host`
@@ -599,4 +618,5 @@ Written down so nobody — including us — spends a busy week on them:
 | 13 | Two-machine head-to-head vs nginx (§8 phase 6a) | Medium | Needs a second machine, not more code |
 | 14 | Make the amalgamation gate name each shipped component (§11) | Small | Next — it missed HTTP/2 for a whole release |
 | 15 | Diagnose the Autobahn runner hang (§11) | Medium | Bounded for now; cause unknown |
+| 16 | Verify `reuse_port` actually balances (§11) — test + the Linux `bench-rpc` row | Small | Never observed, only assumed; unobservable on macOS |
 | 14 | `ws_broadcast_hub` fan-out + `intern_pool` (§10) | Medium | ✅ **Shipped** — shared-frame fan-out (up to ~94× at 8 KB × 1000), fixed-topic multi-webhook, `intern_pool`. Syscall batching / shared-mem transport / conflation deferred (§10) |
