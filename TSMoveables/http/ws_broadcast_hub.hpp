@@ -47,6 +47,18 @@
 //  In frame_mode == raw the payload bytes are sent verbatim as the frame, with
 //  no envelope - for a source that already frames its own messages.
 //
+//  Who may connect. Both doors check the Origin header against cfg.origin, and
+//  the check is on by default, because the thing it defends against surprises
+//  almost everyone: browsers do not apply the same-origin policy to WebSockets.
+//  A page cannot fetch() http://127.0.0.1:8080/ but it CAN open a WebSocket to
+//  it, so a hub with no check is readable by any page the user happens to visit
+//  - every topic, and with replay_on_connect the backlog too. Binding to
+//  loopback does not help: the browser is already on the loopback side. The
+//  default allows a request with no Origin at all (curl, a native client, a
+//  webhook sender), a loopback Origin (the tool's own console), and whatever is
+//  listed in cfg.origin.allow; everything else gets 403 before the upgrade, and
+//  before an ingest publish. See origin_policy in config.hpp.
+//
 //  Guarded on SNICHOLLS_HAS_WEBSOCKET: where the WebSocket delegate compiles to
 //  nothing (non-POSIX in phase 1) so does this.
 //
@@ -106,6 +118,18 @@ struct ws_hub_config {
     std::string    wildcard_topic    = "*";
 
     std::size_t    max_subscribers   = 10000;             // total, across all topics
+
+    // Which browser origins may read /ws and write /ingest. One policy answers
+    // for both sides, and the two want the same answer: the read side leaks the
+    // streams, the write side accepts forged events, and a drive-by page reaches
+    // each of them the same way. It is one knob rather than two because the
+    // non-browser callers that must keep working - a webhook sender, a curl
+    // POST, a native tailer - send no Origin and are allowed by both.
+    //
+    // The default allows no-Origin, loopback and nothing else. A hub bound to
+    // loopback and serving its own console from localhost needs no change; a
+    // browser app on a real domain adds that origin to `origin.allow`.
+    origin_policy  origin{};
 
     // Per-topic replay history in chunks (rounded up to a power of two).
     // Bounded in bytes by ring_bytes below, and the two bound different
@@ -196,6 +220,7 @@ public:
         ws_config wscfg;
         wscfg.max_message = h_->cfg.max_message_bytes;
         wscfg.max_frame   = h_->cfg.max_message_bytes;
+        wscfg.origin      = h_->cfg.origin;      // rejected before the 101
         return websocket_route([h](websocket ws) { h->on_connect(std::move(ws)); }, wscfg);
     }
 
@@ -606,6 +631,18 @@ private:
     static void accept(const std::shared_ptr<impl>& h, const std::string& topic,
                        const request& req, responder res)
     {
+        // The write side of the same drive-by. A page cannot read a response
+        // it did not get permission for, but it can still cause the write: a
+        // `no-cors` POST with a text/plain body is a "simple request", so it
+        // is sent with no preflight to ask about, and the page never needs to
+        // see the answer to have injected a forged event. The browser attaches
+        // Origin to it regardless, which is what makes this check enough -
+        // and enough without the endpoint speaking CORS, so a publisher using
+        // no-cors on purpose keeps working from an allowed origin.
+        if (!h->cfg.origin.allows(req.header("origin"))) {
+            res.send(403, "text/plain; charset=utf-8", "403 Forbidden (origin)\n");
+            return;
+        }
         if (req.body.size() > h->cfg.max_message_bytes) {
             res.send(413, "text/plain; charset=utf-8", "413 Payload Too Large\n");
             return;

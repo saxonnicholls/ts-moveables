@@ -205,6 +205,12 @@ enum ws_close : std::uint16_t {
 struct ws_config {
     std::size_t max_message = 8u * 1024 * 1024;
     std::size_t max_frame   = 8u * 1024 * 1024;
+    // Who may open this socket from a browser. Enforced before the 101, and on
+    // by default - browsers do not apply the same-origin policy to WebSockets,
+    // so a route that does not check is readable by any page the user visits.
+    // See origin_policy in config.hpp for what the default does and does not
+    // claim; origin_policy::any() opts out.
+    http::origin_policy origin{};
     // Supply this to offer an extension (see websocket_deflate.hpp). One
     // instance per connection, because the compression context is per
     // connection and stateful.
@@ -715,6 +721,14 @@ private:
 inline handler websocket_route(ws_handler on_open, ws_config cfg = ws_config{})
 {
     return [on_open, cfg](const request& req, responder res) {
+        // Before anything else, including the shape of the handshake: a page
+        // that is not allowed to open this socket learns nothing about it, and
+        // no attacker-chosen header is looked at on its behalf.
+        if (!cfg.origin.allows(req.header("origin"))) {
+            res.send(403, "text/plain; charset=utf-8", "403 Forbidden (origin)\n");
+            return;
+        }
+
         const std::string* upgrade = req.header("upgrade");
         const std::string* conn = req.header("connection");
         const std::string* key = req.header("sec-websocket-key");

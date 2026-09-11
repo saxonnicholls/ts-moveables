@@ -15,6 +15,11 @@
 //  through untouched, and the per-connection queue is bounded (oldest-dropped)
 //  under backpressure.
 //
+//  And the origin policy on both doors: a foreign Origin cannot upgrade /ws or
+//  publish to /ingest, while the callers that must keep working - a loopback
+//  viewer, an allowlisted app, a native client that sends no Origin at all -
+//  are untouched.
+//
 
 #include "test_helpers.hpp"
 
@@ -46,7 +51,11 @@ namespace {
 
 class ws_client {
 public:
-    bool connect_to(std::uint16_t port, const char* path)
+    // `origin`, when given, is sent as the Origin header - which is how a
+    // browser identifies the page opening the socket, and the only thing the
+    // handshake has to go on. nullptr means no header at all: a curl or native
+    // client, which is a different case from an empty one.
+    bool connect_to(std::uint16_t port, const char* path, const char* origin = nullptr)
     {
         fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         assert(fd_ >= 0);
@@ -62,11 +71,14 @@ public:
         tv.tv_sec = 5;
         ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
-        const std::string req =
+        std::string req =
             std::string("GET ") + path + " HTTP/1.1\r\nHost: t\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n";
+            "Sec-WebSocket-Version: 13\r\n";
+        if (origin)
+            req += std::string("Origin: ") + origin + "\r\n";
+        req += "\r\n";
         send_raw(req);
 
         std::string head;
@@ -194,7 +206,8 @@ private:
 };
 
 // A one-shot blocking HTTP POST, returns the status code (or -1)
-int http_post(std::uint16_t port, const std::string& path, const std::string& body)
+int http_post(std::uint16_t port, const std::string& path, const std::string& body,
+              const char* origin = nullptr)
 {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
@@ -209,7 +222,10 @@ int http_post(std::uint16_t port, const std::string& path, const std::string& bo
     }
     std::string req = "POST " + path + " HTTP/1.1\r\nHost: t\r\nConnection: close\r\n"
                       "Content-Type: application/octet-stream\r\nContent-Length: " +
-                      std::to_string(body.size()) + "\r\n\r\n" + body;
+                      std::to_string(body.size()) + "\r\n";
+    if (origin)
+        req += std::string("Origin: ") + origin + "\r\n";
+    req += "\r\n" + body;
     std::size_t off = 0;
     while (off < req.size()) {
         const ssize_t n = ::send(fd, req.data() + off, req.size() - off, 0);
@@ -689,6 +705,169 @@ void test_hub_order_holds_under_concurrent_publishers()
     pass("ws_broadcast_hub: 32 concurrent publishers, one gapless total order, identical for all");
 }
 
+// ------------------------------------------------------------------- origin
+//
+// Browsers do not apply the same-origin policy to WebSockets, so until the
+// handshake started reading Origin, any page the developer visited could open
+// ws://127.0.0.1:<port>/ws?topic=* against a loopback-bound hub and read every
+// stream, replay history included. These tests are that hole, from both sides.
+
+void test_origin_policy_defaults_and_lookalikes()
+{
+    origin_policy p;                                    // exactly what ships
+    auto allows = [&p](const char* o) {
+        const std::string s(o);
+        return p.allows(&s);
+    };
+
+    // No Origin header at all: curl, a native tailer, a webhook sender. Not a
+    // hole a page can use - a browser attaches Origin to a cross-origin socket
+    // or POST and script cannot take it off.
+    assert(p.allows(nullptr));
+
+    // The tool's own console, however it spells the local machine.
+    assert(allows("http://localhost"));
+    assert(allows("http://localhost:7333"));
+    assert(allows("https://localhost:443"));
+    assert(allows("http://127.0.0.1:7333"));
+    assert(allows("http://127.0.0.2:8080"));            // all of 127/8 is local
+    assert(allows("http://[::1]"));
+    assert(allows("http://[::1]:7333"));
+    assert(allows("HTTP://LOCALHOST:7333"));            // scheme and host are case-blind
+
+    // The drive-by, and every way of dressing it up as local.
+    assert(!allows("http://evil.example"));
+    assert(!allows("https://evil.example:443"));
+    assert(!allows("http://localhost.evil.example"));   // a name its owner controls
+    assert(!allows("http://127.0.0.1.evil.example"));
+    assert(!allows("http://evil.example/@localhost"));  // has a path: not an origin
+    assert(!allows("http://evil.example#localhost"));
+    assert(!allows("http://evil.example?x=localhost"));
+    assert(!allows("http://localhost@evil.example"));   // userinfo
+    assert(!allows("http://1270.0.1"));
+    assert(!allows("http://127.0.0.1x"));
+    assert(!allows("null"));                            // sandboxed iframe, file://
+    assert(!allows(""));                                // a header naming nobody
+
+    // An allowlist entry is one exact serialised origin. A different port or a
+    // different scheme is a different origin, and neither is covered.
+    p.allow.push_back("https://app.example.com");
+    assert(allows("https://app.example.com"));
+    assert(allows("HTTPS://APP.EXAMPLE.COM"));
+    assert(!allows("https://app.example.com:8443"));
+    assert(!allows("http://app.example.com"));
+    assert(!allows("https://evil.app.example.com"));
+
+    // allow_if can only widen: it is asked after the built-ins decline, and
+    // cannot veto one that already said yes.
+    origin_policy q;
+    q.allow_loopback = false;
+    q.allow_if = [](std::string_view o) { return o == "http://chosen"; };
+    const std::string chosen("http://chosen"), local("http://localhost");
+    assert(q.allows(&chosen));
+    assert(!q.allows(&local));
+
+    // And any() is the one documented way out, for a server that means it.
+    origin_policy open = origin_policy::any();
+    const std::string evil("http://evil.example");
+    assert(open.allows(&evil));
+    assert(open.allows(nullptr));
+
+    pass("origin_policy: allows no-Origin, loopback and the list; refuses lookalikes");
+}
+
+void test_hub_rejects_foreign_origin_on_ws()
+{
+    hub_server s;                                       // shipped defaults
+
+    // The reviewer's repro: a raw RFC 6455 handshake carrying a foreign
+    // Origin. This used to answer 101 and then stream. Now it is refused
+    // before the upgrade, so there is no socket to read.
+    ws_client evil;
+    assert(evil.connect_to(s.port, "/ws?topic=*", "http://evil.example"));
+    assert(evil.status() == 403);
+
+    // And it never became a subscriber, so a publish has nowhere to reach it.
+    s.hub.publish("alerts", "secret");
+    assert(s.hub.subscribers() == 0);
+
+    pass("ws_broadcast_hub: a foreign Origin is refused 403 before the /ws upgrade");
+}
+
+void test_hub_allows_loopback_and_listed_origins()
+{
+    ws_broadcast_hub::config cfg;
+    cfg.origin.allow.push_back("https://app.example.com");
+    hub_server s(cfg);
+
+    ws_client local;                                    // the viewer on localhost
+    assert(local.connect_to(s.port, "/ws?topic=alerts", "http://localhost:5173"));
+    assert(local.status() == 101);
+
+    ws_client native;                                   // a tailer, no Origin
+    assert(native.connect_to(s.port, "/ws?topic=alerts"));
+    assert(native.status() == 101);
+
+    ws_client listed;                                   // the deployed browser app
+    assert(listed.connect_to(s.port, "/ws?topic=alerts", "https://app.example.com"));
+    assert(listed.status() == 101);
+
+    spin_until([&] { return s.hub.subscribers() == 3; });
+
+    s.hub.publish("alerts", "hello");
+    for (ws_client* c : {&local, &native, &listed}) {
+        ws_opcode op;
+        std::string payload;
+        assert(c->read_frame(op, payload));
+        assert(contains(payload, "hello"));
+    }
+
+    pass("ws_broadcast_hub: loopback, no-Origin and allowlisted browsers still connect");
+}
+
+void test_hub_origin_check_opts_out()
+{
+    ws_broadcast_hub::config cfg;
+    cfg.origin = origin_policy::any();
+    hub_server s(cfg);
+
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=alerts", "http://evil.example"));
+    assert(c.status() == 101);
+
+    pass("ws_broadcast_hub: origin_policy::any() opts the check out");
+}
+
+void test_hub_ingest_rejects_foreign_origin()
+{
+    hub_server s;
+
+    ws_client sub;
+    assert(sub.connect_to(s.port, "/ws?topic=hooks"));  // a tailer: no Origin
+    assert(sub.status() == 101);
+    spin_until([&] { return s.hub.subscribers() == 1; });
+
+    // The write half of the same drive-by. The page could never read this
+    // response, which is exactly why answering it was never the protection -
+    // a no-cors text/plain POST is a "simple request", so it crosses with no
+    // preflight to refuse and the forged event lands anyway. The Origin it
+    // cannot suppress is what stops it.
+    assert(http_post(s.port, "/ingest/hooks", "forged", "http://evil.example") == 403);
+    assert(s.hub.snapshot().published == 0);
+
+    // The sender that must keep working, unchanged and with no CORS spoken:
+    // a webhook POST carries no Origin.
+    assert(http_post(s.port, "/ingest/hooks", "real") == 202);
+
+    ws_opcode op;
+    std::string payload;
+    assert(sub.read_frame(op, payload));
+    assert(contains(payload, "real"));
+    assert(!contains(payload, "forged"));
+
+    pass("ws_broadcast_hub: a foreign Origin cannot forge an /ingest publish");
+}
+
 } // namespace
 
 void run_ws_broadcast_hub_tests()
@@ -705,6 +884,11 @@ void run_ws_broadcast_hub_tests()
     test_hub_direct_publish_api();
     test_hub_raw_framing();
     test_hub_backpressure_bounded();
+    test_origin_policy_defaults_and_lookalikes();
+    test_hub_rejects_foreign_origin_on_ws();
+    test_hub_allows_loopback_and_listed_origins();
+    test_hub_origin_check_opts_out();
+    test_hub_ingest_rejects_foreign_origin();
 }
 
 #else // !SNICHOLLS_HAS_WS_BROADCAST_HUB

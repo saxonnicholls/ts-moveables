@@ -9,6 +9,69 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+### Security
+
+- **A WebSocket upgrade accepted any `Origin`, so any web page could read a
+  loopback server's streams.** This is the one asymmetry that catches nearly
+  everyone: browsers do *not* apply the same-origin policy to WebSockets. A
+  `fetch()` to `http://127.0.0.1:7333/` is stopped before it leaves the page; a
+  WebSocket to `ws://127.0.0.1:7333/` is not. So any page the developer happened
+  to visit could open `ws://127.0.0.1:<port>/ws?topic=*` against a
+  loopback-bound `ws_broadcast_hub`, and read every stream on it — with
+  `replay_on_connect`, the backlog too. Binding to loopback reads like a
+  boundary and is not one: the browser is already on the loopback side, and the
+  browser is what is asking. Found by an independent security review of a
+  downstream consumer (super-log), which completed a raw RFC 6455 handshake
+  carrying a foreign `Origin` against a loopback hub and got `101` plus live
+  frames; the exposure there was OS logs, ssh auth failures, git, DNS and
+  outbound connections, on a fixed and documented port.
+
+  The handshake is the only place that can refuse this, and the only evidence it
+  has is the `Origin` header — worth exactly as much as the fact that a browser
+  attaches it to every cross-origin socket and will not let script take it off.
+  New `http::origin_policy` (`http/config.hpp`), carried on `ws_config::origin`
+  and `ws_broadcast_hub::config::origin`, checked in `websocket_route` **before
+  the 101** and in the hub's ingest handler before the publish:
+
+  - no `Origin` header at all → **allow**. curl, a native client, a webhook
+    sender: no browser, so no drive-by, and none of them send one.
+  - loopback `Origin` (`localhost`, all of `127.0.0.0/8`, `::1`) → **allow**.
+    A page served from localhost is the tool's own console, which is the common
+    shape for a local server and the case a blanket reject breaks.
+  - listed in `origin.allow` → **allow**. The deployed browser app's real
+    origin, matched as one exact serialised origin, case-blind, no wildcards.
+  - anything else → **403, no upgrade**. `null` is not loopback and not
+    special: it names nobody, so it faces the allowlist like any other value.
+
+  Lookalikes are refused by construction, because this is the check that always
+  gets caught by them: the host is parsed out and matched whole, never by
+  substring or suffix, and a value carrying a path, userinfo, query or fragment
+  is not an origin at all and is refused rather than read generously — so
+  `http://localhost.evil.example`, `http://127.0.0.1.evil.example` and
+  `http://evil.example/@localhost` are all rejected.
+
+  **The same policy closes the write side**, which the review raised separately
+  as CSRF into `/ingest`. A cross-origin `no-cors` POST with a `text/plain` body
+  is a "simple request": it crosses with no preflight to refuse, and the page
+  never needs to read the response to have injected a forged event. Answering
+  with CORS headers was never the protection. But the browser attaches `Origin`
+  to that POST too, so checking it is sufficient — and sufficient *without the
+  endpoint speaking CORS at all*, which means a publisher using `no-cors`
+  deliberately keeps working from an allowed origin, unchanged.
+
+  What this does **not** claim: no-Origin is allowed, so it is not a defence
+  against a non-browser process already on the loopback side. That process has
+  local code execution, which is a boundary this check was never at.
+
+  **This changes a default and can refuse connections that previously
+  succeeded** — deliberately, since the old default was the vulnerability. A
+  browser app on a real domain adds that origin to `origin.allow`; a server that
+  genuinely wants any origin says so once with `origin_policy::any()` rather
+  than being talked out of the default one exception at a time. Five tests,
+  including the review's own repro and its control: the same foreign `Origin`
+  that is refused `403` by default gets `101` under `any()`, so the tests grade
+  the check rather than observing a broken connection.
+
 ### Added
 
 - **`wss://` on `websocket_client`**, via a `transport_factory` on the config —

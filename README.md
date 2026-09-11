@@ -811,6 +811,30 @@ it per subscriber previously cost ~2 ms at 8 KB — a ~94× gap). On one thread 
 Per-subscriber queues are **bounded** (trim-oldest with a high-water mark — never
 unbounded growth, and the publisher never blocks on the slowest reader).
 
+**Both doors check `Origin`, and this is on by default.** Browsers do not apply
+the same-origin policy to WebSockets — a `fetch()` to `http://127.0.0.1:8080/` is
+stopped before it is sent, a `WebSocket` to `ws://127.0.0.1:8080/` is not — so
+without a check, any page the user visits can open your hub and read every topic
+on it, replay history included. Binding to loopback is not a boundary against
+the browser, which is already on that side. `config::origin` decides:
+
+```cpp
+snicholls::http::ws_broadcast_hub::config cfg;
+cfg.origin.allow.push_back("https://app.example.com");   // the deployed browser app
+snicholls::http::ws_broadcast_hub hub(cfg);
+```
+
+No `Origin` header at all is allowed (curl, a native client, a webhook sender —
+no browser is involved); a loopback origin is allowed (the tool's own console on
+localhost); anything listed is allowed; everything else gets `403` **before the
+upgrade**. The same policy guards the ingest side, where it closes CSRF — a
+cross-origin `no-cors` `text/plain` POST is a "simple request" that crosses with
+no preflight, and the page never needs to read the response to have injected a
+forged event, but the browser attaches `Origin` to it regardless. That is why
+`/ingest` needs no CORS to be safe. `origin_policy::any()` opts out if you mean
+it. See [`http/config.hpp`](TSMoveables/http/config.hpp) for what the default
+does and does not claim.
+
 ## http_server
 
 The reactor's first real customer, and the component that composes everything else in the library. Phase 1 is a **non-blocking HTTP/1.1 server**: routes, keep-alive, chunked bodies, `Expect: 100-continue`, backpressure, timeouts — with the ergonomics of [cpp-httplib](https://github.com/yhirose/cpp-httplib), which set the standard for "drop in one header and it works".

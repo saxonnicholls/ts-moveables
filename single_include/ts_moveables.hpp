@@ -7338,7 +7338,10 @@ private:
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace snicholls {
 namespace http {
@@ -7380,6 +7383,200 @@ struct access_entry {
     double duration_ms = 0.0;
     int fd = -1;
     std::uint64_t stream = 0;
+};
+
+// --------------------------------------------------------------- origin policy
+//
+// Who is allowed to open a cross-origin connection to this server.
+//
+// This exists because of one asymmetry that surprises nearly everyone: browsers
+// do NOT apply the same-origin policy to WebSockets. A fetch() to
+// http://127.0.0.1:7333/ is stopped before it is sent; a WebSocket to
+// ws://127.0.0.1:7333/ is not. So any page the developer happens to visit can
+// open a socket to a loopback-bound server and read whatever it streams - and
+// if that server replays history on connect, the backlog as well. Binding to
+// loopback feels like a boundary and is not one: the browser is already on the
+// loopback side, and it is the browser doing the asking.
+//
+// The handshake is therefore the only place that can say no, and the only
+// evidence it has is the Origin header - which is worth exactly as much as the
+// fact that a browser will not let a page lie about it or leave it off.
+//
+// The default reads that evidence the useful way (see origin_policy below):
+//
+//   no Origin header  -> allow. curl, a native client, a webhook sender, another
+//                        service: no browser is involved, so there is no
+//                        drive-by to stop, and none of them send one. This is
+//                        not a hole a page can climb through - a browser always
+//                        attaches Origin to a cross-origin socket or POST, and
+//                        script cannot remove it.
+//   loopback Origin   -> allow. A page served from localhost is the tool's own
+//                        console or viewer, which is the common shape for a
+//                        local server and the case a blanket reject breaks.
+//   listed in `allow` -> allow. The deployed browser app's real origin.
+//   anything else     -> reject, before the upgrade or the write.
+//
+// `null` is not loopback and not special: sandboxed iframes, file:// pages and
+// some redirect chains send it, it names nobody, and so it faces the allowlist
+// like any other value.
+//
+// The same policy answers for the write side. A cross-origin POST - including
+// the `no-cors`, text/plain "simple request" that a page can send without a
+// preflight and whose response it cannot read - still carries Origin, so
+// checking it here closes the CSRF path into an ingest endpoint without the
+// endpoint having to speak CORS at all.
+
+namespace detail {
+
+// Split a serialised origin into scheme, host and port.
+//
+// An origin is scheme + host + optional port and nothing else (RFC 6454 §6.1).
+// The strictness is the point: anything carrying a path, userinfo, query or
+// fragment is not an origin, and the only reason to send one that does is to
+// get a lenient reader to find "localhost" somewhere inside
+// "http://evil.com/@localhost" and stop looking. So a value with those bytes in
+// it is refused outright rather than parsed generously.
+inline bool split_origin(std::string_view o,
+                         std::string_view& scheme,
+                         std::string_view& host,
+                         std::string_view& port) noexcept
+{
+    const std::size_t sep = o.find("://");
+    if (sep == std::string_view::npos)
+        return false;
+    scheme = o.substr(0, sep);
+    if (scheme.empty())
+        return false;
+
+    std::string_view auth = o.substr(sep + 3);
+    if (auth.empty() || auth.find_first_of("/\\?#@") != std::string_view::npos)
+        return false;
+
+    if (auth.front() == '[') {                      // [::1] or [::1]:8080
+        const std::size_t close = auth.find(']');
+        if (close == std::string_view::npos)
+            return false;
+        host = auth.substr(1, close - 1);
+        const std::string_view rest = auth.substr(close + 1);
+        if (rest.empty())
+            port = std::string_view{};
+        else if (rest.front() == ':')
+            port = rest.substr(1);
+        else
+            return false;
+    } else {
+        const std::size_t colon = auth.find(':');
+        if (colon == std::string_view::npos) {
+            host = auth;
+            port = std::string_view{};
+        } else {
+            host = auth.substr(0, colon);
+            port = auth.substr(colon + 1);
+            if (port.find(':') != std::string_view::npos)
+                return false;                       // unbracketed IPv6
+        }
+    }
+    if (host.empty())
+        return false;
+    for (const char c : port)
+        if (!is_digit(c))
+            return false;
+    return true;
+}
+
+// Is this host the local machine? "localhost" by name, the whole 127.0.0.0/8
+// literal range (127.0.0.1 is the usual one, but 127.0.0.2 and friends are
+// equally local and equally reachable), and IPv6 ::1.
+//
+// Matched against the parsed host and never by substring or suffix, which is
+// the whole trick these checks get caught by: "localhost.evil.com" is a name
+// its owner controls, "127.0.0.1.evil.com" likewise, and neither is local.
+inline bool is_loopback_host(std::string_view h) noexcept
+{
+    if (iequals(h.data(), h.size(), "localhost", 9))
+        return true;
+    if (h == "::1" || h == "0:0:0:0:0:0:0:1")
+        return true;
+
+    // Dotted quad, fully consumed, first octet 127. Anything that is not four
+    // plain decimal octets is a name rather than an address, and a name only
+    // reaches loopback by resolving there - which is not ours to assume.
+    unsigned first = 0;
+    std::size_t i = 0;
+    for (int k = 0; k < 4; ++k) {
+        if (i >= h.size() || !is_digit(h[i]))
+            return false;
+        unsigned v = 0, digits = 0;
+        while (i < h.size() && is_digit(h[i])) {
+            v = v * 10 + unsigned(h[i] - '0');
+            if (++digits > 3 || v > 255)
+                return false;
+            ++i;
+        }
+        if (k == 0)
+            first = v;
+        if (k < 3) {
+            if (i >= h.size() || h[i] != '.')
+                return false;
+            ++i;
+        }
+    }
+    return i == h.size() && first == 127;
+}
+
+} // namespace detail
+
+struct origin_policy {
+    // Off makes every check below pass. For a server that genuinely wants any
+    // origin, and would rather say so once here than be talked out of the
+    // default one exception at a time.
+    bool enforce        = true;
+
+    bool allow_missing  = true;         // no Origin header at all
+    bool allow_loopback = true;         // localhost, 127.0.0.0/8, ::1
+
+    // Exact serialised origins - "https://app.example.com", scheme and host and
+    // port, no path and no wildcards. Compared case-insensitively, because a
+    // browser lowercases what it sends and a hand-written list should not have
+    // to remember that.
+    std::vector<std::string> allow;
+
+    // An extra allow, for a rule the list cannot spell: a wildcard subdomain, a
+    // value read from configuration at run time. It can only widen the policy -
+    // it is consulted after the built-in allows have all declined, and cannot
+    // veto one that has already said yes.
+    std::function<bool(std::string_view)> allow_if;
+
+    static origin_policy any()
+    {
+        origin_policy p;
+        p.enforce = false;
+        return p;
+    }
+
+    // `origin` is the header value, or nullptr when the request carried no
+    // Origin at all. The distinction matters: an empty Origin: header is a
+    // header naming no origin, not the absence of one, so it is not the
+    // non-browser case and falls through to the allowlist.
+    bool allows(const std::string* origin) const
+    {
+        if (!enforce)
+            return true;
+        if (!origin)
+            return allow_missing;
+
+        const std::string_view o(*origin);
+        if (allow_loopback) {
+            std::string_view scheme, host, port;
+            if (detail::split_origin(o, scheme, host, port) &&
+                detail::is_loopback_host(host))
+                return true;
+        }
+        for (const auto& a : allow)
+            if (detail::iequals(a.data(), a.size(), o.data(), o.size()))
+                return true;
+        return allow_if && allow_if(o);
+    }
 };
 
 } // namespace http
@@ -11722,6 +11919,12 @@ enum ws_close : std::uint16_t {
 struct ws_config {
     std::size_t max_message = 8u * 1024 * 1024;
     std::size_t max_frame   = 8u * 1024 * 1024;
+    // Who may open this socket from a browser. Enforced before the 101, and on
+    // by default - browsers do not apply the same-origin policy to WebSockets,
+    // so a route that does not check is readable by any page the user visits.
+    // See origin_policy in config.hpp for what the default does and does not
+    // claim; origin_policy::any() opts out.
+    http::origin_policy origin{};
     // Supply this to offer an extension (see websocket_deflate.hpp). One
     // instance per connection, because the compression context is per
     // connection and stateful.
@@ -12232,6 +12435,14 @@ private:
 inline handler websocket_route(ws_handler on_open, ws_config cfg = ws_config{})
 {
     return [on_open, cfg](const request& req, responder res) {
+        // Before anything else, including the shape of the handshake: a page
+        // that is not allowed to open this socket learns nothing about it, and
+        // no attacker-chosen header is looked at on its behalf.
+        if (!cfg.origin.allows(req.header("origin"))) {
+            res.send(403, "text/plain; charset=utf-8", "403 Forbidden (origin)\n");
+            return;
+        }
+
         const std::string* upgrade = req.header("upgrade");
         const std::string* conn = req.header("connection");
         const std::string* key = req.header("sec-websocket-key");
@@ -12350,6 +12561,18 @@ inline handler websocket_route(ws_handler on_open, ws_config cfg = ws_config{})
 //  In frame_mode == raw the payload bytes are sent verbatim as the frame, with
 //  no envelope - for a source that already frames its own messages.
 //
+//  Who may connect. Both doors check the Origin header against cfg.origin, and
+//  the check is on by default, because the thing it defends against surprises
+//  almost everyone: browsers do not apply the same-origin policy to WebSockets.
+//  A page cannot fetch() http://127.0.0.1:8080/ but it CAN open a WebSocket to
+//  it, so a hub with no check is readable by any page the user happens to visit
+//  - every topic, and with replay_on_connect the backlog too. Binding to
+//  loopback does not help: the browser is already on the loopback side. The
+//  default allows a request with no Origin at all (curl, a native client, a
+//  webhook sender), a loopback Origin (the tool's own console), and whatever is
+//  listed in cfg.origin.allow; everything else gets 403 before the upgrade, and
+//  before an ingest publish. See origin_policy in config.hpp.
+//
 //  Guarded on SNICHOLLS_HAS_WEBSOCKET: where the WebSocket delegate compiles to
 //  nothing (non-POSIX in phase 1) so does this.
 //
@@ -12452,6 +12675,18 @@ struct ws_hub_config {
 
     std::size_t    max_subscribers   = 10000;             // total, across all topics
 
+    // Which browser origins may read /ws and write /ingest. One policy answers
+    // for both sides, and the two want the same answer: the read side leaks the
+    // streams, the write side accepts forged events, and a drive-by page reaches
+    // each of them the same way. It is one knob rather than two because the
+    // non-browser callers that must keep working - a webhook sender, a curl
+    // POST, a native tailer - send no Origin and are allowed by both.
+    //
+    // The default allows no-Origin, loopback and nothing else. A hub bound to
+    // loopback and serving its own console from localhost needs no change; a
+    // browser app on a real domain adds that origin to `origin.allow`.
+    origin_policy  origin{};
+
     // Per-topic replay history in chunks (rounded up to a power of two).
     // Bounded in bytes by ring_bytes below, and the two bound different
     // things: this one is how much history a quiet topic keeps, that one is
@@ -12541,6 +12776,7 @@ public:
         ws_config wscfg;
         wscfg.max_message = h_->cfg.max_message_bytes;
         wscfg.max_frame   = h_->cfg.max_message_bytes;
+        wscfg.origin      = h_->cfg.origin;      // rejected before the 101
         return websocket_route([h](websocket ws) { h->on_connect(std::move(ws)); }, wscfg);
     }
 
@@ -12951,6 +13187,18 @@ private:
     static void accept(const std::shared_ptr<impl>& h, const std::string& topic,
                        const request& req, responder res)
     {
+        // The write side of the same drive-by. A page cannot read a response
+        // it did not get permission for, but it can still cause the write: a
+        // `no-cors` POST with a text/plain body is a "simple request", so it
+        // is sent with no preflight to ask about, and the page never needs to
+        // see the answer to have injected a forged event. The browser attaches
+        // Origin to it regardless, which is what makes this check enough -
+        // and enough without the endpoint speaking CORS, so a publisher using
+        // no-cors on purpose keeps working from an allowed origin.
+        if (!h->cfg.origin.allows(req.header("origin"))) {
+            res.send(403, "text/plain; charset=utf-8", "403 Forbidden (origin)\n");
+            return;
+        }
         if (req.body.size() > h->cfg.max_message_bytes) {
             res.send(413, "text/plain; charset=utf-8", "413 Payload Too Large\n");
             return;
