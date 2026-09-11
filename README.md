@@ -835,6 +835,28 @@ forged event, but the browser attaches `Origin` to it regardless. That is why
 it. See [`http/config.hpp`](TSMoveables/http/config.hpp) for what the default
 does and does not claim.
 
+**The check covers the handlers `mount()` registers, and nothing else** — worth
+being exact about, because it is easy to over-read as "the hub is guarded" and a
+downstream consumer shipped the unguarded version. Routes match in registration
+order, first match wins, so a route of your own on the same path registered
+*before* `mount()` shadows the hub's; and `publish()` takes a topic and bytes
+with no request to read an `Origin` from, so any route you write that publishes
+is guarded by you. One line fixes it:
+
+```cpp
+srv.post("/ingest/:topic", [&hub](const auto& req, auto res) {
+    if (!hub.origin_allowed(req)) {               // the line
+        res.send(403, "text/plain", "403 Forbidden\n");
+        return;
+    }
+    hub.publish(req.param("topic"), req.body);
+    res.send(202, "text/plain", "ok\n");
+});
+```
+
+Or register `hub.ingest_handler()` and get the hub's semantics plus the check
+rather than re-implementing it.
+
 ## http_server
 
 The reactor's first real customer, and the component that composes everything else in the library. Phase 1 is a **non-blocking HTTP/1.1 server**: routes, keep-alive, chunked bodies, `Expect: 100-continue`, backpressure, timeouts — with the ergonomics of [cpp-httplib](https://github.com/yhirose/cpp-httplib), which set the standard for "drop in one header and it works".

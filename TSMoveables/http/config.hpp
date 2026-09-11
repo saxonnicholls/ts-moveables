@@ -254,6 +254,16 @@ struct origin_policy {
                 return true;
         return allow_if && allow_if(o);
     }
+
+    // The same question asked of a request directly, which is how a handler
+    // wants to ask it:
+    //
+    //     if (!policy.allows(req)) { res.send(403, ...); return; }
+    //
+    // Worth having as one call because the alternative spelling reaches through
+    // two objects to find the header, and a security check that is tedious to
+    // write correctly is one that gets written incorrectly or skipped.
+    bool allows(const request& req) const { return allows(req.header("origin")); }
 };
 
 } // namespace http

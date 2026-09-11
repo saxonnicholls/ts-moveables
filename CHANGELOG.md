@@ -9,6 +9,23 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+### Added
+
+- **`origin_policy::allows(const request&)` and
+  `ws_broadcast_hub::origin_allowed(const request&)`** — the 1.1.2 `Origin`
+  check as one call from inside a handler. It guards the handlers `mount()`
+  registers and nothing else, which reads more broadly than it is: routes match
+  in registration order and first match wins, so a consumer's own route on the
+  same path registered *before* `mount()` shadows the hub's guarded one; and
+  `publish()` takes a topic and bytes, with no request to read an `Origin` from,
+  so it cannot check one. Both are by design, and together they mean a
+  hand-written ingest route is guarded by its author, not by the hub. Found the
+  way these things are: a downstream consumer (super-log) took 1.1.2, confirmed
+  `/ws` was refusing foreign origins, and found its own `/ingest` route still
+  publishing them — the check was working and the request was never reaching it.
+  Documented on `mount()`, in the header comment and in the README, because the
+  fix is one line and the failure is silent. No behaviour change.
+
 ## [1.1.2] — 2026-09-11
 
 A security release. The one fix that names it is the `Origin` check below —

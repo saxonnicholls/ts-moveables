@@ -868,6 +868,60 @@ void test_hub_ingest_rejects_foreign_origin()
     pass("ws_broadcast_hub: a foreign Origin cannot forge an /ingest publish");
 }
 
+// A route of your own shadows the hub's guarded one (routes match in
+// registration order, first match wins) - and publish() has no request to read
+// an Origin from, so it cannot check one for you. Both halves of that are by
+// design; what matters is that the one-line fix actually works. A downstream
+// consumer shipped the unguarded version of exactly this, so it gets a test.
+void test_hub_custom_route_guards_itself()
+{
+    server srv;
+    ws_broadcast_hub hub;
+
+    // Registered BEFORE mount(), so this shadows the hub's /ingest entirely.
+    srv.post("/ingest/:topic", [&hub](const request& req, responder res) {
+        if (!hub.origin_allowed(req)) {
+            res.send(403, "text/plain; charset=utf-8", "403 Forbidden (origin)\n");
+            return;
+        }
+        hub.publish(req.param("topic"), req.body);
+        res.send(202, "text/plain; charset=utf-8", "ok\n");
+    });
+    hub.mount(srv);
+
+    const std::uint16_t port = srv.listen("127.0.0.1", 0);
+    std::thread th([&srv] { srv.run(); });
+    spin_until([&] { return srv.running(); });
+
+    ws_client sub;
+    assert(sub.connect_to(port, "/ws?topic=hooks"));
+    assert(sub.status() == 101);
+    spin_until([&] { return hub.subscribers() == 1; });
+
+    // The shadowing route is reached, not the hub's - and it refuses.
+    assert(http_post(port, "/ingest/hooks", "forged", "http://evil.example") == 403);
+    assert(hub.snapshot().published == 0);
+
+    assert(http_post(port, "/ingest/hooks", "real") == 202);
+    ws_opcode op;
+    std::string payload;
+    assert(sub.read_frame(op, payload));
+    assert(contains(payload, "real"));
+
+    // And the reason the line is needed: publish() itself never checked, which
+    // is what an unguarded custom route was really calling.
+    hub.publish("hooks", "direct");
+    assert(sub.read_frame(op, payload));
+    assert(contains(payload, "direct"));
+
+    sub.close();
+    srv.stop();
+    if (th.joinable())
+        th.join();
+
+    pass("ws_broadcast_hub: a shadowing custom route guards itself with origin_allowed()");
+}
+
 } // namespace
 
 void run_ws_broadcast_hub_tests()
@@ -889,6 +943,7 @@ void run_ws_broadcast_hub_tests()
     test_hub_allows_loopback_and_listed_origins();
     test_hub_origin_check_opts_out();
     test_hub_ingest_rejects_foreign_origin();
+    test_hub_custom_route_guards_itself();
 }
 
 #else // !SNICHOLLS_HAS_WS_BROADCAST_HUB

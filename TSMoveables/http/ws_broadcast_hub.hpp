@@ -59,6 +59,11 @@
 //  listed in cfg.origin.allow; everything else gets 403 before the upgrade, and
 //  before an ingest publish. See origin_policy in config.hpp.
 //
+//  That covers the handlers this hub hands out. A route you write yourself that
+//  calls publish() is yours to guard - publish() has no request to read an
+//  Origin from - and a route of your own registered before mount() shadows the
+//  hub's. hub.origin_allowed(req) is the one-line check; see mount().
+//
 //  Guarded on SNICHOLLS_HAS_WEBSOCKET: where the WebSocket delegate compiles to
 //  nothing (non-POSIX in phase 1) so does this.
 //
@@ -259,6 +264,22 @@ public:
     // Register both sides on a server in one call, and remember the loop so
     // publish() from a worker thread can marshal onto it. Call before run()
     // (or from the loop thread after).
+    //
+    // The Origin check covers the two handlers registered HERE, and nothing
+    // else - which is easy to over-read as "the hub is guarded" and is worth
+    // being exact about, because a consumer hit it:
+    //
+    //   - Routes match in registration order, first match wins. A route of your
+    //     own on the same path, registered before mount(), shadows the hub's -
+    //     so the request never reaches the guarded handler at all.
+    //   - publish() takes a topic and bytes. There is no request, so there is
+    //     no Origin, so it cannot check one. That is by design (most publishes
+    //     come from a timer, a feed, another thread) and it means any route you
+    //     write that calls publish() is guarded by you, not by the hub.
+    //
+    // Either way the fix is one line at the top of your handler - see
+    // origin_allowed() above. If you want the hub's own ingest semantics plus
+    // the check, register ingest_handler() rather than re-implementing it.
     void mount(server& srv,
                const std::string& ws_path     = "/ws",
                const std::string& ingest_path = "/ingest/:topic")
@@ -267,6 +288,21 @@ public:
         srv.get(ws_path, ws_route());
         srv.post(ingest_path, ingest_handler());
     }
+
+    // Does this request's Origin pass the hub's policy? The hub's own handlers
+    // already ask this. You need it when you write your own route that
+    // publishes - see the note on mount() about why that route is NOT covered
+    // by the hub's check, and is yours to guard:
+    //
+    //     srv.post("/ingest/:topic", [&hub](const request& req, responder res) {
+    //         if (!hub.origin_allowed(req)) {
+    //             res.send(403, "text/plain; charset=utf-8", "403 Forbidden\n");
+    //             return;
+    //         }
+    //         hub.publish(req.param("topic"), req.body);
+    //         res.send(202, "text/plain", "ok\n");
+    //     });
+    bool origin_allowed(const request& req) const { return h_->cfg.origin.allows(req); }
 
     std::size_t subscribers() const { return static_cast<std::size_t>(h_->sub_count.load()); }
     std::size_t subscribers(std::string_view topic) const { return h_->topic_size(topic); }
