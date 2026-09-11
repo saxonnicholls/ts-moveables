@@ -9,6 +9,11 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+## [1.1.2] — 2026-09-11
+
+A security release. The one fix that names it is the `Origin` check below —
+everything else had been sitting in `[Unreleased]` and ships alongside it.
+
 ### Security
 
 - **A WebSocket upgrade accepted any `Origin`, so any web page could read a
@@ -341,6 +346,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.1.2]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.2
 [1.1.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.1
 [1.1.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.0
 [1.0.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.0.0
