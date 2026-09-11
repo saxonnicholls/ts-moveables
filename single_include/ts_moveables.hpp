@@ -67,7 +67,7 @@
 
 #define SNICHOLLS_VERSION_MAJOR 1
 #define SNICHOLLS_VERSION_MINOR 1
-#define SNICHOLLS_VERSION_PATCH 2
+#define SNICHOLLS_VERSION_PATCH 3
 
 // Comparable in the preprocessor. Two decimal digits each for minor and patch,
 // which is plenty and keeps the number readable: 1.0.0 is 10000, 1.2.3 is
@@ -12558,15 +12558,44 @@ inline handler websocket_route(ws_handler on_open, ws_config cfg = ws_config{})
 //  Delivery envelope (frame_mode == envelope_json, the default). Each WebSocket
 //  text frame a subscriber receives is exactly one JSON object:
 //
-//      {"seq":<uint64>,"ts_ms":<uint64>,"topic":"<string>","payload":"<string>"}
+//      {"epoch":<uint64>,"seq":<uint64>,"ts_ms":<uint64>,
+//       "topic":"<string>","payload":"<string>"}
 //
-//    seq      global, monotonic, starts at 1; one per published message, in
-//             delivery order (so a client can spot a gap or a reorder)
+//    epoch    identifies THIS hub's lifetime. Constant for every frame one hub
+//             ever sends, and different for the hub that replaces it. See below
+//             for why a consumer that ignores it eventually loses data.
+//    seq      monotonic within an epoch, starts at 1; one per published
+//             message, in delivery order (so a client can spot a gap or a
+//             reorder). Across epochs it is meaningless - it restarts.
 //    ts_ms    server wall-clock time of publication, Unix epoch milliseconds
 //    topic    the topic the message was published to (JSON-string escaped)
 //    payload  the raw published bytes, carried verbatim as a JSON-string value
 //             (escaped so any UTF-8 text is legal JSON). Not re-parsed - to the
 //             hub it is an opaque string.
+//
+//  Why epoch exists, since a frame that already has seq and ts_ms looks
+//  complete. seq restarts at 1 when the hub does, and the natural consumer -
+//  "remember the last seq I saw, ignore anything not above it" - is correct
+//  within a lifetime and silently wrong across one. After a restart every frame
+//  looks older than what it already has, so it discards all of them, forever,
+//  with no error and no gap to notice: the socket is up, frames are arriving,
+//  and none of them count. That is not hypothetical. A consumer built exactly
+//  this way lost 11 hours of journal and 5 hours of an uplink on one restart,
+//  and the only reason it was ever found was someone reading a dashboard.
+//
+//  The rule for a consumer: compare epoch first. If it differs from the last
+//  one seen, this is a new hub - drop the seq watermark and resynchronise
+//  rather than filtering against it. Only when the epoch matches does seq mean
+//  what you think.
+//
+//  The value is random-looking rather than a timestamp, deliberately: what a
+//  consumer needs is "is this the same lifetime as before", which is a question
+//  about distinctness, and ts_ms already carries time on every frame. A
+//  clock-derived epoch would answer the distinctness question wrongly in
+//  exactly the cases that matter - an NTP step backwards, a VM restored from
+//  snapshot, a container with a coarse clock restarting fast - by handing two
+//  different lifetimes the same id, or by going backwards. Do not read ordering
+//  into it; read equality.
 //
 //  In frame_mode == raw the payload bytes are sent verbatim as the frame, with
 //  no envelope - for a source that already frames its own messages.
@@ -12649,10 +12678,12 @@ inline std::uint64_t unix_millis() noexcept
 #endif /* ts_moveables_utils_time_hpp */
 // end time.hpp
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <list>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -12721,6 +12752,32 @@ struct ws_hub_config {
     // firehose evicts oldest until it fits. 0 disables the byte bound.
     std::size_t    ring_bytes        = 8u * 1024 * 1024;
 
+    // How many distinct topics may hold replay history at once.
+    //
+    // Nothing else bounds this. A topic is whatever a publisher named, a ring
+    // is created the first time one is seen, and both the count bound and the
+    // byte bound above are PER TOPIC - so they multiply rather than cap, and
+    // cardinality is the multiplier nobody sets. Measured: 20,000 distinct
+    // topics cost ~140MB RSS holding almost no history, because the cost is the
+    // ring and the map entry, not the frames. A publisher deriving a topic from
+    // anything unbounded - a request id, a user id, a filename - gets there by
+    // accident, and an attacker with reach to an ingest endpoint gets there on
+    // purpose.
+    //
+    // Over the cap, the coldest topic's history is dropped (least recently
+    // published; the wildcard is touched by every publish, so it never falls
+    // out). DELIVERY IS NEVER AFFECTED - subscribers of any topic, capped or
+    // not, receive every message. Only replay depth is at stake, and only for
+    // topics nobody has published to in a while, which is the history worth the
+    // least. 0 disables the cap.
+    //
+    // Worst-case replay memory is max_topics x ring_bytes; the default pair is
+    // 4096 x 8MB, which is a ceiling and not a reservation (a ring costs bytes
+    // only for the frames actually in it). If that product is too loose for the
+    // deployment, ring_bytes is the one to lower - it is what a single loud
+    // topic can spend.
+    std::size_t    max_topics        = 4096;
+
     std::size_t    max_message_bytes = 1u * 1024 * 1024;  // ingest + frame size cap
 
     // Per-connection outbound bound. A reader slower than the publish rate has
@@ -12741,6 +12798,17 @@ struct ws_hub_stats {
     std::uint64_t dropped     = 0;      // frames trimmed by backpressure
     std::uint64_t subscribers = 0;      // live subscribers now
     std::uint64_t seq         = 0;      // last sequence number issued
+    // This hub's lifetime id, the one stamped into every envelope. Serve it
+    // beside seq on a health endpoint and a consumer can cross-check the socket
+    // against it; a change means the hub restarted and seq restarted with it.
+    std::uint64_t epoch       = 0;
+    // Topics holding replay history now, and how many have been dropped to stay
+    // under max_topics. A climbing topics_evicted with a flat published is the
+    // signature of unbounded topic naming - a topic derived from a request id,
+    // or an ingest endpoint being sprayed - and is worth an alert, because the
+    // cost it is bounding is memory that used to be unbounded.
+    std::uint64_t topics          = 0;
+    std::uint64_t topics_evicted  = 0;
     // Replay history held right now, as accounted per ring: a frame in both
     // its topic's ring and the wildcard's counts twice, and actual heap is
     // lower because rings share frames. The number to watch on a dashboard -
@@ -12870,6 +12938,11 @@ public:
     //     });
     bool origin_allowed(const request& req) const { return h_->cfg.origin.allows(req); }
 
+    // This hub's lifetime id - the `epoch` in every envelope it sends, constant
+    // for as long as it lives. Serve it on a health endpoint and a consumer can
+    // match what the socket carries against what the server says it is.
+    std::uint64_t epoch() const { return h_->epoch; }
+
     std::size_t subscribers() const { return static_cast<std::size_t>(h_->sub_count.load()); }
     std::size_t subscribers(std::string_view topic) const { return h_->topic_size(topic); }
     stats snapshot() const { return h_->snapshot(); }
@@ -12905,15 +12978,20 @@ private:
     struct ring_state {
         circular_buffer<frame_ptr> cb;
         std::size_t bytes = 0;
+        // Where this topic sits in the recency list, so touching it on publish
+        // is a splice rather than a search. Valid for as long as the ring is in
+        // the map; the two are created and destroyed together.
+        std::list<std::string>::iterator lru_it{};
         explicit ring_state(std::size_t cap) : cb(cap) {}
     };
 
     struct impl : std::enable_shared_from_this<impl> {
         config cfg;
 
-        moveable_mutex<> mtx;                                        // guards topics + rings
+        moveable_mutex<> mtx;                                        // guards topics + rings + lru
         std::unordered_map<std::string, sub_snapshot>              topics;   // topic -> subscriber snapshot
         std::unordered_map<std::string, ring_state>                rings;    // topic -> replay history
+        std::list<std::string>                                     lru;      // most recently published first
 
         event_loop::poster       poster;                            // set by mount(); may be empty
 
@@ -12925,11 +13003,45 @@ private:
         // Sum of every ring's bytes, mirrored into an atomic so snapshot()
         // stays lock-free. Written only under mtx (push/evict), read anywhere.
         moveable_atomic_uint64_t ring_held{0};
+        moveable_atomic_uint64_t topic_count{0};        // rings.size(), mirrored for snapshot()
+        moveable_atomic_uint64_t topics_evicted{0};
 
-        explicit impl(config c) : cfg(std::move(c))
+        // Constant for this hub's life, stamped into every envelope. const so
+        // that is enforced rather than merely intended - a mutable epoch would
+        // be worse than none, since a consumer resynchronises on every change.
+        const std::uint64_t epoch;
+
+        explicit impl(config c) : cfg(std::move(c)), epoch(make_epoch(this))
         {
             if (cfg.ring_capacity == 0)
                 cfg.ring_capacity = 1;              // circular_buffer needs a positive capacity
+            // A publish touches its own topic and then the wildcard, so a cap
+            // of 1 would evict what it just wrote on every message. Two is the
+            // smallest cap that holds anything at all.
+            if (cfg.max_topics == 1)
+                cfg.max_topics = 2;
+        }
+
+        // A value that will not repeat across two lifetimes of this type.
+        //
+        // Distinctness is the whole requirement (see the envelope note in the
+        // file header), so this mixes three things that cannot all coincide:
+        // wall-clock milliseconds, a counter that separates hubs built inside
+        // one process in the same millisecond, and the object's own address,
+        // which ASLR varies between runs. The splitmix64 finalizer spreads
+        // those into the full 64 bits so the result does not betray any of
+        // them - a consumer must not be able to read a clock out of this and
+        // start treating it as ordered.
+        static std::uint64_t make_epoch(const void* self) noexcept
+        {
+            static std::atomic<std::uint64_t> counter{0};
+            std::uint64_t x = detail::unix_millis();
+            x += 0x9E3779B97F4A7C15ull * (counter.fetch_add(1, std::memory_order_relaxed) + 1);
+            x ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(self));
+            x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+            x ^= x >> 27; x *= 0x94D049BB133111EBull;
+            x ^= x >> 31;
+            return x ? x : 1;                       // 0 is reserved for "no epoch"
         }
 
         // -------------------------------------------------------- publish path
@@ -12999,8 +13111,9 @@ private:
             if (cfg.frame_mode == framing::raw)
                 return payload;
             std::string e;
-            e.reserve(payload.size() + topic.size() + 64);
-            e += "{\"seq\":";      detail::append_uint(e, static_cast<unsigned long long>(s));
+            e.reserve(payload.size() + topic.size() + 96);
+            e += "{\"epoch\":";    detail::append_uint(e, static_cast<unsigned long long>(epoch));
+            e += ",\"seq\":";      detail::append_uint(e, static_cast<unsigned long long>(s));
             e += ",\"ts_ms\":";    detail::append_uint(e, static_cast<unsigned long long>(ts));
             e += ",\"topic\":\"";  detail::json_escape(topic, e);   e += '"';
             e += ",\"payload\":\"";detail::json_escape(payload, e); e += "\"}";
@@ -13065,16 +13178,22 @@ private:
                     // after this pair: it either lands in the history we just
                     // copied, or is delivered live after it. No gap, no dup, and
                     // replay always precedes live in the queue.
+                    // ring_find, not ring_for: subscribing must not CREATE a
+                    // ring. Otherwise opening sockets on invented topic names
+                    // is its own way to grow the map, and a subscriber that
+                    // leaves would strand an empty ring behind it.
                     if (cfg.replay_on_connect) {
-                        std::vector<frame_ptr> hist;
-                        ring_snapshot(ring_for(topic), hist);
-                        for (auto& m : hist) {
-                            sub->queued_bytes += m->size();
-                            sub->queue.push_back(std::move(m));
-                        }
-                        while (sub->queue.size() > cfg.max_queue_msgs) {
-                            sub->queued_bytes -= sub->queue.front()->size();
-                            sub->queue.pop_front();
+                        if (ring_state* r = ring_find(topic)) {
+                            std::vector<frame_ptr> hist;
+                            ring_snapshot(*r, hist);
+                            for (auto& m : hist) {
+                                sub->queued_bytes += m->size();
+                                sub->queue.push_back(std::move(m));
+                            }
+                            while (sub->queue.size() > cfg.max_queue_msgs) {
+                                sub->queued_bytes -= sub->queue.front()->size();
+                                sub->queue.pop_front();
+                            }
                         }
                     }
                     register_locked(topic, sub);
@@ -13167,8 +13286,11 @@ private:
             s.delivered   = delivered.load();
             s.dropped     = dropped.load();
             s.subscribers = sub_count.load();
-            s.seq         = seq.load();
-            s.ring_bytes  = ring_held.load();
+            s.seq            = seq.load();
+            s.ring_bytes     = ring_held.load();
+            s.epoch          = epoch;
+            s.topics         = topic_count.load();
+            s.topics_evicted = topics_evicted.load();
             return s;
         }
 
@@ -13180,14 +13302,55 @@ private:
             return it == topics.end() ? nullptr : it->second;
         }
 
+        // The topic's ring if it has one, without creating it and without
+        // disturbing recency - recency here means recently PUBLISHED, which is
+        // what the history in a ring actually reflects.
+        ring_state* ring_find(const std::string& topic)
+        {
+            auto it = rings.find(topic);
+            return it == rings.end() ? nullptr : &it->second;
+        }
+
+        // The topic's ring, created on first use, and marked most-recently-used
+        // either way. Creating one past the cap evicts the coldest first, so
+        // rings.size() never exceeds max_topics rather than exceeding it
+        // briefly - which matters, because "briefly" under a topic spray is the
+        // whole attack.
         ring_state& ring_for(const std::string& topic)
         {
             auto it = rings.find(topic);
-            if (it == rings.end())
-                it = rings.emplace(std::piecewise_construct,
-                                   std::forward_as_tuple(topic),
-                                   std::forward_as_tuple(cfg.ring_capacity)).first;
+            if (it != rings.end()) {
+                lru.splice(lru.begin(), lru, it->second.lru_it);    // touch; self-splice is fine
+                return it->second;
+            }
+            if (cfg.max_topics && rings.size() >= cfg.max_topics)
+                evict_coldest_topic();
+
+            it = rings.emplace(std::piecewise_construct,
+                               std::forward_as_tuple(topic),
+                               std::forward_as_tuple(cfg.ring_capacity)).first;
+            lru.push_front(topic);
+            it->second.lru_it = lru.begin();
+            topic_count.store(static_cast<std::uint64_t>(rings.size()));
             return it->second;
+        }
+
+        // Drop the least recently published topic's history. Only history: the
+        // subscriber list for that topic lives in `topics` and is untouched, so
+        // anyone subscribed keeps receiving. Frames already handed to a queue
+        // are shared_ptrs and outlive the ring that held them.
+        void evict_coldest_topic()
+        {
+            if (lru.empty())
+                return;
+            auto it = rings.find(lru.back());
+            if (it != rings.end()) {
+                ring_held.fetch_sub(it->second.bytes);
+                rings.erase(it);
+            }
+            lru.pop_back();
+            topics_evicted.fetch_add(1);
+            topic_count.store(static_cast<std::uint64_t>(rings.size()));
         }
 
         // Keep the last N that fit the byte budget: count bound first, then

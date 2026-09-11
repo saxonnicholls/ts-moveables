@@ -9,7 +9,59 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+## [1.1.3] — 2026-09-11
+
 ### Added
+
+- **The `/ws` envelope carries an `epoch`** — a per-hub-lifetime id, constant
+  for every frame one hub sends and different for the hub that replaces it:
+  `{"epoch":…,"seq":…,"ts_ms":…,"topic":…,"payload":…}`. `seq` restarts at 1
+  when the hub does, and the natural consumer — remember the last `seq`, ignore
+  anything not above it — is correct within a lifetime and **silently wrong
+  across one**: after a restart every frame looks older than what the consumer
+  already has, so it discards all of them, forever, with the socket up and
+  frames arriving. No error, no gap, nothing to notice. That is not a
+  hypothetical: it cost a downstream consumer (super-log) **11 hours of journal
+  and 5 hours of an uplink** on a single restart, found only because somebody
+  read a dashboard. The rule for a consumer is now: compare `epoch` first, and
+  if it changed, drop the watermark and resynchronise rather than filter
+  against it.
+
+  The value is deliberately **random-looking rather than a timestamp**.
+  Distinctness is the entire requirement — `ts_ms` already carries time on every
+  frame — and a clock-derived id answers the distinctness question wrongly in
+  exactly the cases that matter: an NTP step backwards, a VM restored from
+  snapshot, a container with a coarse clock restarting fast, any of which hand
+  two different lifetimes the same id or make it go backwards. It mixes
+  wall-clock ms, a process-local counter and the object address through a
+  splitmix64 finalizer, so it does not leak a readable clock that a consumer
+  might start treating as ordered. `0` is reserved for "unset". Also on
+  `hub.epoch()` and `stats::epoch`, so a health endpoint can serve the same
+  value the wire carries. Three tests, including 256 hubs constructed inside one
+  millisecond all getting distinct epochs — the case a clock-derived id fails —
+  and a restart test confirmed to fail when the epoch is made constant.
+
+- **`config::max_topics` caps distinct topic cardinality** (default 4096; 0
+  disables). Nothing bounded this before: a topic is whatever a publisher named,
+  a ring is created the first time one is seen, and both the count bound and the
+  byte bound are *per topic*, so cardinality multiplied them rather than being
+  capped by them. Measured at **20,000 topics → ~140MB RSS** holding almost no
+  history, because the cost is the ring and the map entry, not the frames. A
+  publisher deriving a topic from a request id, a user id or a filename arrives
+  there by accident; anyone with reach to an ingest endpoint arrives on purpose.
+
+  Over the cap the **least recently published** topic's history is dropped —
+  not the newest, which would let whoever got there first squat the map.
+  **Delivery is never affected**: subscribers of any topic, capped or not,
+  receive every message; only replay depth is at stake, and only for topics
+  nobody has published to lately. Subscribing no longer creates a ring either
+  (`ring_find` rather than `ring_for` on the replay path), so `/ws` is not its
+  own cardinality vector. `stats` gains `topics` and `topics_evicted` — a
+  climbing `topics_evicted` against a flat `published` is the signature of
+  unbounded topic naming. Four tests; the eviction-order one was **rewritten
+  after a negative control showed the first version passed even when eviction
+  took the newest topic** — it now asserts the cold topic's history is gone as
+  well as the hot one's surviving, and fails under that control.
 
 - **`origin_policy::allows(const request&)` and
   `ws_broadcast_hub::origin_allowed(const request&)`** — the 1.1.2 `Origin`
@@ -363,6 +415,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.1.3]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.3
 [1.1.2]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.2
 [1.1.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.1
 [1.1.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.0

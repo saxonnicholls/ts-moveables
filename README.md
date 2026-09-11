@@ -811,6 +811,34 @@ it per subscriber previously cost ~2 ms at 8 KB — a ~94× gap). On one thread 
 Per-subscriber queues are **bounded** (trim-oldest with a high-water mark — never
 unbounded growth, and the publisher never blocks on the slowest reader).
 
+**Every frame carries an `epoch`, and a consumer must compare it first.**
+
+```json
+{"epoch":7719238401993,"seq":1,"ts_ms":1757...,"topic":"prices","payload":"..."}
+```
+
+`seq` restarts at 1 when the hub does. The obvious consumer — remember the last
+`seq`, ignore anything not above it — is correct within one hub lifetime and
+**silently wrong across a restart**: every frame then looks older than what it
+already has, so it discards all of them, with the socket up and frames arriving.
+No error, no gap, nothing to see. That cost a downstream consumer 11 hours of
+journal and 5 hours of an uplink on one restart. `epoch` is constant for one
+hub's life and different for the hub that replaces it, so a change means *drop
+the watermark and resynchronise*. It is deliberately not a timestamp — what you
+need is distinctness, `ts_ms` already carries time, and a clock-derived id gets
+distinctness wrong exactly when it matters (NTP stepping back, a VM restored
+from snapshot). Read it for equality, never for order. Also on `hub.epoch()`
+and `stats::epoch` for a health endpoint.
+
+**Topic cardinality is capped** (`config::max_topics`, default 4096). A topic is
+whatever a publisher named and a ring is created the first time one is seen, so
+distinct topics *multiply* the per-topic count and byte bounds rather than being
+capped by them — 20,000 topics cost ~140MB holding almost no history. Over the
+cap the least-recently-published topic's history is dropped; **delivery is never
+affected**, only replay depth, and only for topics nobody is publishing to.
+`stats.topics_evicted` climbing against a flat `published` is the signature of
+unbounded topic naming.
+
 **Both doors check `Origin`, and this is on by default.** Browsers do not apply
 the same-origin policy to WebSockets — a `fetch()` to `http://127.0.0.1:8080/` is
 stopped before it is sent, a `WebSocket` to `ws://127.0.0.1:8080/` is not — so

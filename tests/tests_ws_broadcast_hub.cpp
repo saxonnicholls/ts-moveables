@@ -27,8 +27,10 @@
 
 #if SNICHOLLS_HAS_WS_BROADCAST_HUB
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -272,6 +274,17 @@ struct hub_server {
 bool contains(const std::string& hay, const std::string& needle)
 {
     return hay.find(needle) != std::string::npos;
+}
+
+// Pull one unsigned field out of an envelope. Deliberately crude - the point is
+// to read what went on the wire, not to depend on a parser that might agree
+// with the writer about a shared mistake.
+std::uint64_t json_uint(const std::string& s, const char* key)
+{
+    const std::string k = std::string("\"") + key + "\":";
+    const std::size_t i = s.find(k);
+    assert(i != std::string::npos);
+    return std::strtoull(s.c_str() + i + k.size(), nullptr, 10);
 }
 
 // ------------------------------------------------------------------- tests
@@ -922,6 +935,205 @@ void test_hub_custom_route_guards_itself()
     pass("ws_broadcast_hub: a shadowing custom route guards itself with origin_allowed()");
 }
 
+// -------------------------------------------------------------------- epoch
+//
+// seq restarts at 1 when the hub does, so a consumer filtering on "greater than
+// the last seq I saw" is correct within a lifetime and silently wrong across
+// one - after a restart every frame looks stale and it discards all of them,
+// with the socket up and frames arriving. That cost a downstream consumer 11
+// hours of journal and 5 hours of an uplink. epoch is what makes the restart
+// visible on the wire.
+
+void test_hub_frames_carry_a_stable_epoch()
+{
+    hub_server s;
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=*"));
+    spin_until([&] { return s.hub.subscribers() == 1; });
+
+    const std::uint64_t e = s.hub.epoch();
+    assert(e != 0);                                 // 0 is reserved for "unset"
+    assert(s.hub.snapshot().epoch == e);            // and what /healthz would serve
+
+    for (int i = 1; i <= 5; ++i) {
+        s.hub.publish("t" + std::to_string(i), "p");
+        std::string payload;
+        assert(c.read_data_frame(payload));
+        assert(json_uint(payload, "epoch") == e);   // identical on every frame
+        assert(json_uint(payload, "seq") == std::uint64_t(i));
+    }
+
+    pass("ws_broadcast_hub: every envelope carries the hub's epoch, unchanging");
+}
+
+void test_hub_epoch_changes_on_restart_where_seq_does_not()
+{
+    std::uint64_t first_epoch = 0, first_seq = 0;
+    {
+        hub_server s;
+        ws_client c;
+        assert(c.connect_to(s.port, "/ws?topic=feed"));
+        spin_until([&] { return s.hub.subscribers() == 1; });
+        s.hub.publish("feed", "before");
+        std::string payload;
+        assert(c.read_data_frame(payload));
+        first_epoch = json_uint(payload, "epoch");
+        first_seq   = json_uint(payload, "seq");
+    }
+
+    hub_server s2;                                  // the restart
+    ws_client c2;
+    assert(c2.connect_to(s2.port, "/ws?topic=feed"));
+    spin_until([&] { return s2.hub.subscribers() == 1; });
+    s2.hub.publish("feed", "after");
+    std::string payload;
+    assert(c2.read_data_frame(payload));
+
+    // seq cannot tell the two lifetimes apart - it is 1 both times, which is
+    // exactly why a watermark filter throws the new hub's whole output away.
+    assert(first_seq == 1);
+    assert(json_uint(payload, "seq") == 1);
+
+    // epoch can, which is the entire point of the field.
+    assert(json_uint(payload, "epoch") != first_epoch);
+    assert(json_uint(payload, "epoch") == s2.hub.epoch());
+
+    pass("ws_broadcast_hub: a restart changes epoch though seq restarts at 1");
+}
+
+void test_hub_epochs_are_distinct_within_one_millisecond()
+{
+    // Hubs built back-to-back land in the same millisecond, so an epoch taken
+    // straight from the clock would hand them the same id - and a consumer
+    // would then miss a restart entirely. Distinctness has to survive a coarse
+    // clock, which is why the value is mixed rather than read.
+    std::vector<std::uint64_t> seen;
+    seen.reserve(256);
+    for (int i = 0; i < 256; ++i) {
+        ws_broadcast_hub h;
+        seen.push_back(h.epoch());
+    }
+    assert(std::find(seen.begin(), seen.end(), std::uint64_t(0)) == seen.end());
+    std::sort(seen.begin(), seen.end());
+    assert(std::adjacent_find(seen.begin(), seen.end()) == seen.end());
+
+    pass("ws_broadcast_hub: 256 hubs in one millisecond all get distinct epochs");
+}
+
+// ------------------------------------------------------------- cardinality
+//
+// A topic is whatever a publisher named, and a ring is created the first time
+// one is seen - so distinct topics multiply the per-topic bounds rather than
+// being bounded by them. 20,000 of them cost ~140MB holding nearly no history.
+
+void test_hub_topic_cardinality_is_capped()
+{
+    ws_broadcast_hub::config cfg;
+    cfg.max_topics = 8;
+    hub_server s(cfg);
+
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=kept"));
+    spin_until([&] { return s.hub.subscribers() == 1; });
+
+    for (int i = 0; i < 200; ++i)
+        s.hub.publish("spray-" + std::to_string(i), "x");
+    assert(spin_until_for([&] { return s.hub.snapshot().published >= 200; }));
+
+    const auto st = s.hub.snapshot();
+    assert(st.topics <= 8);                         // the cap holds
+    assert(st.topics_evicted > 0);                  // and it was actually doing work
+
+    // The guarantee that matters: the cap bounds HISTORY, never delivery. A
+    // subscriber keeps receiving no matter how hard topics churn past it.
+    s.hub.publish("kept", "still-here");
+    std::string payload;
+    assert(c.read_data_frame(payload));
+    assert(contains(payload, "still-here"));
+
+    pass("ws_broadcast_hub: distinct topics are capped, and delivery is unaffected");
+}
+
+void test_hub_cardinality_evicts_the_coldest_topic()
+{
+    // Eviction is least-recently-published, so a topic still in use keeps its
+    // replay while abandoned ones fall out. The alternative - refusing new
+    // topics once full - would let whoever got there first squat the map.
+    ws_broadcast_hub::config cfg;
+    cfg.max_topics = 4;
+    hub_server s(cfg);
+
+    s.hub.publish("cold", "COLD-HISTORY");                   // and never again
+    for (int i = 0; i < 40; ++i) {
+        s.hub.publish("hot", "HOT-HISTORY");                 // kept warm
+        s.hub.publish("churn-" + std::to_string(i), "x");    // pushes others out
+    }
+    assert(spin_until_for([&] { return s.hub.snapshot().topics_evicted >= 30; }));
+    assert(s.hub.snapshot().topics <= 4);
+
+    // hot was republished throughout, so its ring survived: a fresh subscriber
+    // gets replay before anything live.
+    ws_client hot;
+    assert(hot.connect_to(s.port, "/ws?topic=hot"));
+    spin_until([&] { return s.hub.subscribers() == 1; });
+    std::string payload;
+    assert(hot.read_data_frame(payload));
+    assert(contains(payload, "HOT-HISTORY"));
+
+    // cold has not been published to since the very first message, so it is the
+    // least recently used and its ring is gone. Asserted positively rather than
+    // by waiting for nothing to arrive: connect, publish once, and the FIRST
+    // frame must be the new message. If the ring had survived, the replay of
+    // COLD-HISTORY would arrive ahead of it.
+    //
+    // This is the assertion that makes the test about eviction ORDER. Without
+    // it the test passes just as happily when eviction takes the newest, since
+    // hot is re-touched every round and survives either policy - which is
+    // exactly what a negative control caught here.
+    ws_client cold;
+    assert(cold.connect_to(s.port, "/ws?topic=cold"));
+    spin_until([&] { return s.hub.subscribers() == 2; });
+    s.hub.publish("cold", "COLD-LIVE");
+    assert(cold.read_data_frame(payload));
+    assert(contains(payload, "COLD-LIVE"));
+    assert(!contains(payload, "COLD-HISTORY"));
+
+    pass("ws_broadcast_hub: eviction takes the coldest topic, not the newest");
+}
+
+void test_hub_subscribing_never_creates_a_topic()
+{
+    // Otherwise /ws is its own cardinality vector: open sockets on invented
+    // topic names and the map grows, with an empty ring stranded behind each
+    // one that leaves.
+    hub_server s;
+    assert(s.hub.snapshot().topics == 0);
+
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=never-published"));
+    spin_until([&] { return s.hub.subscribers() == 1; });
+    assert(s.hub.snapshot().topics == 0);
+
+    pass("ws_broadcast_hub: subscribing to a topic does not create one");
+}
+
+void test_hub_cardinality_cap_can_be_disabled()
+{
+    ws_broadcast_hub::config cfg;
+    cfg.max_topics = 0;                             // documented as "no cap"
+    hub_server s(cfg);
+
+    for (int i = 0; i < 50; ++i)
+        s.hub.publish("t" + std::to_string(i), "x");
+    assert(spin_until_for([&] { return s.hub.snapshot().published >= 50; }));
+
+    const auto st = s.hub.snapshot();
+    assert(st.topics == 51);                        // 50 topics + the wildcard
+    assert(st.topics_evicted == 0);
+
+    pass("ws_broadcast_hub: max_topics 0 disables the cap");
+}
+
 } // namespace
 
 void run_ws_broadcast_hub_tests()
@@ -944,6 +1156,13 @@ void run_ws_broadcast_hub_tests()
     test_hub_origin_check_opts_out();
     test_hub_ingest_rejects_foreign_origin();
     test_hub_custom_route_guards_itself();
+    test_hub_frames_carry_a_stable_epoch();
+    test_hub_epoch_changes_on_restart_where_seq_does_not();
+    test_hub_epochs_are_distinct_within_one_millisecond();
+    test_hub_topic_cardinality_is_capped();
+    test_hub_cardinality_evicts_the_coldest_topic();
+    test_hub_subscribing_never_creates_a_topic();
+    test_hub_cardinality_cap_can_be_disabled();
 }
 
 #else // !SNICHOLLS_HAS_WS_BROADCAST_HUB
