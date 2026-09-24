@@ -9,6 +9,11 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-09-24
+
+The data-parallel release. Additive throughout - nothing that worked in
+1.1.3 behaves differently.
+
 ### Added
 
 - **`parallel_for` and `parallel_for_each`** (`concurrent/parallel_for.hpp`) —
@@ -465,6 +470,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.2.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.2.0
 [1.1.3]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.3
 [1.1.2]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.2
 [1.1.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.1
