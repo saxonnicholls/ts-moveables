@@ -99,7 +99,7 @@
 
 #define SNICHOLLS_VERSION_MAJOR 1
 #define SNICHOLLS_VERSION_MINOR 2
-#define SNICHOLLS_VERSION_PATCH 0
+#define SNICHOLLS_VERSION_PATCH 1
 
 // Comparable in the preprocessor. Two decimal digits each for minor and patch,
 // which is plenty and keeps the number readable: 1.0.0 is 10000, 1.2.3 is

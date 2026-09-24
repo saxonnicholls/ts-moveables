@@ -9,6 +9,43 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-09-24
+
+### Fixed
+
+- **A 1.2.0 test asserted a property of the machine rather than of the code**,
+  and failed CI on Windows MSVC, CMake Windows and CMake macOS. The library
+  itself was never wrong — `parallel_for` behaved correctly on every platform,
+  and only the bundled test failed — but a release that does not pass its own
+  CI is not a release, hence this patch.
+
+  The test put 256 expensive elements at the front of a 4096 range and asserted
+  no single thread did all of them. Default grain is `ceil(n / (workers × 4))`,
+  so on a two-core runner it is 512 and the whole expensive prefix sits in
+  chunk 0: one thread does all 256, *correctly*, because the range was never
+  divided anywhere near them. On a 32-thread machine grain is 32, the prefix
+  spans 8 chunks, and it spread — so the test encoded "big machine" as an
+  assumption, passed locally, and failed on every small runner. Not flaky;
+  arithmetic.
+
+  Grain is now explicit, so the prefix spans 16 chunks at any core count, and a
+  gate parks the first thread entering the body until a second arrives — a lone
+  thread draining the range while workers are still starting is also correct
+  behaviour, and was the other half of the coin flip. The gate opening is now
+  the assertion: a fixed-slice implementation would hand the whole prefix to one
+  worker, which would wait out its deadline and **fail** rather than skip.
+  Confirmed by negative control, plus 30 consecutive runs and 16 concurrent
+  instances under full CPU saturation. The companion "spread across threads"
+  test had the same latent flaw and the same fix; both now use an explicit
+  two-worker pool so CI and a workstation run the same thing.
+
+### Added
+
+- `make bench-parallel` runs in CI as an informational step on all six build
+  platforms, with `--quick` to fit a runner's memory and time budget and
+  `--markdown` to render in the job summary.
+
+
 ## [1.2.0] — 2026-09-24
 
 The data-parallel release. Additive throughout - nothing that worked in
@@ -470,6 +507,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.2.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.2.1
 [1.2.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.2.0
 [1.1.3]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.3
 [1.1.2]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.2
