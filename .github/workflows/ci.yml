@@ -227,6 +227,21 @@ jobs:
             ./build/loop_dispatch --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Does parallel_for actually scale, and where does it stop? Informational
+      # because runners are shared, few-core and noisy - but the SHAPE is the
+      # point: a compute-bound body should track cores, a memory-bound one
+      # should plateau, and hand unrolling should be a wash. --quick shrinks the
+      # ranges to fit a runner's memory and time budget.
+      - name: parallel_for scaling (informational)
+        continue-on-error: true
+        run: |
+          make build/parallel_scaling CXX=${{ matrix.cxx }}
+          {
+            echo "## parallel_for scaling - ${{ matrix.name }}"
+            echo ""
+            ./build/parallel_scaling --markdown
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       # What one request costs in CPU alone, with no sockets involved: the
       # ceiling a core cannot exceed however good the I/O layer is.
       - name: Request path cost (informational)

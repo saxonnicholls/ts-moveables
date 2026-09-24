@@ -97,8 +97,22 @@ struct memory_body {
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    // --quick shrinks the ranges for CI: shared runners have few cores, less
+    // memory and a time budget, and the shape of the curve survives the cut
+    // even though the absolute numbers do not. --markdown fences the output so
+    // it renders inside a GitHub step summary.
+    bool quick = false, markdown = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--quick") quick = true;
+        else if (a == "--markdown") { markdown = true; quick = true; }
+    }
+    const int shift = quick ? 4 : 0;        // 16x fewer elements
+    const int runs  = quick ? 2 : 3;
+    if (markdown) std::printf("```\n");
+
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     std::printf("parallel_for scaling - %u hardware threads\n", hw);
 
@@ -106,8 +120,8 @@ int main()
     //
     // Two bodies, the same shape of loop, swept over worker counts.
     {
-        const std::size_t n_compute = 1u << 20;     // 1M elements
-        const std::size_t n_memory  = 1u << 24;     // 16M elements ~ 128MB per array
+        const std::size_t n_compute = std::size_t{1} << (20 - shift);
+        const std::size_t n_memory  = std::size_t{1} << (24 - shift);
 
         std::vector<double> in(n_compute), out(n_compute);
         for (std::size_t i = 0; i < n_compute; ++i)
@@ -119,10 +133,10 @@ int main()
         const compute_body cb{out.data(), in.data()};
         const memory_body  mbod{mo.data(), ma.data(), mb.data()};
 
-        const double serial_compute = best_ms(3, [&] {
+        const double serial_compute = best_ms(runs, [&] {
             for (std::size_t i = 0; i < n_compute; ++i) cb(i);
         });
-        const double serial_memory = best_ms(3, [&] {
+        const double serial_memory = best_ms(runs, [&] {
             for (std::size_t i = 0; i < n_memory; ++i) mbod(i);
         });
 
@@ -132,7 +146,7 @@ int main()
         std::printf("  %-10s %12.2f %12s %10s %12s\n", "serial", serial_compute, "1.00x", "-", "baseline");
         for (unsigned w = 1; w <= hw; w *= 2) {
             work_stealing_task_pool pool(w);
-            const double t = best_ms(3, [&] {
+            const double t = best_ms(runs, [&] {
                 parallel_for(pool, std::size_t{0}, n_compute, cb);
             });
             std::printf("  %-10u %12.2f %11.2fx %9.0f%% %12s\n",
@@ -147,7 +161,7 @@ int main()
                     (3.0 * double(n_memory) * sizeof(double) / 1e9) / (serial_memory / 1e3));
         for (unsigned w = 1; w <= hw; w *= 2) {
             work_stealing_task_pool pool(w);
-            const double t = best_ms(3, [&] {
+            const double t = best_ms(runs, [&] {
                 parallel_for(pool, std::size_t{0}, n_memory, mbod);
             });
             std::printf("  %-10u %12.2f %11.2fx %9.0f%% %12.1f\n",
@@ -171,16 +185,17 @@ int main()
         rule("call overhead - where parallel stops being worth it (compute body)");
         std::printf("  %-12s %14s %14s %12s\n", "elements", "serial ms", "parallel ms", "verdict");
         work_stealing_task_pool pool(hw);
-        std::vector<double> in(1u << 16), out(1u << 16);
+        const std::size_t cap = std::size_t{1} << (16 - shift);
+        std::vector<double> in(cap), out(cap);
         for (std::size_t i = 0; i < in.size(); ++i) in[i] = double(i % 1000) * 0.001;
         const compute_body cb{out.data(), in.data()};
 
-        for (std::size_t n = 16; n <= (1u << 16); n *= 8) {
-            const int runs = 200;
-            const double s = best_ms(runs, [&] {
+        for (std::size_t n = 16; n <= cap; n *= 8) {
+            const int inner = quick ? 50 : 200;
+            const double s = best_ms(inner, [&] {
                 for (std::size_t i = 0; i < n; ++i) cb(i);
             });
-            const double p = best_ms(runs, [&] {
+            const double p = best_ms(inner, [&] {
                 parallel_for(pool, std::size_t{0}, n, cb);
             });
             std::printf("  %-12zu %14.4f %14.4f %12s\n", n, s, p,
@@ -193,14 +208,14 @@ int main()
         rule("grain size (compute body, 1M elements, all cores)");
         std::printf("  %-14s %14s %12s\n", "grain", "time ms", "note");
         work_stealing_task_pool pool(hw);
-        const std::size_t n = 1u << 20;
+        const std::size_t n = std::size_t{1} << (20 - shift);
         std::vector<double> in(n), out(n);
         for (std::size_t i = 0; i < n; ++i) in[i] = double(i % 1000) * 0.001;
         const compute_body cb{out.data(), in.data()};
 
         const std::size_t grains[] = {0, 1, 64, 1024, 16384, n};
         for (std::size_t g : grains) {
-            const double t = best_ms(3, [&] { parallel_for(pool, std::size_t{0}, n, cb, g); });
+            const double t = best_ms(runs, [&] { parallel_for(pool, std::size_t{0}, n, cb, g); });
             const char* note = (g == 0)   ? "default (~4 chunks/worker)"
                              : (g == 1)   ? "one element per chunk"
                              : (g == n)   ? "one chunk total - no parallelism"
@@ -217,20 +232,20 @@ int main()
         rule("hand unrolling vs letting the compiler do it (memory body, 16M)");
         std::printf("  %-16s %14s %12s\n", "unroll factor", "time ms", "vs none");
         work_stealing_task_pool pool(hw);
-        const std::size_t n = 1u << 24;
+        const std::size_t n = std::size_t{1} << (24 - shift);
         std::vector<double> a(n), b(n), o(n);
         for (std::size_t i = 0; i < n; ++i) { a[i] = double(i); b[i] = double(i) * 0.5; }
         const memory_body mb{o.data(), a.data(), b.data()};
 
-        const double base = best_ms(3, [&] { parallel_for<1>(pool, std::size_t{0}, n, mb); });
+        const double base = best_ms(runs, [&] { parallel_for<1>(pool, std::size_t{0}, n, mb); });
         std::printf("  %-16s %14.2f %12s\n", "1 (none)", base, "baseline");
-        const double u2 = best_ms(3, [&] { parallel_for<2>(pool, std::size_t{0}, n, mb); });
+        const double u2 = best_ms(runs, [&] { parallel_for<2>(pool, std::size_t{0}, n, mb); });
         std::printf("  %-16s %14.2f %11.2fx\n", "2", u2, base / u2);
-        const double u4 = best_ms(3, [&] { parallel_for<4>(pool, std::size_t{0}, n, mb); });
+        const double u4 = best_ms(runs, [&] { parallel_for<4>(pool, std::size_t{0}, n, mb); });
         std::printf("  %-16s %14.2f %11.2fx\n", "4", u4, base / u4);
-        const double u8 = best_ms(3, [&] { parallel_for<8>(pool, std::size_t{0}, n, mb); });
+        const double u8 = best_ms(runs, [&] { parallel_for<8>(pool, std::size_t{0}, n, mb); });
         std::printf("  %-16s %14.2f %11.2fx\n", "8", u8, base / u8);
-        const double u16 = best_ms(3, [&] { parallel_for<16>(pool, std::size_t{0}, n, mb); });
+        const double u16 = best_ms(runs, [&] { parallel_for<16>(pool, std::size_t{0}, n, mb); });
         std::printf("  %-16s %14.2f %11.2fx\n", "16", u16, base / u16);
 
         const double best = std::min({base, u2, u4, u8, u16});
@@ -242,14 +257,14 @@ int main()
     // ------------------------------------------- what unrolling IS good for
     {
         rule("constexpr_for - unrolling that a compiler cannot do for you");
-        const std::size_t n = 1u << 22;
+        const std::size_t n = std::size_t{1} << (22 - shift);
         std::vector<double> m(n * 0 + 16, 1.0);     // a 4x4 tile, reused
         double acc = 0;
 
         // A fixed 4x4 kernel with every index a compile-time constant: no
         // loop, no bounds arithmetic, and the body can use I/J as template
         // arguments. A run-time loop cannot be turned into this by -O2 alone.
-        const double t = best_ms(50, [&] {
+        const double t = best_ms(quick ? 10 : 50, [&] {
             for (std::size_t r = 0; r < n / 16; ++r)
                 constexpr_nest<4, 4>([&](auto I, auto J) {
                     acc += m[I.value * 4 + J.value];
@@ -261,6 +276,7 @@ int main()
                     "  kernels become possible at all.\n");
     }
 
+    if (markdown) std::printf("```\n");
     std::printf("\ndone\n");
     return 0;
 }

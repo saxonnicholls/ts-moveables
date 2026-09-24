@@ -64,28 +64,59 @@ void test_parallel_for_visits_every_element_once_on_every_pool()
     pass("parallel_for: every element runs exactly once, on all four pools");
 }
 
+// Force at least two threads into the loop body rather than hoping the
+// scheduler provides them.
+//
+// The first arrival blocks until a second shows up, so a single thread CANNOT
+// drain the whole range: it is parked inside the body, and the remaining
+// chunks are there for anyone else to claim. That turns "did it spread?" from
+// a timing observation into something the test makes true - or fails on.
+//
+// Bounded by a deadline so a starved runner can never hang CI; if the gate
+// times out the design under test did not do what it claims, which is a
+// failure rather than a reason to skip.
+class two_thread_gate {
+public:
+    bool arrive()
+    {
+        if (arrived_.fetch_add(1) + 1 >= 2)
+            return true;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (arrived_.load() < 2) {
+            if (std::chrono::steady_clock::now() >= deadline)
+                return false;
+            std::this_thread::yield();
+        }
+        return true;
+    }
+    bool opened() const { return arrived_.load() >= 2; }
+
+private:
+    std::atomic<int> arrived_{0};
+};
+
 void test_parallel_for_actually_uses_more_than_one_thread()
 {
     // Correctness above is satisfied by a serial loop, so it cannot tell
-    // whether anything was parallel at all. This can: collect the thread ids
-    // that ran chunks. A body slow enough to overlap makes this deterministic
-    // enough to assert on without timing.
-    work_stealing_task_pool pool;
-    if (pool.worker_count() <= 1) {
-        pass("parallel_for: (single core - parallel spread not asserted)");
-        return;
-    }
+    // whether anything ran in parallel at all. This can - but only because the
+    // gate makes a single-threaded run impossible rather than unlikely.
+    //
+    // An explicit two-worker pool, not hardware_concurrency: the behaviour
+    // under test must be the same on a 2-core CI runner as on a 32-thread
+    // workstation, and depending on the host's core count is how the first
+    // version of the test below came to pass locally and fail on Windows.
+    work_stealing_task_pool pool(2);
 
+    two_thread_gate gate;
     moveable_mutex<> mtx;
     std::set<std::thread::id> threads;
     parallel_for(pool, 0, 512, [&](int) {
-        {
-            std::lock_guard<moveable_mutex<>> g(mtx);
-            threads.insert(std::this_thread::get_id());
-        }
-        std::this_thread::yield();
-    });
+        gate.arrive();
+        std::lock_guard<moveable_mutex<>> g(mtx);
+        threads.insert(std::this_thread::get_id());
+    }, 16);                                      // 32 chunks, so there is always more to claim
 
+    assert(gate.opened());                       // a second thread really did arrive
     assert(threads.size() > 1);
     pass("parallel_for: the range really is spread across threads");
 }
@@ -94,39 +125,56 @@ void test_parallel_for_balances_an_uneven_body()
 {
     // The reason chunks are claimed from a cursor rather than handed out as
     // fixed slices. All the expensive elements are at one end, so a fixed-slice
-    // split puts them on one worker while the others idle. With claiming, the
-    // workers that drew cheap chunks come back for more - so no single thread
-    // should end up doing nearly all of the expensive elements.
-    work_stealing_task_pool pool;
-    if (pool.worker_count() <= 1) {
-        pass("parallel_for: (single core - balance not asserted)");
-        return;
-    }
+    // split hands them to one worker while the others idle; with claiming, the
+    // threads that drew cheap chunks come back for more.
+    //
+    // Two things make this deterministic rather than a property of the host,
+    // and the first version of this test had neither - it passed on a 32-thread
+    // machine and failed on every 2-core CI runner:
+    //
+    //   grain is EXPLICIT. The default is ceil(n / (workers*4)), so on two
+    //   workers it would be 512 and all 256 expensive elements would sit in
+    //   chunk 0 - one thread doing all of them, correctly, with nothing for
+    //   anyone to steal. That is not an imbalance the design claims to fix; it
+    //   is a range that was never divided. At grain 16 the expensive prefix
+    //   spans 16 chunks and there is something to spread.
+    //
+    //   the gate forces a second thread in. Otherwise the calling thread can
+    //   legitimately drain the whole range before a worker is scheduled, which
+    //   is also correct behaviour and would make the assertion a coin flip.
+    work_stealing_task_pool pool(2);
 
     const int n = 4096;
     const int expensive_below = 256;            // the costly elements, all at the front
+    two_thread_gate gate;
     moveable_mutex<> mtx;
     std::map<std::thread::id, int> expensive_per_thread;
 
     parallel_for(pool, 0, n, [&](int i) {
         if (i < expensive_below) {
+            gate.arrive();                      // only the first arrival waits
             volatile double sink = 0;           // enough work to matter, no sleeping
             for (int k = 0; k < 20000; ++k)
                 sink += k * 0.5;
             std::lock_guard<moveable_mutex<>> g(mtx);
             ++expensive_per_thread[std::this_thread::get_id()];
         }
-    });
+    }, 16);
 
     int total = 0, worst = 0;
     for (const auto& e : expensive_per_thread) {
         total += e.second;
         worst = (e.second > worst) ? e.second : worst;
     }
-    assert(total == expensive_below);
-    // A fixed-slice split would put all 256 on one thread. Claiming should get
-    // well under that; the bound is loose on purpose so this is not a timing
-    // test, but it still fails the design it is here to check.
+    assert(total == expensive_below);           // every expensive element ran once
+
+    // The gate opening IS the design claim: with the expensive work spread over
+    // 16 chunks and one thread parked in the first of them, a second thread had
+    // to be able to claim another. A fixed-slice implementation would have given
+    // the whole prefix to one worker, which would then wait at the gate until
+    // the deadline - so this assertion fails rather than skips.
+    assert(gate.opened());
+    assert(expensive_per_thread.size() > 1);
     assert(worst < expensive_below);
 
     pass("parallel_for: an uneven body still spreads, not one slice per worker");
