@@ -67,6 +67,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | a **pipeline** with consumer dependency graphs | [`disruptor<T>`](#disruptor) |
 | **run tasks on a pool** | [`task_pool`](#thread_pool) — `work_stealing_` for fork-join, `mpmc_` for general submit, `dispatch_` for a single feed |
 | **run a loop across cores** | [`parallel_for`](#parallel_for) / `parallel_for_each` — over any `task_pool`, blocking, exception-propagating |
+| **unroll a loop at compile time**, or index by a constant | [`constexpr_for`](#constexpr_for) — a step, nested to any depth, and the index as a template argument |
 | an **event loop** for fds and timers without the usual scars | [`event_loop`](#event_loop) — POSIX reactor, typed dispatch, loud contracts |
 | an **HTTP server** that does not park a thread per connection | [`http_server`](#http_server) — routes, async responders, or one drop-in header |
 | **WebSockets**, or `wss` | [`websocket`](#websocket) — Autobahn-clean, one route handler |
