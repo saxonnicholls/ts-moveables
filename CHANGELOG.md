@@ -9,6 +9,56 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+### Added
+
+- **`parallel_for` and `parallel_for_each`** (`concurrent/parallel_for.hpp`) —
+  data-parallel loops over any `task_pool`, so the same call runs on the
+  shared-queue, sharded, MPMC or work-stealing pool and a benchmark can swap
+  between them without touching the loop. Both block until every element is
+  done and rethrow the first exception a body threw once the rest have settled.
+
+  Two decisions carry it. **Chunks are claimed from a shared cursor, not handed
+  out as fixed slices** — one slice per worker is only correct when every
+  element costs the same, which is exactly the assumption that fails; claiming
+  makes an imbalance cost one chunk instead of one slice. And **the calling
+  thread runs chunks too**, which is what makes the call safe to nest: a
+  `parallel_for` inside a pool task occupies a worker while it waits, so if it
+  waited passively and every worker did the same there would be no thread left
+  to run the work they were all waiting on. Because the caller drains the same
+  cursor it can finish the range alone, and nesting degrades to serial rather
+  than deadlocking. Verified by negative control — with caller participation
+  removed, the nested test hangs.
+
+  Measured with `make bench-parallel` on a 32-thread machine: a compute-bound
+  body reaches **17.1x**, a memory-bound one plateaus at **5.7x (~79 GB/s)**
+  because cores do not add memory bandwidth. The parallel call pays for itself
+  from roughly **128 elements** of a non-trivial body and loses below that. The
+  default grain (~4 chunks per worker) lands within 5% of the best hand-picked
+  value, while grain 1 is 10x worse.
+
+- **`constexpr_for`, `constexpr_nest` and `unrolled_for`** (`utils/constexpr_for.hpp`)
+  — compile-time loop unrolling. `constexpr_for<Start, End, Inc>` supports a
+  step including a negative one, forwards trailing arguments to every
+  iteration, and hands the body `std::integral_constant` rather than a bare
+  value **so the index is usable as a template argument** — a function
+  parameter is never a constant expression, which is usually the whole reason
+  to unroll by hand. `constexpr_nest<E0, E1, ...>` does the same for nested
+  loops to any depth (`<2,3>`, `<2,3,4>`, `<2,2,2,2>`), every index constant.
+  `unrolled_for<N>` covers a run-time range with a tail.
+
+  Implemented by folding an `index_sequence` rather than recursing: the
+  recursive spelling instantiates one template per iteration, so template depth
+  grows with the count and meets the compiler's instantiation limit a few
+  hundred iterations in. The fold is depth 1 at any count. C++17 throughout,
+  which is the library's declared floor.
+
+  The benchmark also prints hand-unrolling against not, and the honest result is
+  that **it is a wash** — 3.4% spread across factors 1 to 16 on a streaming
+  body, i.e. noise, because the compiler already unrolled it. `constexpr_for`
+  earns its place where a compiler unroll cannot help at all: bodies that must
+  be instantiated per index.
+
+
 ## [1.1.3] — 2026-09-11
 
 ### Added

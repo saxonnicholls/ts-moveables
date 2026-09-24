@@ -222,6 +222,13 @@ build/ws_hub_broadcast: benchmarks/ws_hub_broadcast.cpp $(HEADERS) | build
 	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/ws_hub_broadcast.cpp -o $@ $(LDLIBS)
 
+build/parallel_scaling: benchmarks/parallel_scaling.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    benchmarks/parallel_scaling.cpp -o $@ $(LDLIBS)
+
+bench-parallel: build/parallel_scaling
+	./build/parallel_scaling
+
 bench-wshub: build/ws_hub_broadcast
 	./build/ws_hub_broadcast
 
@@ -295,4 +302,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
+.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean

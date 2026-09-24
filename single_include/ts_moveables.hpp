@@ -5184,6 +5184,505 @@ namespace snicholls
 
 #endif /* thread_pool_hpp */
 // end thread_pool.hpp
+// (inlined) #include "concurrent/parallel_for.hpp"                 // IWYU pragma: export
+// ----------------------------------------------------------------------
+// begin parallel_for.hpp
+// ----------------------------------------------------------------------
+//
+//  parallel_for.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - data-parallel loops over any task_pool
+//
+//  The pools in thread_pool.hpp answer "run this somewhere". This answers the
+//  question actually asked most of the time: "run this loop across the cores I
+//  have, and come back when it is done." It is a thin layer and deliberately
+//  so - it adds no threads, owns no scheduler, and holds no global state. It
+//  binds to the `task_pool` INTERFACE, so the same call runs on the shared-queue
+//  pool, the sharded one, the MPMC one or the work-stealing one, and a
+//  benchmark can swap between them without touching the loop.
+//
+//      snicholls::work_stealing_task_pool pool;
+//      snicholls::parallel_for(pool, 0, n, [&](int i) { out[i] = f(in[i]); });
+//      snicholls::parallel_for_each(pool, v.begin(), v.end(), [](auto& x) { x *= 2; });
+//
+//  Both block until every element has been processed, and both propagate the
+//  first exception a body threw once the rest have settled.
+//
+//  ------------------------------------------------------------------ the shape
+//
+//  Two decisions carry this file, and neither is the obvious one.
+//
+//  1. The range is cut into many more chunks than there are workers, and
+//     workers CLAIM chunks from a shared cursor rather than being handed a
+//     fixed slice each. The obvious design - one slice per worker - is only
+//     correct when every element costs the same, and that is exactly the
+//     assumption that fails in practice: one slice lands on the expensive rows
+//     and the other workers finish early and idle. Claiming means a worker that
+//     drew cheap work comes back for more, so the imbalance costs one chunk
+//     rather than one slice. This is the same reason the pool underneath steals.
+//
+//  2. THE CALLING THREAD RUNS CHUNKS TOO, and that is not (only) an
+//     optimisation - it is what makes the call safe to nest. A parallel_for
+//     invoked from inside a pool task occupies a worker while it waits; if it
+//     waited passively and every worker did the same, the pool would have no
+//     thread left to run the work they are all waiting on, and the program
+//     would stop. Because the caller drains the same cursor, it can finish the
+//     entire range alone. The submitted tasks then find the cursor exhausted
+//     and retire without doing anything. Nested parallel_for cannot deadlock
+//     here; it degrades to serial in the worst case, which is the right
+//     failure.
+//
+//  A consequence worth stating: `body` is invoked concurrently on several
+//  threads, and a chunk may run on the calling thread. It must be safe to call
+//  from many threads at once, and it must not assume which thread it is on.
+//  That is the same contract TBB's parallel_for carries.
+//
+//  What this is NOT: a scheduler. There is no global pool and no implicit
+//  parallelism - the caller passes the pool it wants, because a library that
+//  quietly spawns threads is a library you cannot put inside someone else's
+//  thread budget.
+//
+
+#ifndef parallel_for_hpp
+#define parallel_for_hpp
+
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <exception>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <type_traits>
+#include <utility>
+
+// (inlined) #include "../interfaces/task_pool.hpp"
+// (inlined) #include "../utils/constexpr_for.hpp"
+// ----------------------------------------------------------------------
+// begin constexpr_for.hpp
+// ----------------------------------------------------------------------
+//
+//  constexpr_for.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - compile-time loop unrolling
+//
+//      constexpr_for<0, 4>      ([&](auto I) { use<I.value>(); });   // fully unrolled
+//      constexpr_for<0, 10, 2>  ([&](auto I) { even(I); });          // with a step
+//      constexpr_for<10, 0, -1> ([&](auto I) { down(I); });          // and backwards
+//      constexpr_for<0, 3>      (f, a, b);                           // f(I, a, b)
+//      unrolled_for<4>(0, n, [&](std::size_t i) { out[i] = g(in[i]); });
+//
+//  constexpr_for<Start, End, Inc> expands into exactly the calls it needs and
+//  leaves no loop at all - the bounds are template parameters, so there is no
+//  counter, no compare and no branch. unrolled_for takes a RUN-TIME range and
+//  emits the body Unroll times per iteration, with a tail for the remainder.
+//
+//  ------------------------------------------------------ the index is a type
+//
+//  The body is handed std::integral_constant<T, I>, not a bare T, and that is
+//  the whole reason this is worth having over a plain loop.
+//
+//  A function parameter is never a constant expression, however constant the
+//  value passed in was - so a body taking `std::size_t i` cannot write
+//  std::get<i>(tuple) or use i as a template argument, which is usually the
+//  entire point of unrolling by hand. Handing it a type carrying the index
+//  fixes that: `I.value` is a constant expression inside the body, while `I`
+//  still converts implicitly to its underlying type, so the ordinary
+//  arithmetic spelling keeps working:
+//
+//      constexpr_for<0, N>([&](auto I) { sum += v[I]; });                // fine
+//      constexpr_for<0, N>([&](auto I) { use(std::get<I.value>(tup)); }); // also fine
+//
+//  The index type is decltype(Start), so constexpr_for<0, 4> yields int and
+//  constexpr_for<std::size_t{0}, std::size_t{4}> yields std::size_t. Say which
+//  you want when it matters.
+//
+//  ------------------------------------------------------------ expansion, not
+//                                                                  recursion
+//  The obvious implementation recurses - body, then constexpr_for<Start+Inc,
+//  End, Inc> - and it is shorter. This expands an index_sequence through a fold
+//  instead, because the recursive form instantiates one template per iteration:
+//  template depth grows with the count, a few hundred iterations meets the
+//  compiler's instantiation-depth limit, and compile time grows superlinearly
+//  well before that. The fold is depth 1 whatever the count. Same unrolled
+//  output, no cliff to fall off.
+//
+//  ------------------------------------------------------------ extra arguments
+//
+//  Trailing arguments are passed through to every call as LVALUES, never
+//  forwarded. Forwarding would move the same object once per iteration, which
+//  is a use-after-move that compiles quietly; if a body needs to consume
+//  something it should capture it instead.
+//
+//  ------------------------------------------------------------- when to reach
+//
+//  Be sceptical of unrolled_for as a speed tool. At -O2 the compiler already
+//  unrolls simple counted loops, and doing it by hand can lose: more code in
+//  the instruction cache, more live registers, and a tail that confuses the
+//  vectoriser. `make bench-parallel` prints unrolled against not so the claim
+//  stays falsifiable rather than folkloric.
+//
+//  Where it does earn its place: when the body must be instantiated per index -
+//  a tuple element, a template argument, a fixed-size matrix row - which no
+//  compiler unroll can do for you, because that is a language requirement
+//  rather than an optimisation. Reach for constexpr_for for that; reach for
+//  unrolled_for only with a benchmark in hand.
+//
+
+#ifndef constexpr_for_hpp
+#define constexpr_for_hpp
+
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+
+namespace snicholls
+{
+    namespace detail
+    {
+        // How many iterations [Start, End) by Inc actually performs. Computed
+        // in long long so a negative Inc against unsigned bounds cannot wrap -
+        // the arithmetic that makes a hand-rolled version of this silently
+        // produce 18 quintillion iterations.
+        constexpr std::size_t constexpr_for_count(long long start, long long end, long long inc)
+        {
+            const long long span = (inc > 0) ? (end - start) : (start - end);
+            const long long step = (inc > 0) ? inc : -inc;
+            return span > 0 ? static_cast<std::size_t>((span + step - 1) / step) : 0u;
+        }
+
+        template <auto Start, auto Inc, typename F, std::size_t... I, typename... Args>
+        constexpr void constexpr_for_impl(F&& f, std::index_sequence<I...>, Args&... args)
+        {
+            using T = decltype(Start);
+            // Fold over the comma operator: one call per index, in order, and
+            // nothing at all generated for an empty sequence.
+            (static_cast<void>(f(std::integral_constant<
+                                     T, static_cast<T>(static_cast<long long>(Start) +
+                                                       static_cast<long long>(I) *
+                                                           static_cast<long long>(Inc))>{},
+                                 args...)),
+             ...);
+        }
+    } // namespace detail
+
+    // Invoke f(I, args...) for each I in [Start, End) stepping by Inc, fully
+    // unrolled at compile time. Inc may be negative to count down. I is an
+    // integral_constant<decltype(Start), ...>.
+    template <auto Start, auto End, auto Inc = 1, typename F, typename... Args>
+    constexpr void constexpr_for(F&& f, Args&&... args)
+    {
+        static_assert(Inc != 0, "constexpr_for with a step of 0 would never terminate");
+        constexpr std::size_t n = detail::constexpr_for_count(
+            static_cast<long long>(Start), static_cast<long long>(End),
+            static_cast<long long>(Inc));
+        detail::constexpr_for_impl<Start, Inc>(std::forward<F>(f),
+                                               std::make_index_sequence<n>{}, args...);
+    }
+
+    // Invoke f(I, args...) for each I in [0, Count) - the common case, shorter.
+    // Disjoint from the overload above: that one cannot deduce End, this one
+    // cannot take a second non-type argument.
+    template <auto Count, typename F, typename... Args>
+    constexpr void constexpr_for(F&& f, Args&&... args)
+    {
+        constexpr_for<static_cast<decltype(Count)>(0), Count, 1>(std::forward<F>(f), args...);
+    }
+
+    namespace detail
+    {
+        // N-deep nest, peeled one extent at a time. The recursion here is over
+        // DEPTH (2, 3, 4...), not over iteration count, so it is three or four
+        // instantiations deep rather than thousands - the cliff the flat
+        // constexpr_for avoids by folding does not exist on this axis.
+        template <std::size_t... Extents>
+        struct nest;
+
+        template <>
+        struct nest<> {
+            template <typename F, typename... Acc>
+            static constexpr void run(F& f, Acc... acc) { f(acc...); }
+        };
+
+        template <std::size_t E0, std::size_t... Rest>
+        struct nest<E0, Rest...> {
+            template <typename F, typename... Acc>
+            static constexpr void run(F& f, Acc... acc)
+            {
+                constexpr_for<std::size_t{0}, E0>(
+                    [&](auto I) { nest<Rest...>::run(f, acc..., I); });
+            }
+        };
+    } // namespace detail
+
+    // Nested loops, every level unrolled, to any depth:
+    //
+    //     constexpr_nest<2, 3>   ([&](auto I, auto J)         { m[I][J] += a[I]*b[J]; });
+    //     constexpr_nest<2, 3, 4>([&](auto I, auto J, auto K) { t[I][J][K] = 0; });
+    //
+    // The body is called once per point of the cartesian product, in row-major
+    // order (last extent varies fastest), with one integral_constant per level
+    // - so every index is a constant expression and a fixed-size kernel can be
+    // written with no loop and no run-time indexing at all.
+    //
+    // Mind the multiplication: <8,8,8> is 512 expansions of the body, and the
+    // object code grows with it. This is for small fixed extents - a 4x4
+    // transform, a tile of a matrix kernel - not for whole arrays.
+    template <std::size_t... Extents, typename F>
+    constexpr void constexpr_nest(F&& f)
+    {
+        detail::nest<Extents...>::run(f);
+    }
+
+    // Walk a RUN-TIME range [first, last), calling body(i, args...) for each i,
+    // with the body emitted Unroll times per iteration and a tail loop for the
+    // remainder.
+    //
+    // body receives a plain Index here, not an integral_constant: the value is
+    // genuinely a run-time one, and pretending otherwise would be a lie that
+    // only compiles when the bounds happen to be constant.
+    template <std::size_t Unroll = 4, typename Index, typename Body, typename... Args>
+    constexpr void unrolled_for(Index first, Index last, Body body, Args&... args)
+    {
+        static_assert(std::is_integral_v<Index>, "unrolled_for needs an integral index");
+        static_assert(Unroll >= 1, "unrolled_for needs an unroll factor of at least 1");
+
+        if (!(first < last))
+            return;
+
+        const auto count = static_cast<std::size_t>(last - first);
+        const auto whole = count - (count % Unroll);
+        const Index main_end = first + static_cast<Index>(whole);
+
+        Index i = first;
+        for (; i < main_end; i += static_cast<Index>(Unroll))
+            constexpr_for<std::size_t{0}, Unroll>(
+                [&](auto K) { body(i + static_cast<Index>(K.value), args...); });
+        for (; i < last; ++i)                       // the tail Unroll did not divide
+            body(i, args...);
+    }
+} // namespace snicholls
+
+#endif /* constexpr_for_hpp */
+// end constexpr_for.hpp
+
+namespace snicholls
+{
+    namespace detail
+    {
+        // How many chunks to cut per worker. More chunks balance better and
+        // cost one atomic increment each to claim; fewer chunks amortise that
+        // increment over more work. Four is the usual answer and is what the
+        // default grain below aims at - it is not tuned here because the right
+        // number depends on how uneven the body is, which is why grain_size is
+        // a parameter rather than a constant.
+        inline constexpr std::size_t parallel_chunks_per_worker = 4;
+
+        // Outstanding-chunk tracker. Same shape as the pool's own completion
+        // gate, and for the same reason: the hot path (a chunk finishing) only
+        // touches the atomic, and the mutex is taken solely to publish the
+        // reached-zero wakeup. done() takes the lock BEFORE notifying rather
+        // than after decrementing, which is what stops a waiter that has
+        // evaluated its predicate but not yet slept from missing the signal
+        // and waiting forever.
+        class chunk_gate
+        {
+        public:
+            void arm(std::size_t n) noexcept { outstanding_.store(n, std::memory_order_release); }
+
+            void done() noexcept
+            {
+                if (outstanding_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> g(m_);
+                    cv_.notify_all();
+                }
+            }
+
+            void wait()
+            {
+                std::unique_lock<std::mutex> lock(m_);
+                cv_.wait(lock, [this] { return outstanding_.load(std::memory_order_acquire) == 0; });
+            }
+
+        private:
+            std::atomic<std::size_t> outstanding_{0};
+            std::mutex               m_;
+            std::condition_variable  cv_;
+        };
+
+        // Everything the workers and the caller share for one parallel_for.
+        // Heap-allocated behind a shared_ptr because a submitted task may still
+        // be retiring after the call has returned: it will find the cursor
+        // exhausted and touch nothing but the gate, but it must find those
+        // alive to do so.
+        template <typename Index, typename Body, std::size_t Unroll>
+        struct parallel_range {
+            Index       first;
+            std::size_t grain;
+            std::size_t count;              // elements
+            std::size_t chunks;
+            Body        body;
+
+            std::atomic<std::size_t> cursor{0};
+            std::atomic<bool>        failed{false};
+            chunk_gate               gate;
+
+            std::mutex         err_m;
+            std::exception_ptr error;
+
+            parallel_range(Index f, std::size_t g, std::size_t n, std::size_t c, Body b)
+                : first(f), grain(g), count(n), chunks(c), body(std::move(b)) {}
+
+            void capture(std::exception_ptr e)
+            {
+                std::lock_guard<std::mutex> g(err_m);
+                if (!error) {                       // first failure wins; the rest are consequences
+                    error = e;
+                    failed.store(true, std::memory_order_release);
+                }
+            }
+
+            // Claim chunks until there are none left. Called by the pool's
+            // workers AND by the calling thread.
+            //
+            // Note what happens after a body throws: this keeps CLAIMING but
+            // stops EXECUTING. Breaking out instead would leave the unclaimed
+            // chunks undecremented and the waiter parked on a gate that can
+            // never reach zero - the failure path hanging is a worse bug than
+            // the failure.
+            void drain()
+            {
+                for (;;) {
+                    const std::size_t c = cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (c >= chunks)
+                        return;
+                    if (!failed.load(std::memory_order_acquire)) {
+                        const std::size_t lo = c * grain;
+                        const std::size_t hi = (lo + grain < count) ? lo + grain : count;
+                        try {
+                            // Unroll == 1 is the plain loop, which is what the
+                            // compiler wants to see when it is going to unroll
+                            // or vectorise this itself.
+                            if constexpr (Unroll <= 1) {
+                                for (std::size_t k = lo; k < hi; ++k)
+                                    body(static_cast<Index>(first + static_cast<Index>(k)));
+                            } else {
+                                unrolled_for<Unroll>(lo, hi, [this](std::size_t k) {
+                                    body(static_cast<Index>(first + static_cast<Index>(k)));
+                                });
+                            }
+                        } catch (...) {
+                            capture(std::current_exception());
+                        }
+                    }
+                    gate.done();
+                }
+            }
+        };
+    } // namespace detail
+
+    // Run `body(i)` for every i in [first, last), across `pool`, and return
+    // when all of them have completed.
+    //
+    // grain_size is elements per chunk; 0 (the default) picks one that gives
+    // roughly four chunks per worker. Raise it when the body is tiny and the
+    // per-chunk atomic starts to show; lower it when the body's cost varies a
+    // lot between elements, which is when balance matters more than overhead.
+    //
+    // If the body throws, the first exception is rethrown here once every other
+    // chunk has settled, and chunks not yet started are skipped. Elements
+    // already in flight still finish - there is no way to interrupt them, and
+    // pretending otherwise would just mean returning while they wrote to memory
+    // the caller thinks is finished with.
+    // Unroll is a compile-time chunk-inner unroll factor, default 1 (none).
+    // parallel_for<8>(pool, 0, n, body) emits the body eight times per inner
+    // iteration; see utils/constexpr_for.hpp for why that is usually not the
+    // win it sounds like, and `make bench-parallel` for the measurement.
+    template <std::size_t Unroll = 1, typename Index, typename Body>
+    void parallel_for(task_pool& pool, Index first, Index last, Body body,
+                      std::size_t grain_size = 0)
+    {
+        static_assert(std::is_integral_v<Index>, "parallel_for needs an integral index");
+
+        if (!(first < last))
+            return;
+        const std::size_t count = static_cast<std::size_t>(last - first);
+
+        // One thread available, or a range too small to be worth splitting:
+        // run it here. No submit, no shared state, no atomics - the serial path
+        // should not pay for the parallel one.
+        const std::size_t workers = pool.worker_count();
+        if (workers <= 1 || count == 1) {
+            if constexpr (Unroll <= 1) {
+                for (Index i = first; i < last; ++i)
+                    body(i);
+            } else {
+                unrolled_for<Unroll>(first, last, body);
+            }
+            return;
+        }
+
+        std::size_t grain = grain_size;
+        if (grain == 0) {
+            const std::size_t want = workers * detail::parallel_chunks_per_worker;
+            grain = (count + want - 1) / want;          // ceil, so chunks <= want
+            if (grain == 0)
+                grain = 1;
+        }
+        const std::size_t chunks = (count + grain - 1) / grain;
+
+        auto st = std::make_shared<detail::parallel_range<Index, Body, Unroll>>(
+            first, grain, count, chunks, std::move(body));
+        st->gate.arm(chunks);
+
+        // One task per worker, not one per chunk: the chunks are claimed from
+        // the cursor, so W tasks are enough to occupy W workers, and the
+        // type-erased submit is paid W times instead of once per chunk.
+        const std::size_t helpers = (workers < chunks) ? workers : chunks;
+        for (std::size_t i = 0; i < helpers; ++i)
+            pool.submit([st] { st->drain(); });
+
+        st->drain();                // the caller is a worker too - see the header
+        st->gate.wait();
+
+        if (st->error)
+            std::rethrow_exception(st->error);
+    }
+
+    // Run `body(*it)` for every element in [first, last).
+    //
+    // Random-access iterators only, and that is a deliberate refusal rather
+    // than an omission: chunking a forward iterator means walking it to find
+    // each chunk boundary, so a "parallel" loop over a std::list would spend
+    // more time seeking than working and would look like a performance bug in
+    // the caller's code rather than in this decision. Copy into a vector first
+    // and the cost is at least visible.
+    template <std::size_t Unroll = 1, typename Iter, typename Body>
+    void parallel_for_each(task_pool& pool, Iter first, Iter last, Body body,
+                           std::size_t grain_size = 0)
+    {
+        using category = typename std::iterator_traits<Iter>::iterator_category;
+        static_assert(std::is_base_of_v<std::random_access_iterator_tag, category>,
+                      "parallel_for_each needs random-access iterators - "
+                      "chunking anything else costs more than it saves");
+
+        using diff = typename std::iterator_traits<Iter>::difference_type;
+        parallel_for<Unroll>(
+            pool, diff{0}, last - first,
+            [first, &body](diff i) { body(*(first + i)); },
+            grain_size);
+    }
+} // namespace snicholls
+
+#endif /* parallel_for_hpp */
+// end parallel_for.hpp
+// (inlined) #include "utils/constexpr_for.hpp"                    // IWYU pragma: export
 // (inlined) #include "event/loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 // ----------------------------------------------------------------------
 // begin loop.hpp

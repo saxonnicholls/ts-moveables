@@ -66,6 +66,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | **broadcast an event** to many typed listeners | [`moveable_signal`](#moveable_signal) |
 | a **pipeline** with consumer dependency graphs | [`disruptor<T>`](#disruptor) |
 | **run tasks on a pool** | [`task_pool`](#thread_pool) — `work_stealing_` for fork-join, `mpmc_` for general submit, `dispatch_` for a single feed |
+| **run a loop across cores** | [`parallel_for`](#parallel_for) / `parallel_for_each` — over any `task_pool`, blocking, exception-propagating |
 | an **event loop** for fds and timers without the usual scars | [`event_loop`](#event_loop) — POSIX reactor, typed dispatch, loud contracts |
 | an **HTTP server** that does not park a thread per connection | [`http_server`](#http_server) — routes, async responders, or one drop-in header |
 | **WebSockets**, or `wss` | [`websocket`](#websocket) — Autobahn-clean, one route handler |
@@ -139,6 +140,7 @@ Moved-from objects are always left valid and usable.
 | `concurrent/work_stealing_deque.hpp` | `work_stealing_deque<T>` (bounded Chase-Lev) | Chase-Lev / Taskflow internals | — | — (internal, stable) |
 | `concurrent/disruptor.hpp` | `disruptor<T, WaitStrategy>` + `multi_producer_disruptor<T>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
 | `concurrent/thread_pool.hpp` | `task_pool` interface + `mutex_` / `sharded_` / `dispatch_` / `mpmc_` / `work_stealing_task_pool` | Taskflow / TBB / `std::async` | — | moveable handle (heap core) |
+| `concurrent/parallel_for.hpp` | `parallel_for` / `parallel_for_each` over any `task_pool` | `tbb::parallel_for` / `std::for_each(par)` | — | free functions (stateless) |
 | `event/loop.hpp` | `event_loop` + `fd_watch` / `timer` (POSIX; self-disables on Windows) | Asio / libuv / libevent | — | moveable handles, loop handle moves mid-run |
 | `event/time_master.hpp` | `time_master` — named, cancellable, repeating timers on the loop | Boost.Asio timer wrappers | — | moveable handle (heap core) |
 | `http/server.hpp` | `server` + `responder` / `response_stream`, HTTP/1.1 delegate | cpp-httplib (blocking) / Asio | — | moveable handle (heap core) |
@@ -581,6 +583,59 @@ We do **not** claim to beat the work-stealing greats (Taskflow, TBB, Tokio) — 
 The two lock-free building blocks stand alone too: `mpmc_queue<T>` is a bounded Vyukov MPMC ring (moveable when quiescent), and `work_stealing_deque<T>` is a bounded Chase-Lev deque with the memory-model-verified orderings from Le et al. (2013).
 
 The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Nearly all of it has shipped: disruptor phase 2 (multi-producer), the event loop, and §8 phases 1–4 of the HTTP server — TLS on two backends, WebSocket with `permessage-deflate`, and HTTP/2. What remains is **QUIC and HTTP/3** (§8 phase 5, and the plan there is explicitly to *wrap* a QUIC library rather than write one), the **event loop's phase 2 comforts** (POSIX signals as emissions, a Windows `WSAPoll` backend), and the **two-machine head-to-head** against nginx, which needs hardware rather than code.
+
+## parallel_for
+
+The pools answer "run this somewhere". This answers the question asked more often — *run this loop across the cores I have, and come back when it's done*:
+
+```cpp
+snicholls::work_stealing_task_pool pool;
+
+snicholls::parallel_for(pool, 0, n, [&](int i) { out[i] = f(in[i]); });
+snicholls::parallel_for_each(pool, v.begin(), v.end(), [](auto& x) { x *= 2; });
+```
+
+Both block until every element is done and rethrow the first exception a body threw once the rest have settled. It binds to the `task_pool` **interface**, so the same loop runs on any of the five pools and a benchmark can swap between them without touching the call.
+
+Two decisions carry it, and neither is the obvious one.
+
+**The range is cut into many more chunks than there are workers, and workers claim them from a shared cursor.** The obvious design — one slice per worker — is only correct when every element costs the same, which is exactly the assumption that fails: one slice lands on the expensive rows and everyone else idles. Claiming means the imbalance costs one chunk, not one slice.
+
+**The calling thread runs chunks too, and that is what makes the call safe to nest.** A `parallel_for` invoked from inside a pool task occupies a worker while it waits; if it waited passively and every worker did the same, no thread would be left to run the work they are all waiting on. Because the caller drains the same cursor it can finish the range alone, so nested calls degrade to serial rather than stopping. That is verified by a negative control: with caller participation removed, the nested test deadlocks.
+
+`grain_size` defaults to roughly four chunks per worker — raise it when the body is tiny, lower it when its cost varies a lot. `parallel_for_each` requires random-access iterators, deliberately: chunking a `std::list` would spend more time seeking than working, and refusing is more honest than looking like a performance bug in the caller's code.
+
+There is **no global pool and no implicit parallelism** — you pass the pool you want, because a library that quietly spawns threads is one you cannot put inside someone else's thread budget.
+
+**Measured** (`make bench-parallel`, 32-thread x86-64, macOS):
+
+| body | serial | best parallel | speedup | what stops it |
+|---|---|---|---|---|
+| compute-bound (1M elements, 12 transcendental ops) | 128.9 ms | 7.6 ms @ 32 | **17.1×** | SMT siblings past 16 — efficiency 96% at 8, 53% at 32 |
+| memory-bound (16M elements, one multiply-add) | 29.0 ms | 5.1 ms @ 16 | **5.7×** (~79 GB/s) | DRAM bandwidth — cores do not add any |
+
+The second row is the one worth publishing. A streaming body stops scaling long before it runs out of threads, and a benchmark that only showed the first row would be advertising. Efficiency above 100% at 2–4 workers is cache residency, not magic: each worker's slice fits a private cache level the whole array did not.
+
+The parallel call pays for itself from roughly **128 elements** of a non-trivial body and loses below that — the crossover is printed too, because it is the number a caller actually needs. The default grain lands within 5% of the best hand-picked value; grain 1 is 10× worse.
+
+## constexpr_for
+
+Compile-time unrolling, in `utils/constexpr_for.hpp`:
+
+```cpp
+constexpr_for<0, 4>      ([&](auto I) { use<I.value>(); });        // fully unrolled
+constexpr_for<0, 10, 2>  ([&](auto I) { even(I); });               // with a step
+constexpr_for<10, 0, -1> ([&](auto I) { down(I); });               // backwards
+constexpr_for<0, 3>      (f, a, b);                                // f(I, a, b)
+constexpr_nest<2, 3, 4>  ([&](auto I, auto J, auto K) { ... });    // nested, any depth
+unrolled_for<4>(0, n, [&](std::size_t i) { out[i] = g(in[i]); });  // run-time range
+```
+
+The body is handed `std::integral_constant`, not a bare value, and **that is the point**: a function parameter is never a constant expression, so a body taking `std::size_t i` cannot write `std::get<i>(tuple)` or use `i` as a template argument — which is usually the whole reason to unroll by hand. `I.value` is a constant expression; `I` still converts implicitly, so ordinary arithmetic keeps working.
+
+It expands an `index_sequence` through a fold rather than recursing. The recursive spelling instantiates one template per iteration, so template depth grows with the count and meets the compiler's instantiation limit a few hundred iterations in; the fold is depth 1 at any count. C++17 throughout.
+
+**On unrolling as a speed tool, be sceptical.** The benchmark prints hand-unrolled against not, and the answer is a **3.4% spread across factors 1–16** — noise. At `-O2` the compiler already unrolled that loop. `constexpr_for` earns its place where no compiler unroll can help: bodies that must be *instantiated* per index.
 
 ## event_loop
 

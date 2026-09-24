@@ -28,6 +28,8 @@
 #include "moveable/signal.hpp"              // IWYU pragma: export
 #include "logging/logger.hpp"                      // IWYU pragma: export
 #include "concurrent/thread_pool.hpp"                  // IWYU pragma: export
+#include "concurrent/parallel_for.hpp"                 // IWYU pragma: export
+#include "utils/constexpr_for.hpp"                    // IWYU pragma: export
 #include "event/loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 #include "event/time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
 #include "http/server.hpp"                  // IWYU pragma: export (follows the event loop)
