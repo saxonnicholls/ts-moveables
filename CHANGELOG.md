@@ -9,6 +9,11 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-29
+
+The parallel-algorithms release, plus a hardened CI. Additive throughout —
+nothing that worked in 1.2.1 behaves differently.
+
 ### Added
 
 - **`task_graph`** (`concurrent/task_graph.hpp`) — a dependency graph run level
@@ -681,6 +686,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.3.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.3.0
 [1.2.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.2.1
 [1.2.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.2.0
 [1.1.3]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.1.3
