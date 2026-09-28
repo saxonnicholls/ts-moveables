@@ -83,6 +83,7 @@ def main():
     stem = os.path.splitext(os.path.basename(entry))[0]
     name = stem if stem.startswith("ts_") else "ts_" + stem
     output = args.output or os.path.join(ROOT, "single_include", name + ".hpp")
+    name = os.path.splitext(os.path.basename(output))[0]    # the banner names the file it is in
 
     body = []
     expand(entry, set(), body, [])

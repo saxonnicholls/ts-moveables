@@ -215,6 +215,13 @@ demo-timemaster: build/time_master_demo
 demo-http: build/http_server_demo
 	./build/http_server_demo
 
+build/bwt_dna_demo: demos/bwt_dna_demo.cpp $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    demos/bwt_dna_demo.cpp -o $@ $(LDLIBS)
+
+demo-bwt: build/bwt_dna_demo
+	./build/bwt_dna_demo
+
 demo-webhook: build/webhook_ws_hub_demo
 	./build/webhook_ws_hub_demo
 
@@ -292,14 +299,19 @@ amalgamate:
 	python3 scripts/amalgamate.py http/server.hpp -o single_include/ts_http_server.hpp
 	python3 scripts/amalgamate.py ts_moveables.hpp
 
-# The amalgamated header must always still compile - and run - on its own,
-# so the single-file drop-in claim can never quietly drift
+# The amalgamated headers must always still compile - and run - on their own,
+# and must contain the library rather than just the part that already worked:
+# check_amalgamation.py proves every header in the tree is in the file, and
+# tests/amalgamation/drop_in.cpp uses every shipped component through it
 check-amalgamate: amalgamate | build
-	printf '#include "ts_http_server.hpp"\nint main(){ snicholls::http::server s; s.get("/", [](const auto&, auto r){ r.send(200, "text/plain", "ok"); }); return s.listen("127.0.0.1", 0) ? 0 : 1; }\n' > build/amalgam_check.cpp
-	$(CXX) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include build/amalgam_check.cpp -o build/amalgam_check
-	./build/amalgam_check && echo "single-header drop-in: builds and runs"
+	python3 scripts/check_amalgamation.py
+	printf '#include "ts_http_server.hpp"\nint main(){ snicholls::http::server s; s.get("/", [](const auto&, auto r){ r.send(200, "text/plain", "ok"); }); return s.listen("127.0.0.1", 0) ? 0 : 1; }\n' > build/amalgam_http_check.cpp
+	$(CXX) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include build/amalgam_http_check.cpp -o build/amalgam_http_check
+	./build/amalgam_http_check && echo "single-header http drop-in: builds and runs"
+	$(CXX) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include tests/amalgamation/drop_in.cpp -o build/amalgam_check
+	./build/amalgam_check
 
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
+.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean

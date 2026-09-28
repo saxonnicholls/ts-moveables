@@ -9,6 +9,180 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+### Added
+
+- **`task_graph`** (`concurrent/task_graph.hpp`) — a dependency graph run level
+  by level on a pool, with `precede()` spelled as `stl-topological-sorting`
+  spells it. It answers a different question from a topological sort: a
+  sequential sort returns one linearisation, this returns the **levels** —
+  antichains whose members can all run at once. The order is the by-product;
+  the concurrency is the product.
+
+  `depth()` and `width()` are public because they are the graph's own ceiling
+  and no amount of hardware moves them: width is the most parallelism that
+  exists, depth is the critical path and a hard serial floor. A chain has depth
+  *n* and width 1 and runs at serial speed on any number of cores; every level
+  also pays a join, so a deep narrow graph can finish slower than one thread.
+  Cycles throw `task_graph_cycle` with a count of the stuck nodes. Not a graph
+  library — no traversal, no paths, no components.
+
+  The shared-frontier parallel Kahn was considered and declined: it removes the
+  per-level join and pays for it with every worker contending on the one
+  counter each finishing node must touch. Level-synchronous is simpler and
+  usually faster on a multicore box. Computing the levels is O(V+E) and
+  sequential on purpose — it is bookkeeping over the edges, not over the work.
+
+- **A Burrows-Wheeler demo over DNA** (`demos/bwt_dna_demo.cpp`, `make
+  demo-bwt`) — a demo rather than a component, because a compression transform
+  has no business inside a concurrency library, but an unusually good way to
+  show the parallel algorithms composing into something real. The suffix array
+  is built by prefix doubling, where each round is literally a `parallel_sort`
+  followed by a prefix scan: a flag per adjacent pair saying "these differ",
+  and the **inclusive scan of those flags is the new rank** — the renumbering
+  step *is* a scan rather than merely using one. Dependency-free, including of
+  the author's own `base-encode-decode`, whose 2-bit ACGT packing inspired the
+  alphabet but is not linked.
+
+  Measured on 400k bases: **3.72x** over the same code path with one worker,
+  which tracks `parallel_sort`'s ceiling rather than `parallel_reduce`'s
+  because each of the log2(n) rounds synchronises. It makes no claim against
+  `libdivsufsort`, which would win; the point is composition. The inverse
+  transform is deliberately left serial — it is a pointer chase through the LF
+  mapping where each step depends on the last, and its character counts are
+  4-256 entries, far under the ~128-element crossover the benchmark measured
+  for a parallel call to be worth making.
+
+- **`task_group`** (`concurrent/task_group.hpp`) — fork/join over any
+  `task_pool`. `run()` to fire work, `wait()` to join and rethrow the first
+  exception any task threw. Three decisions: exceptions are collected rather
+  than lost, the destructor waits (a forgotten `wait()` should stall visibly,
+  not let tasks write to a dead frame), and **the waiting thread runs tasks
+  too** — which is what makes a group safe to nest. A group waited on from
+  inside a pool task occupies a worker; if every worker did that with none
+  left to run what they wait for, the program stops. `run()` therefore keeps
+  the closure in the group as well as offering it to the pool, and exactly one
+  of the two executes it. Nested groups degrade to serial instead of
+  deadlocking, which is verified by a test on a deliberately two-worker pool.
+
+- **`parallel_reduce` / `parallel_reduce_each`** — map-reduce. `map(i)` is the
+  map, `reduce(a,b)` the fold; there is no separate `parallel_map_reduce`
+  because that is what this already is.
+
+  **The result is deterministic**, and that is the design decision worth the
+  note. Each chunk folds its own elements locally, then the per-chunk results
+  are folded **in chunk order, never completion order** — so the answer does
+  not depend on how the scheduler interleaved the work and a floating-point sum
+  is reproducible run to run. Completion-ordered reduction is the obvious
+  implementation and what TBB's `parallel_reduce` does by default; it is also
+  how a total that will not reconcile gets into a support ticket. Verified
+  bit-identical across 50 runs. A consequence worth having: `reduce` must be
+  associative but need **not** be commutative, so string concatenation and
+  matrix products are safe here — tested with a 26-way concatenation that comes
+  back in alphabetical order.
+
+- **`parallel_inclusive_scan` / `parallel_exclusive_scan`** — prefix fold,
+  returning the grand total. Three passes: per-chunk totals, a serial prefix
+  over those (there are only a handful), then each chunk re-walked from its own
+  offset. Deterministic for the same reason reduce is. The cost that buys is
+  stated rather than hidden: the data is traversed **twice**, so a parallel scan
+  moves about twice the memory a serial one does and only wins once there are
+  enough cores to pay that back.
+
+- **`parallel_sort` / `parallel_stable_sort`** — sort *k* runs in parallel, then
+  merge pairwise in log2(*k*) rounds with the merges of each round running in
+  parallel. Uses `std::sort`/`std::stable_sort` and `std::inplace_merge`,
+  because those are tuned and a worse quicksort here would add nothing; what
+  this contributes is the scheduling. Two caveats stated up front:
+  `std::inplace_merge` allocates when it can, and each merge round halves the
+  available parallelism, so the ceiling is well under the core count.
+
+  Measured (`make bench-parallel`, 32 threads, 8M elements): reduce **15.7×**,
+  inclusive_scan **4.6×**, sort **4.7×** — the last two exactly as the two-pass
+  and merge-round arguments predict.
+
+- **A compile-time moveability gate** (`tests/tests_moveability.cpp`). The
+  library's pitch is that immovability is imposed by the standard, spreads
+  virally, and is cured here — so a component that is *accidentally* immovable
+  falsifies it, and that is easy to do by accident (one raw `std::mutex`
+  member, or a user-declared copy constructor, which silently suppresses the
+  implicit move). The claim is now a `static_assert` over every shipped type
+  rather than a paragraph, with the three deliberate exceptions asserted as
+  immovable and each given its reason.
+
+- **What an HTTP engine behind someone else's interface needs**, found by
+  building one: the TSMoveables engine behind asoMonoRepo1's
+  `HttpServerInterface`, measured against its httplib engine.
+  - `response_stream::abort()` ends a streamed body as a failure. `end()` sends
+    the terminal chunk, which makes a broken SSE feed look finished. On
+    HTTP/1.1 `abort()` closes the connection, because nothing else can signal
+    the failure. On HTTP/2 it resets only that stream, through a new
+    `protocol_delegate::abort_stream()` hook. The hook defaults to "cannot",
+    and when a protocol cannot, the session closes the connection instead.
+  - `server::stop_accepting()` closes the listener and keeps open connections.
+    It's the first half of a graceful stop: take no new work, let the work in
+    hand finish, then `shutdown()`.
+  - `request::peer` holds the client's numeric address. Before this there was
+    no way to read it from a handler.
+  - `synchronized_waitable::update_one()` mutates the value and wakes one
+    waiter, for changes only one waiter can use.
+
+### Fixed
+
+- **`mutex_task_pool` woke every idle worker for each task.** `submit()` went
+  through `synchronized_waitable::update()`, which calls `notify_all`, so a
+  large pool ran a thundering herd on every hand-off. The measured p95 grew
+  with pool size: loopback HTTP hand-off, x86-64 macOS, 32 threads.
+
+  | Pool size | p95 with `notify_all` | p95 with `notify_one` |
+  |---|---|---|
+  | 4 workers | 103 µs | 81 µs |
+  | 56 workers | 458 µs | 87 µs |
+
+  `submit()` now uses `update_one()`. Shutdown still wakes every worker. The
+  HTTP engine benchmark found this: sequential keep-alive `GET /health` went
+  from p95 534 µs, five times httplib, to 111 µs, level with httplib.
+- **Stream handles now read a published closed flag.**
+  `response_stream::write()` and `open()`, and `responder::connected()`, used
+  to judge "connection gone" by the session object expiring. Any task still
+  posted to the loop holds that object alive. They now read a flag the loop
+  sets when the connection closes, so a producer on a worker learns of a
+  disconnect deterministically. This is hardening, not a fix for an observed
+  failure: in testing, the lifetime signal also arrived promptly, and a
+  negative control could not make it fail.
+
+- **`work_stealing_deque` was immovable by accident rather than by decision.**
+  Its deleted copy constructor suppressed the implicit move and nothing
+  recorded that this was intended. It is the one type here that should *not*
+  get the library's usual treatment: everything else is moveable because
+  immovability was imposed by a member and spread virally, whereas this one's
+  address is part of its contract — thieves hold a pointer and steal
+  concurrently, so a live deque that moved would strand them, the same reason
+  a `std::mutex` cannot move. The move is now deleted explicitly with the
+  reasoning recorded, which turns a future `= default` into an argument rather
+  than an accident and makes `std::vector<work_stealing_deque<T>>` — which
+  would reallocate and break live thieves silently — a compile error.
+
+- **The amalgamation gate now checks what is in the single header, not just
+  that it compiles.** The old `check-amalgamate` built a one-line HTTP/1.1
+  server, so it proved the committed file was fresh and compiled and said
+  nothing about its contents. That is how `http2.hpp` went a whole release
+  missing from the drop-in while h2spec graded it 147/147. The gate now makes
+  two checks from opposite sides.
+  `scripts/check_amalgamation.py` requires every header in the tree to be in
+  `single_include/ts_moveables.hpp`, unless it is on an explicit opt-in list
+  (TLS and `websocket_deflate.hpp`, which link a third party). It also fails
+  if an opt-in header leaks in, if two headers share a basename (the
+  amalgamator would silently keep only one), or if `single_include/` holds a
+  file nothing regenerates. `tests/amalgamation/drop_in.cpp` then compiles against
+  `single_include/` alone and uses every shipped component. Negative control:
+  removing `http2.hpp` from the umbrella again fails both checks.
+- **`single_include/ts_server.hpp` is removed.** No target had regenerated it
+  since the file was renamed to `ts_http_server.hpp`, so it still reported
+  version 1.1 and the drift check could not see it. Copy
+  `ts_http_server.hpp` or `ts_moveables.hpp` instead.
+- **The banner of `ts_http_server.hpp` named it `ts_server.hpp`.** The
+  amalgamator now takes the banner name from the output file.
+
 ## [1.2.1] — 2026-09-24
 
 ### Fixed

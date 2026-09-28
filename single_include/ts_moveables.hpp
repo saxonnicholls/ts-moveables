@@ -4477,6 +4477,27 @@ namespace snicholls
             return this->with_lock(std::forward<F>(f));
         }
 
+        // Mutate then wake ONE waiter - for a change exactly one waiter can
+        // use, like pushing one task onto a queue. update() there wakes every
+        // idle worker to fight over a single item, and the losers' round trip
+        // through the scheduler is what the caller then waits behind: measured
+        // on a 56-worker pool, p95 hand-off latency 458 us with update(), 87 us
+        // with this (loopback HTTP round trip, x86-64 macOS, 32 threads).
+        //
+        // The contract is "wake a single waiter", not "one update". Use
+        // update() if the closure can satisfy more than one waiter: pushing
+        // two items here wakes one worker, and the second item waits for
+        // some later notify. That's no race and no failure, just an
+        // unexplained latency spike, so neither TSan nor a test will catch it.
+        template <typename F>
+        decltype(auto) update_one(F&& f) {
+            struct notifier {
+                moveable_condition_variable_any& cv;
+                ~notifier() { cv.notify_one(); }
+            } n{cv};
+            return this->with_lock(std::forward<F>(f));
+        }
+
         void notify_one() noexcept { cv.notify_one(); }
         void notify_all() noexcept { cv.notify_all(); }
 
@@ -4629,6 +4650,27 @@ namespace snicholls
 
         work_stealing_deque(const work_stealing_deque&) = delete;
         work_stealing_deque& operator=(const work_stealing_deque&) = delete;
+
+        // Immovable, and said out loud rather than left to fall out of the
+        // deleted copy above - which is what was happening, since a
+        // user-declared copy constructor suppresses the implicit move and
+        // nothing recorded that this was intended.
+        //
+        // It is the one type here that should NOT get the library's usual
+        // treatment. Everything else is moveable because immovability was
+        // imposed on it by a member and spread virally; this one is immovable
+        // because its address is part of its contract. Thieves hold a pointer
+        // to it and steal concurrently, so a live deque that moved would strand
+        // them mid-operation - the same reason a std::mutex cannot move, rather
+        // than an oversight to fix. work_stealing_task_pool accordingly keeps
+        // them in a std::deque for stable addresses and constructs in place.
+        //
+        // Deleting the move explicitly is what makes a later `= default` an
+        // argument rather than an accident, and turns
+        // std::vector<work_stealing_deque<T>> - which would reallocate and
+        // break live thieves silently - into a compile error.
+        work_stealing_deque(work_stealing_deque&&) = delete;
+        work_stealing_deque& operator=(work_stealing_deque&&) = delete;
 
         std::size_t capacity() const noexcept { return mask_ + 1; }
 
@@ -4844,7 +4886,8 @@ namespace snicholls
 
         void submit(task t) override {
             c_->comp.add();
-            c_->q.update([&t](detail::task_queue& d) { d.push_back(std::move(t)); });
+            // One task, one worker: waking them all is a thundering herd
+            c_->q.update_one([&t](detail::task_queue& d) { d.push_back(std::move(t)); });
         }
         void wait_idle() override { c_->comp.wait(); }
         std::size_t worker_count() const noexcept override { return c_->workers.size(); }
@@ -5184,6 +5227,264 @@ namespace snicholls
 
 #endif /* thread_pool_hpp */
 // end thread_pool.hpp
+// (inlined) #include "concurrent/task_group.hpp"                   // IWYU pragma: export
+// ----------------------------------------------------------------------
+// begin task_group.hpp
+// ----------------------------------------------------------------------
+//
+//  task_group.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - fork/join over any task_pool
+//
+//      snicholls::task_group g(pool);
+//      g.run([&] { left  = solve(a); });
+//      g.run([&] { right = solve(b); });
+//      g.wait();                          // both done, or the first throw rethrown here
+//
+//  The pools answer "run this somewhere, I will find out later". This answers
+//  "run these, and tell me when they are ALL done" - which is the shape almost
+//  every divide-and-conquer algorithm actually wants, and the reason
+//  parallel_for, parallel_reduce, parallel_scan and parallel_sort are all built
+//  on the two pieces in here rather than on four copies of them.
+//
+//  ---------------------------------------------------------------- the design
+//
+//  Three decisions, and the third is the one that matters.
+//
+//  1. Exceptions are collected, not lost. A task that throws does not take the
+//     process down and does not vanish: the first exception is kept and
+//     rethrown from wait(), after every other task has finished. Later
+//     exceptions are dropped, because they are usually consequences of the
+//     first and a caller can only catch one anyway.
+//
+//  2. wait() is not optional, so the destructor does it. Every task captures
+//     references to the caller's frame; returning from that frame while tasks
+//     still run is a dangling reference, not a race you might get away with. A
+//     destructor that waits turns forgetting into a stall you can see in a
+//     stack trace instead of corruption you cannot.
+//
+//  3. THE WAITING THREAD RUNS TASKS TOO. This is what makes the group safe to
+//     nest, and it is not an optimisation. A task_group waited on from inside a
+//     pool task occupies a worker while it blocks; if every worker did that,
+//     the pool would have no thread left to run the tasks they are all waiting
+//     for, and the program would stop. So run() keeps the closure in the group
+//     as well as offering it to the pool, and wait() executes whatever has not
+//     been started yet before it blocks. A nested group therefore degrades to
+//     serial rather than deadlocking - the same contract parallel_for makes,
+//     for the same reason.
+//
+//  What this is NOT: a scheduler, and not a place to park blocking work. A task
+//  that sleeps or waits on I/O occupies a pool thread for the duration; the
+//  pool has no way to know it should start another. Submit compute here and
+//  keep blocking calls on their own threads.
+//
+
+#ifndef task_group_hpp
+#define task_group_hpp
+
+#include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <utility>
+
+// (inlined) #include "../interfaces/task_pool.hpp"
+
+namespace snicholls
+{
+    namespace detail
+    {
+        // Outstanding-work tracker shared by task_group and the parallel
+        // algorithms. The hot path (one unit finishing) touches only the
+        // atomic; the mutex is taken solely to publish the reached-zero
+        // wakeup.
+        //
+        // done() takes the lock BEFORE notifying rather than merely after
+        // decrementing, and that ordering is the whole correctness argument: a
+        // waiter that has evaluated its predicate but not yet slept would
+        // otherwise miss the notify and park forever on work that is already
+        // finished.
+        class completion_gate
+        {
+        public:
+            void add(std::size_t n) noexcept
+            {
+                outstanding_.fetch_add(n, std::memory_order_relaxed);
+            }
+
+            void done() noexcept
+            {
+                if (outstanding_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> g(m_);
+                    cv_.notify_all();
+                }
+            }
+
+            void wait()
+            {
+                std::unique_lock<std::mutex> lock(m_);
+                cv_.wait(lock, [this] { return outstanding_.load(std::memory_order_acquire) == 0; });
+            }
+
+            std::size_t outstanding() const noexcept
+            {
+                return outstanding_.load(std::memory_order_acquire);
+            }
+
+        private:
+            std::atomic<std::size_t> outstanding_{0};
+            std::mutex               m_;
+            std::condition_variable  cv_;
+        };
+
+        // First-exception-wins slot. `failed` is read on the hot path to stop
+        // starting new work, so it is an atomic rather than a lock.
+        class error_slot
+        {
+        public:
+            void capture(std::exception_ptr e)
+            {
+                std::lock_guard<std::mutex> g(m_);
+                if (!error_) {
+                    error_ = e;
+                    failed_.store(true, std::memory_order_release);
+                }
+            }
+
+            bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
+
+            void rethrow_if_failed() const
+            {
+                if (error_)
+                    std::rethrow_exception(error_);
+            }
+
+        private:
+            std::atomic<bool>  failed_{false};
+            mutable std::mutex m_;
+            std::exception_ptr error_;
+        };
+    } // namespace detail
+
+    // Fork/join over any task_pool. Not moveable and not copyable on purpose:
+    // outstanding tasks hold a pointer to the group's shared state, and a group
+    // is a scope-bound thing like a lock_guard - moving one is not a use case,
+    // it is a bug that would compile.
+    class task_group
+    {
+    public:
+        explicit task_group(task_pool& pool)
+            : pool_(&pool), s_(std::make_shared<state>()) {}
+
+        task_group(const task_group&) = delete;
+        task_group& operator=(const task_group&) = delete;
+        task_group(task_group&&) = delete;
+        task_group& operator=(task_group&&) = delete;
+
+        // Waiting is mandatory, so forgetting it stalls rather than corrupts -
+        // see decision 2 in the header. An exception still in the slot at
+        // destruction is swallowed: throwing from a destructor during stack
+        // unwinding calls std::terminate, which would replace a diagnosable
+        // problem with an undiagnosable one.
+        ~task_group()
+        {
+            try {
+                drain_pending();
+                s_->gate.wait();
+            } catch (...) {
+            }
+        }
+
+        // Offer f to the pool and keep it here as well, so wait() can run it if
+        // no worker got to it. Exactly one of the two ever executes it - the
+        // claim flag decides, and the loser does nothing.
+        template <typename F>
+        void run(F&& f)
+        {
+            auto item = std::make_shared<unit>(std::function<void()>(std::forward<F>(f)));
+            s_->gate.add(1);
+            {
+                std::lock_guard<std::mutex> g(s_->m);
+                s_->pending.push_back(item);
+            }
+            auto s = s_;
+            pool_->submit([s, item] { run_unit(*s, item); });
+        }
+
+        // Run whatever has not been claimed yet on THIS thread, then block
+        // until the tasks other threads claimed have finished. Rethrows the
+        // first exception any task threw.
+        void wait()
+        {
+            drain_pending();
+            s_->gate.wait();
+            s_->err.rethrow_if_failed();
+        }
+
+        // Has any task thrown so far? Useful to abandon work early in a
+        // long-running producer; wait() is still what reports the exception.
+        bool failed() const noexcept { return s_->err.failed(); }
+
+    private:
+        struct unit {
+            std::function<void()> fn;
+            std::atomic<bool>     claimed{false};
+            explicit unit(std::function<void()> f) : fn(std::move(f)) {}
+        };
+
+        struct state {
+            detail::completion_gate           gate;
+            detail::error_slot                err;
+            std::mutex                        m;
+            std::deque<std::shared_ptr<unit>> pending;
+        };
+
+        static void run_unit(state& s, const std::shared_ptr<unit>& item)
+        {
+            // Whoever flips the flag owns the call. The other side returns
+            // without touching fn, which is what lets the pool task and the
+            // waiting thread both go looking without a task ever running twice.
+            if (item->claimed.exchange(true, std::memory_order_acq_rel))
+                return;
+            if (!s.err.failed()) {
+                try {
+                    item->fn();
+                } catch (...) {
+                    s.err.capture(std::current_exception());
+                }
+            }
+            s.gate.done();
+        }
+
+        void drain_pending()
+        {
+            for (;;) {
+                std::shared_ptr<unit> item;
+                {
+                    std::lock_guard<std::mutex> g(s_->m);
+                    if (s_->pending.empty())
+                        return;
+                    item = std::move(s_->pending.front());
+                    s_->pending.pop_front();
+                }
+                run_unit(*s_, item);
+            }
+        }
+
+        task_pool*             pool_;
+        std::shared_ptr<state> s_;
+    };
+} // namespace snicholls
+
+#endif /* task_group_hpp */
+// end task_group.hpp
 // (inlined) #include "concurrent/parallel_for.hpp"                 // IWYU pragma: export
 // ----------------------------------------------------------------------
 // begin parallel_for.hpp
@@ -5471,6 +5772,11 @@ namespace snicholls
 
 #endif /* constexpr_for_hpp */
 // end constexpr_for.hpp
+// (inlined) #include "task_group.hpp"          // completion_gate, error_slot
+
+#include <algorithm>
+#include <functional>
+#include <vector>
 
 namespace snicholls
 {
@@ -5484,107 +5790,99 @@ namespace snicholls
         // a parameter rather than a constant.
         inline constexpr std::size_t parallel_chunks_per_worker = 4;
 
-        // Outstanding-chunk tracker. Same shape as the pool's own completion
-        // gate, and for the same reason: the hot path (a chunk finishing) only
-        // touches the atomic, and the mutex is taken solely to publish the
-        // reached-zero wakeup. done() takes the lock BEFORE notifying rather
-        // than after decrementing, which is what stops a waiter that has
-        // evaluated its predicate but not yet slept from missing the signal
-        // and waiting forever.
-        class chunk_gate
-        {
-        public:
-            void arm(std::size_t n) noexcept { outstanding_.store(n, std::memory_order_release); }
-
-            void done() noexcept
-            {
-                if (outstanding_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    std::lock_guard<std::mutex> g(m_);
-                    cv_.notify_all();
-                }
-            }
-
-            void wait()
-            {
-                std::unique_lock<std::mutex> lock(m_);
-                cv_.wait(lock, [this] { return outstanding_.load(std::memory_order_acquire) == 0; });
-            }
-
-        private:
-            std::atomic<std::size_t> outstanding_{0};
-            std::mutex               m_;
-            std::condition_variable  cv_;
-        };
-
-        // Everything the workers and the caller share for one parallel_for.
-        // Heap-allocated behind a shared_ptr because a submitted task may still
-        // be retiring after the call has returned: it will find the cursor
-        // exhausted and touch nothing but the gate, but it must find those
-        // alive to do so.
-        template <typename Index, typename Body, std::size_t Unroll>
-        struct parallel_range {
-            Index       first;
+        // ------------------------------------------------------- the engine
+        //
+        // Everything below is built on this: cut [0,count) into chunks, let any
+        // number of threads CLAIM them from one cursor, and come back when all
+        // of them have completed. parallel_for, parallel_reduce, parallel_scan
+        // and parallel_sort differ only in what they do with a chunk - so the
+        // claiming, the completion gate, the exception handling and the
+        // caller-participates rule live here once rather than four times.
+        //
+        // The gate and the error slot are shared with task_group (see
+        // task_group.hpp) for the same reason.
+        template <typename Fn>
+        struct chunk_run {
             std::size_t grain;
-            std::size_t count;              // elements
+            std::size_t count;
             std::size_t chunks;
-            Body        body;
+            Fn          fn;                 // void(chunk_index, lo, hi)
 
             std::atomic<std::size_t> cursor{0};
-            std::atomic<bool>        failed{false};
-            chunk_gate               gate;
+            completion_gate          gate;
+            error_slot               err;
 
-            std::mutex         err_m;
-            std::exception_ptr error;
+            chunk_run(std::size_t g, std::size_t n, std::size_t c, Fn f)
+                : grain(g), count(n), chunks(c), fn(std::move(f)) {}
 
-            parallel_range(Index f, std::size_t g, std::size_t n, std::size_t c, Body b)
-                : first(f), grain(g), count(n), chunks(c), body(std::move(b)) {}
-
-            void capture(std::exception_ptr e)
-            {
-                std::lock_guard<std::mutex> g(err_m);
-                if (!error) {                       // first failure wins; the rest are consequences
-                    error = e;
-                    failed.store(true, std::memory_order_release);
-                }
-            }
-
-            // Claim chunks until there are none left. Called by the pool's
-            // workers AND by the calling thread.
+            // Claim chunks until there are none left. Run by the pool's workers
+            // AND by the calling thread.
             //
-            // Note what happens after a body throws: this keeps CLAIMING but
+            // Note what happens after a chunk throws: this keeps CLAIMING but
             // stops EXECUTING. Breaking out instead would leave the unclaimed
             // chunks undecremented and the waiter parked on a gate that can
-            // never reach zero - the failure path hanging is a worse bug than
-            // the failure.
+            // never reach zero - a hanging failure path is worse than the
+            // failure.
             void drain()
             {
                 for (;;) {
                     const std::size_t c = cursor.fetch_add(1, std::memory_order_relaxed);
                     if (c >= chunks)
                         return;
-                    if (!failed.load(std::memory_order_acquire)) {
+                    if (!err.failed()) {
                         const std::size_t lo = c * grain;
                         const std::size_t hi = (lo + grain < count) ? lo + grain : count;
                         try {
-                            // Unroll == 1 is the plain loop, which is what the
-                            // compiler wants to see when it is going to unroll
-                            // or vectorise this itself.
-                            if constexpr (Unroll <= 1) {
-                                for (std::size_t k = lo; k < hi; ++k)
-                                    body(static_cast<Index>(first + static_cast<Index>(k)));
-                            } else {
-                                unrolled_for<Unroll>(lo, hi, [this](std::size_t k) {
-                                    body(static_cast<Index>(first + static_cast<Index>(k)));
-                                });
-                            }
+                            fn(c, lo, hi);
                         } catch (...) {
-                            capture(std::current_exception());
+                            err.capture(std::current_exception());
                         }
                     }
                     gate.done();
                 }
             }
         };
+
+        // Elements per chunk: the caller's choice, or one that gives roughly
+        // four chunks per worker.
+        inline std::size_t pick_grain(std::size_t count, std::size_t workers,
+                                      std::size_t requested)
+        {
+            if (requested != 0)
+                return requested;
+            const std::size_t want = workers * parallel_chunks_per_worker;
+            const std::size_t g = (count + want - 1) / want;     // ceil => chunks <= want
+            return g == 0 ? 1 : g;
+        }
+
+        // Run fn over every chunk of [0,count) and return once all of them have
+        // completed, rethrowing the first exception any chunk threw.
+        //
+        // The state is heap-allocated behind a shared_ptr because a submitted
+        // task may still be retiring after this returns: it will find the cursor
+        // exhausted and touch nothing but the gate, but it must find the gate
+        // alive to do so. That is also why fn may safely capture the caller's
+        // frame by reference - a late task never calls it.
+        template <typename Fn>
+        void run_chunks(task_pool& pool, std::size_t count, std::size_t grain, Fn fn)
+        {
+            const std::size_t chunks = (count + grain - 1) / grain;
+            auto st = std::make_shared<chunk_run<Fn>>(grain, count, chunks, std::move(fn));
+            st->gate.add(chunks);
+
+            // One task per worker, not one per chunk: chunks are claimed from
+            // the cursor, so W tasks occupy W workers and the type-erased
+            // submit is paid W times instead of once per chunk.
+            const std::size_t workers = pool.worker_count();
+            const std::size_t helpers = (workers < chunks) ? workers : chunks;
+            for (std::size_t i = 0; i < helpers; ++i)
+                pool.submit([st] { st->drain(); });
+
+            st->drain();                    // the caller is a worker too
+            st->gate.wait();
+            st->err.rethrow_if_failed();
+        }
+
     } // namespace detail
 
     // Run `body(i)` for every i in [first, last), across `pool`, and return
@@ -5628,31 +5926,18 @@ namespace snicholls
             return;
         }
 
-        std::size_t grain = grain_size;
-        if (grain == 0) {
-            const std::size_t want = workers * detail::parallel_chunks_per_worker;
-            grain = (count + want - 1) / want;          // ceil, so chunks <= want
-            if (grain == 0)
-                grain = 1;
-        }
-        const std::size_t chunks = (count + grain - 1) / grain;
-
-        auto st = std::make_shared<detail::parallel_range<Index, Body, Unroll>>(
-            first, grain, count, chunks, std::move(body));
-        st->gate.arm(chunks);
-
-        // One task per worker, not one per chunk: the chunks are claimed from
-        // the cursor, so W tasks are enough to occupy W workers, and the
-        // type-erased submit is paid W times instead of once per chunk.
-        const std::size_t helpers = (workers < chunks) ? workers : chunks;
-        for (std::size_t i = 0; i < helpers; ++i)
-            pool.submit([st] { st->drain(); });
-
-        st->drain();                // the caller is a worker too - see the header
-        st->gate.wait();
-
-        if (st->error)
-            std::rethrow_exception(st->error);
+        const std::size_t grain = detail::pick_grain(count, workers, grain_size);
+        detail::run_chunks(pool, count, grain,
+            [first, &body](std::size_t, std::size_t lo, std::size_t hi) {
+                if constexpr (Unroll <= 1) {
+                    for (std::size_t k = lo; k < hi; ++k)
+                        body(static_cast<Index>(first + static_cast<Index>(k)));
+                } else {
+                    unrolled_for<Unroll>(lo, hi, [&](std::size_t k) {
+                        body(static_cast<Index>(first + static_cast<Index>(k)));
+                    });
+                }
+            });
     }
 
     // Run `body(*it)` for every element in [first, last).
@@ -5678,10 +5963,539 @@ namespace snicholls
             [first, &body](diff i) { body(*(first + i)); },
             grain_size);
     }
+
+    // ------------------------------------------------------------ reduce
+    //
+    // Map each index to a value and fold the results: this IS map-reduce, which
+    // is why there is no separate parallel_map_reduce. `map(i)` is the map,
+    // `reduce(a,b)` is the fold, `identity` is the seed.
+    //
+    //     const double total = parallel_reduce(pool, 0, n, 0.0,
+    //                              [&](int i) { return v[i] * w[i]; },
+    //                              std::plus<double>{});
+    //
+    // THE RESULT IS DETERMINISTIC, and that is a deliberate choice worth the
+    // paragraph. Each chunk folds its own elements into a local accumulator,
+    // and the per-chunk results are then folded IN CHUNK ORDER - never in
+    // completion order. So the answer does not depend on how the scheduler
+    // happened to interleave the work, and a floating-point sum is reproducible
+    // run to run. Reducing in completion order is the obvious implementation and
+    // is what TBB's parallel_reduce does by default; it is also how a
+    // "nondeterministic" total sneaks into a test suite and then into a
+    // support ticket about numbers that will not reconcile. The cost is one
+    // value per chunk, and chunks are a small multiple of the worker count.
+    //
+    // `reduce` must be ASSOCIATIVE. It does NOT need to be commutative, because
+    // the fold order is index order - so string concatenation and matrix
+    // products are fine here, which they would not be in a completion-ordered
+    // reduction.
+    //
+    // `identity` must be a real identity for `reduce`: every chunk seeds its
+    // local accumulator with it, so a wrong seed is counted once per chunk
+    // rather than once overall.
+    template <std::size_t Unroll = 1, typename Index, typename T,
+              typename Map, typename Reduce>
+    T parallel_reduce(task_pool& pool, Index first, Index last, T identity,
+                      Map map, Reduce reduce, std::size_t grain_size = 0)
+    {
+        static_assert(std::is_integral_v<Index>, "parallel_reduce needs an integral index");
+
+        if (!(first < last))
+            return identity;
+        const std::size_t count = static_cast<std::size_t>(last - first);
+
+        const std::size_t workers = pool.worker_count();
+        if (workers <= 1 || count == 1) {
+            T acc = identity;
+            for (Index i = first; i < last; ++i)
+                acc = reduce(std::move(acc), map(i));
+            return acc;
+        }
+
+        const std::size_t grain  = detail::pick_grain(count, workers, grain_size);
+        const std::size_t chunks = (count + grain - 1) / grain;
+
+        // One slot per chunk, indexed by chunk id - this vector is what makes
+        // the result independent of scheduling. Sized up front so no chunk ever
+        // touches another's slot and no lock is needed.
+        std::vector<T> partials(chunks, identity);
+
+        detail::run_chunks(pool, count, grain,
+            [&](std::size_t c, std::size_t lo, std::size_t hi) {
+                T acc = identity;
+                if constexpr (Unroll <= 1) {
+                    for (std::size_t k = lo; k < hi; ++k)
+                        acc = reduce(std::move(acc), map(static_cast<Index>(first + static_cast<Index>(k))));
+                } else {
+                    unrolled_for<Unroll>(lo, hi, [&](std::size_t k) {
+                        acc = reduce(std::move(acc), map(static_cast<Index>(first + static_cast<Index>(k))));
+                    });
+                }
+                partials[c] = std::move(acc);
+            });
+
+        T out = identity;                   // in chunk order, always
+        for (auto& p : partials)
+            out = reduce(std::move(out), std::move(p));
+        return out;
+    }
+
+    // The iterator form: map sees the element, not the index.
+    template <std::size_t Unroll = 1, typename Iter, typename T,
+              typename Map, typename Reduce>
+    T parallel_reduce_each(task_pool& pool, Iter first, Iter last, T identity,
+                           Map map, Reduce reduce, std::size_t grain_size = 0)
+    {
+        using category = typename std::iterator_traits<Iter>::iterator_category;
+        static_assert(std::is_base_of_v<std::random_access_iterator_tag, category>,
+                      "parallel_reduce_each needs random-access iterators");
+        using diff = typename std::iterator_traits<Iter>::difference_type;
+        return parallel_reduce<Unroll>(
+            pool, diff{0}, last - first, identity,
+            [first, &map](diff i) { return map(*(first + i)); },
+            reduce, grain_size);
+    }
+
+
+    // -------------------------------------------------------------- scan
+    //
+    // Prefix fold: out[i] is the combination of everything up to i. Inclusive
+    // includes element i, exclusive does not; both return the grand total.
+    //
+    //     parallel_inclusive_scan(pool, v.begin(), v.end(), out.begin(),
+    //                             0.0, std::plus<double>{});
+    //
+    // A scan looks inherently serial - every output depends on the one before -
+    // and the trick is that it is only serial WITHIN a chunk. Two passes:
+    //
+    //   1. each chunk folds its own elements into a local total
+    //   2. the chunk totals are prefixed serially (there are only a handful)
+    //   3. each chunk re-walks its range, seeded with its own offset
+    //
+    // Note the cost that buys: the data is traversed TWICE, so a parallel scan
+    // moves about twice the memory a serial one does and only wins once there
+    // are enough cores to pay that back. On a memory-bound body that can mean
+    // never - `make bench-parallel` prints the crossover rather than assuming
+    // it. Deterministic for the same reason parallel_reduce is: the offsets are
+    // accumulated in chunk order, so `combine` must be associative but need not
+    // be commutative.
+    namespace detail
+    {
+        template <bool Inclusive, typename Iter, typename OutIter, typename T, typename Combine>
+        T scan_impl(task_pool& pool, Iter first, Iter last, OutIter out,
+                    T identity, Combine combine, std::size_t grain_size)
+        {
+            using category = typename std::iterator_traits<Iter>::iterator_category;
+            static_assert(std::is_base_of_v<std::random_access_iterator_tag, category>,
+                          "parallel scan needs random-access iterators");
+
+            if (!(first < last))
+                return identity;
+            const std::size_t count = static_cast<std::size_t>(last - first);
+
+            const std::size_t workers = pool.worker_count();
+            if (workers <= 1 || count == 1) {
+                T run = identity;
+                for (std::size_t k = 0; k < count; ++k) {
+                    if constexpr (Inclusive) {
+                        run = combine(std::move(run), *(first + static_cast<std::ptrdiff_t>(k)));
+                        *(out + static_cast<std::ptrdiff_t>(k)) = run;
+                    } else {
+                        *(out + static_cast<std::ptrdiff_t>(k)) = run;
+                        run = combine(std::move(run), *(first + static_cast<std::ptrdiff_t>(k)));
+                    }
+                }
+                return run;
+            }
+
+            const std::size_t grain  = pick_grain(count, workers, grain_size);
+            const std::size_t chunks = (count + grain - 1) / grain;
+
+            // pass 1: per-chunk totals
+            std::vector<T> totals(chunks, identity);
+            run_chunks(pool, count, grain,
+                [&](std::size_t c, std::size_t lo, std::size_t hi) {
+                    T acc = identity;
+                    for (std::size_t k = lo; k < hi; ++k)
+                        acc = combine(std::move(acc), *(first + static_cast<std::ptrdiff_t>(k)));
+                    totals[c] = std::move(acc);
+                });
+
+            // pass 2 (serial, chunks is small): the offset each chunk starts at
+            std::vector<T> offsets(chunks, identity);
+            T running = identity;
+            for (std::size_t c = 0; c < chunks; ++c) {
+                offsets[c] = running;
+                running = combine(std::move(running), totals[c]);
+            }
+
+            // pass 3: re-walk each chunk from its own offset
+            run_chunks(pool, count, grain,
+                [&](std::size_t c, std::size_t lo, std::size_t hi) {
+                    T run = offsets[c];
+                    for (std::size_t k = lo; k < hi; ++k) {
+                        if constexpr (Inclusive) {
+                            run = combine(std::move(run), *(first + static_cast<std::ptrdiff_t>(k)));
+                            *(out + static_cast<std::ptrdiff_t>(k)) = run;
+                        } else {
+                            *(out + static_cast<std::ptrdiff_t>(k)) = run;
+                            run = combine(std::move(run), *(first + static_cast<std::ptrdiff_t>(k)));
+                        }
+                    }
+                });
+
+            return running;
+        }
+    } // namespace detail
+
+    template <typename Iter, typename OutIter, typename T, typename Combine>
+    T parallel_inclusive_scan(task_pool& pool, Iter first, Iter last, OutIter out,
+                              T identity, Combine combine, std::size_t grain_size = 0)
+    {
+        return detail::scan_impl<true>(pool, first, last, out, identity, combine, grain_size);
+    }
+
+    template <typename Iter, typename OutIter, typename T, typename Combine>
+    T parallel_exclusive_scan(task_pool& pool, Iter first, Iter last, OutIter out,
+                              T identity, Combine combine, std::size_t grain_size = 0)
+    {
+        return detail::scan_impl<false>(pool, first, last, out, identity, combine, grain_size);
+    }
+
+    // -------------------------------------------------------------- sort
+    //
+    //     parallel_sort(pool, v.begin(), v.end());
+    //     parallel_sort(pool, v.begin(), v.end(), std::greater<>{});
+    //
+    // Sort k runs in parallel, then merge them pairwise in log2(k) rounds, each
+    // round's merges running in parallel. The per-run sort and the merge are
+    // the standard library's - std::sort and std::inplace_merge - because those
+    // are heavily tuned and there is nothing to gain by writing a worse
+    // quicksort here. What this adds is the scheduling.
+    //
+    // Two honest caveats. std::inplace_merge allocates a temporary when it can,
+    // so this is not an allocation-free sort; without the temporary it still
+    // works but degrades. And the merge rounds halve the available parallelism
+    // each time - the last round is a single merge on one thread - so the
+    // speedup ceiling is well under the core count. Measured, not asserted:
+    // see `make bench-parallel`.
+    //
+    // parallel_sort is UNSTABLE (std::sort per run); parallel_stable_sort uses
+    // std::stable_sort and is stable throughout, since the merge is stable.
+    namespace detail
+    {
+        // Runs shorter than this are not worth a thread of their own.
+        inline constexpr std::size_t parallel_sort_min_run = 1u << 12;
+
+        template <typename Iter, typename Compare, typename RunSort>
+        void sort_impl(task_pool& pool, Iter first, Iter last, Compare comp, RunSort run_sort)
+        {
+            using category = typename std::iterator_traits<Iter>::iterator_category;
+            static_assert(std::is_base_of_v<std::random_access_iterator_tag, category>,
+                          "parallel sort needs random-access iterators");
+            using diff = typename std::iterator_traits<Iter>::difference_type;
+
+            const diff n = last - first;
+            if (n < 2)
+                return;
+
+            const std::size_t workers = pool.worker_count();
+            if (workers <= 1 || static_cast<std::size_t>(n) <= parallel_sort_min_run) {
+                run_sort(first, last, comp);
+                return;
+            }
+
+            // A power-of-two run count keeps the merge tree exact, and no run
+            // smaller than the floor above.
+            std::size_t runs = 1;
+            while (runs * 2 <= workers &&
+                   static_cast<std::size_t>(n) / (runs * 2) >= parallel_sort_min_run)
+                runs *= 2;
+
+            const diff run_len = (n + static_cast<diff>(runs) - 1) / static_cast<diff>(runs);
+            auto bound = [&](std::size_t k) {
+                const diff v = static_cast<diff>(k) * run_len;
+                return v < n ? v : n;
+            };
+
+            parallel_for(pool, std::size_t{0}, runs, [&](std::size_t r) {
+                run_sort(first + bound(r), first + bound(r + 1), comp);
+            }, 1);
+
+            for (std::size_t width = 1; width < runs; width *= 2) {
+                const std::size_t pairs = (runs + 2 * width - 1) / (2 * width);
+                parallel_for(pool, std::size_t{0}, pairs, [&](std::size_t p) {
+                    const diff lo  = bound(p * 2 * width);
+                    const diff mid = bound(p * 2 * width + width);
+                    const diff hi  = bound((p + 1) * 2 * width);
+                    if (mid < hi)
+                        std::inplace_merge(first + lo, first + mid, first + hi, comp);
+                }, 1);
+            }
+        }
+    } // namespace detail
+
+    template <typename Iter, typename Compare = std::less<>>
+    void parallel_sort(task_pool& pool, Iter first, Iter last, Compare comp = Compare{})
+    {
+        detail::sort_impl(pool, first, last, comp,
+                          [](auto b, auto e, auto c) { std::sort(b, e, c); });
+    }
+
+    template <typename Iter, typename Compare = std::less<>>
+    void parallel_stable_sort(task_pool& pool, Iter first, Iter last, Compare comp = Compare{})
+    {
+        detail::sort_impl(pool, first, last, comp,
+                          [](auto b, auto e, auto c) { std::stable_sort(b, e, c); });
+    }
+
 } // namespace snicholls
 
 #endif /* parallel_for_hpp */
 // end parallel_for.hpp
+// (inlined) #include "concurrent/task_graph.hpp"                   // IWYU pragma: export
+// ----------------------------------------------------------------------
+// begin task_graph.hpp
+// ----------------------------------------------------------------------
+//
+//  task_graph.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - a dependency graph, executed level by level
+//
+//      snicholls::task_graph g(pool);
+//      const auto fetch = g.add([&] { data = fetch_it(); });
+//      const auto parse = g.add([&] { tree = parse(data); });
+//      const auto emit  = g.add([&] { write(tree); });
+//      g.precede(fetch, parse);
+//      g.precede(parse, emit);
+//      g.run();                       // fetch, then parse, then emit
+//
+//  `precede` is spelled the way stl-topological-sorting spells it, because it
+//  is the same relation and there is no reason for the same author's two
+//  libraries to disagree about the verb.
+//
+//  ------------------------------------------- what this is, and what it is not
+//
+//  A sequential topological sort answers "in what ORDER may these run?" and
+//  hands back one valid linearisation. This answers a different question -
+//  "which of these may run AT THE SAME TIME?" - and hands back levels.
+//
+//  A level is an antichain: every node in it has all of its dependencies
+//  satisfied by earlier levels and none by its neighbours, so the whole level
+//  can run at once. That set is the useful product. The linear order is a
+//  by-product you get by concatenating the levels, and if a linear order is
+//  all you want then a sequential sort is the better tool and this is the wrong
+//  file.
+//
+//  So this is deliberately NOT a graph library. There is no traversal, no
+//  shortest path, no components - just enough structure to say what can run
+//  together, and a runner that does it.
+//
+//  ------------------------------------------------------- the ceiling, up front
+//
+//  Level-synchronous execution has two hard limits, and they are properties of
+//  the GRAPH rather than of the machine:
+//
+//    width   the largest level. This is the most parallelism that exists. Eight
+//            cores do not help a graph whose widest level is three.
+//    depth   the number of levels, i.e. the critical path. This is a serial
+//            floor: a 10,000-node chain has depth 10,000 and width 1, and runs
+//            at exactly serial speed on any number of cores.
+//
+//  Every level also pays a join, so a deep, narrow graph can finish SLOWER than
+//  running the nodes in order on one thread. depth() and width() are public for
+//  exactly this reason - they are the two numbers that explain a disappointing
+//  speedup, and a benchmark that reports the speedup without them is not
+//  reporting anything.
+//
+//  The other parallel Kahn - one shared frontier queue, in-degrees decremented
+//  atomically as each node finishes - is deliberately not what this does. It
+//  removes the per-level join, and pays for it with every worker contending on
+//  the one hot counter that every finishing node must touch. On a multicore box
+//  the level-synchronous version is simpler and usually faster; the frontier
+//  version earns its keep on graphs far more irregular than the ones a task
+//  scheduler sees.
+//
+//  Computing the levels is O(V+E) and SEQUENTIAL, on purpose. It is bookkeeping
+//  over the graph, not over the work, and in any graph worth running in
+//  parallel the nodes cost enormously more than the edges. Parallelising it
+//  would add contention to something that is already noise.
+//
+
+#ifndef task_graph_hpp
+#define task_graph_hpp
+
+#include <cstddef>
+#include <functional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+// (inlined) #include "../interfaces/task_pool.hpp"
+// (inlined) #include "parallel_for.hpp"
+
+namespace snicholls
+{
+    // Thrown by levels() and run() when the graph has a cycle. Loud, and with
+    // the count, because "your graph has a cycle" without saying how much of it
+    // is stuck sends you reading the whole thing.
+    class task_graph_cycle : public std::runtime_error
+    {
+    public:
+        explicit task_graph_cycle(std::size_t stuck)
+            : std::runtime_error("task_graph: cycle - " + std::to_string(stuck) +
+                                 " node(s) never reach in-degree zero"),
+              stuck_(stuck) {}
+
+        std::size_t stuck() const noexcept { return stuck_; }
+
+    private:
+        std::size_t stuck_;
+    };
+
+    class task_graph
+    {
+    public:
+        using node_id = std::size_t;
+
+        explicit task_graph(task_pool& pool) : pool_(&pool) {}
+
+        // Moveable, like everything else here: a graph is a value you build in
+        // one place and run in another. Nothing outside holds a node's address,
+        // so there is no contract to break by moving one - and run() blocks, so
+        // a graph cannot be moved while it is executing.
+        task_graph(task_graph&&) noexcept = default;
+        task_graph& operator=(task_graph&&) noexcept = default;
+        task_graph(const task_graph&) = delete;
+        task_graph& operator=(const task_graph&) = delete;
+
+        // A node with work, or without: an empty node is a join point, and a
+        // graph of empty nodes is a pure dependency analysis with nothing to
+        // run. levels() works either way.
+        node_id add(std::function<void()> work = {})
+        {
+            work_.push_back(std::move(work));
+            succ_.emplace_back();
+            indeg_.push_back(0);
+            dirty_ = true;
+            return work_.size() - 1;
+        }
+
+        // `before` must finish before `after` starts. Self-edges are refused
+        // rather than silently producing an unsatisfiable graph that only
+        // reports itself much later as a cycle.
+        void precede(node_id before, node_id after)
+        {
+            check(before);
+            check(after);
+            if (before == after)
+                throw std::invalid_argument("task_graph: a node cannot precede itself");
+            succ_[before].push_back(after);
+            ++indeg_[after];
+            dirty_ = true;
+        }
+
+        std::size_t size() const noexcept { return work_.size(); }
+
+        // The antichains, in execution order. Throws task_graph_cycle if the
+        // graph is not a DAG.
+        const std::vector<std::vector<node_id>>& levels() const
+        {
+            if (dirty_)
+                build_levels();
+            return levels_;
+        }
+
+        // The critical path: no schedule can be shorter than this many steps.
+        std::size_t depth() const { return levels().size(); }
+
+        // The widest level: the most parallelism the graph actually contains.
+        std::size_t width() const
+        {
+            std::size_t w = 0;
+            for (const auto& lv : levels())
+                w = (lv.size() > w) ? lv.size() : w;
+            return w;
+        }
+
+        // Run every node, one level at a time, each level in parallel.
+        //
+        // Exceptions follow parallel_for: the first one is rethrown here once
+        // the rest of its level has settled, and no LATER level runs at all -
+        // which is the only sane answer, since those nodes were waiting on the
+        // one that failed.
+        void run()
+        {
+            const auto& lv = levels();
+            for (const auto& level : lv) {
+                parallel_for(*pool_, std::size_t{0}, level.size(),
+                             [this, &level](std::size_t i) {
+                                 const auto& fn = work_[level[i]];
+                                 if (fn)
+                                     fn();
+                             },
+                             1);                // one node per chunk
+            }
+        }
+
+    private:
+        void check(node_id n) const
+        {
+            if (n >= work_.size())
+                throw std::out_of_range("task_graph: no such node");
+        }
+
+        // Kahn by waves. The cycle check is the same count Kahn always gives
+        // you: anything never reaching in-degree zero is in one, or downstream
+        // of one.
+        void build_levels() const
+        {
+            levels_.clear();
+            std::vector<std::size_t> remaining = indeg_;
+            std::vector<node_id> current;
+
+            for (node_id n = 0; n < work_.size(); ++n)
+                if (remaining[n] == 0)
+                    current.push_back(n);
+
+            std::size_t placed = 0;
+            while (!current.empty()) {
+                placed += current.size();
+                std::vector<node_id> next;
+                for (const node_id n : current)
+                    for (const node_id s : succ_[n])
+                        if (--remaining[s] == 0)
+                            next.push_back(s);
+                levels_.push_back(std::move(current));
+                current = std::move(next);
+            }
+
+            if (placed != work_.size()) {
+                levels_.clear();
+                throw task_graph_cycle(work_.size() - placed);
+            }
+            dirty_ = false;
+        }
+
+        task_pool*                            pool_;
+        std::vector<std::function<void()>>    work_;
+        std::vector<std::vector<node_id>>     succ_;
+        std::vector<std::size_t>              indeg_;
+
+        // levels() is logically const - it is a query - but caches. The cache
+        // is rebuilt on the next query after any edit rather than eagerly, so
+        // building a graph stays O(1) per edge.
+        mutable std::vector<std::vector<node_id>> levels_;
+        mutable bool                              dirty_ = true;
+    };
+} // namespace snicholls
+
+#endif /* task_graph_hpp */
+// end task_graph.hpp
 // (inlined) #include "utils/constexpr_for.hpp"                    // IWYU pragma: export
 // (inlined) #include "event/loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 // ----------------------------------------------------------------------
@@ -7166,6 +7980,7 @@ public:
     std::string body;
     bool keep_alive = true;
     std::unordered_map<std::string, std::string> params;    // ":name" captures
+    std::string peer;                   // the client's address, numeric
 
     // Reset for reuse without releasing a single allocation. The strings keep
     // their capacity and the header vector keeps its buffer, so a connection
@@ -7182,6 +7997,7 @@ public:
         body.clear();
         keep_alive = true;
         params.clear();
+        peer.clear();
     }
 
     const std::string* header(const char* name) const noexcept { return headers.find(name); }
@@ -8196,6 +9012,13 @@ public:
     virtual void stream_write(std::uint64_t /*stream*/, const char* /*data*/,
                               std::size_t /*n*/, connection_host& /*host*/) {}
     virtual void end_stream(std::uint64_t /*stream*/, connection_host& /*host*/) {}
+
+    // End a streamed response as a failure rather than a completion, so the
+    // client can tell a truncated body from a finished one. end_stream() would
+    // send the terminal chunk and make the fragment look whole. Returns false
+    // when the protocol cannot fail one exchange on its own - HTTP/1.1 has no
+    // way to - and the connection is closed instead. HTTP/2 resets the stream.
+    virtual bool abort_stream(std::uint64_t /*stream*/, connection_host& /*host*/) { return false; }
 };
 
 } // namespace http
@@ -8470,7 +9293,9 @@ public:
     // send on a dead connection should be a quiet false, not a crash.
     std::weak_ptr<detail::session_core> session() const noexcept { return s_; }
     event_loop::poster session_poster() const;
-    bool connected() const noexcept { return !s_.expired(); }
+    // Safe from any thread. False once the connection has closed, not merely
+    // once its last reference is gone - see session_core::closed_pub.
+    bool connected() const noexcept;
     explicit operator bool() const noexcept { return !answered_ && connected(); }
 
 private:
@@ -8524,11 +9349,20 @@ public:
     // on a chunked body that never terminates
     ~response_stream() { end(); }
 
+    // False once the client has gone, from any thread - which is how a
+    // producer on a worker learns to stop. It can lag the disconnect by the
+    // time the loop takes to notice, never by more.
     bool write(const char* data, std::size_t n);
     bool write(std::string chunk) { return write(chunk.data(), chunk.size()); }
     void end();
 
-    bool open() const noexcept { return open_ && !s_.expired(); }
+    // End it as a failure: the producer broke partway, and the client must be
+    // able to tell the fragment from a finished body. end() would send the
+    // terminal chunk and make it look whole. HTTP/1.1 has no way to fail one
+    // response, so the connection closes; HTTP/2 resets just this stream.
+    void abort();
+
+    bool open() const noexcept;
     explicit operator bool() const noexcept { return open(); }
 
     // Bytes queued for this connection and not yet gone: the socket backlog
@@ -8815,6 +9649,13 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     // enforced inside the protocol on the loop thread.
     std::atomic<std::size_t> pending_pub{0};
 
+    // live_, published. live_ is the loop's own flag and a worker must not
+    // read it; the weak_ptr expiring is no substitute, because a task posted
+    // to the loop holds a strong reference, so a producer writing steadily to
+    // a closed connection keeps it looking alive indefinitely. Set wherever
+    // live_ goes false, read by the handles from any thread.
+    std::atomic<bool> closed_pub{false};
+
     void publish_pending() noexcept
     {
         pending_pub.store(pending_bytes(), std::memory_order_relaxed);
@@ -8873,6 +9714,18 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     }
 
     void end_stream(std::uint64_t id);
+
+    void abort_stream(std::uint64_t id)
+    {
+        if (!live_)
+            return;
+        if (protocol->abort_stream(id, *this)) {
+            if (!driving)
+                flush();
+            return;
+        }
+        close_politely(false);                  // no close_notify: this is not a clean end
+    }
 
     // ---- reactor plumbing
     void on_readable();
@@ -8942,20 +9795,27 @@ struct server_core : std::enable_shared_from_this<server_core> {
             ::close(reserve_fd);
     }
 
-    void shutdown()
+    void close_listener()
     {
-        sweep_conn.disconnect();
-        sweeper.cancel();
         listen_conn.disconnect();
         listen_watch.reset();
         if (listen_fd >= 0) {
             ::close(listen_fd);
             listen_fd = -1;
         }
+    }
+
+    void shutdown()
+    {
+        sweep_conn.disconnect();
+        sweeper.cancel();
+        close_listener();
         auto doomed = std::move(sessions);
         sessions.clear();
-        for (auto& kv : doomed)
+        for (auto& kv : doomed) {
             kv.second->live_ = false;
+            kv.second->closed_pub.store(true, std::memory_order_release);
+        }
     }
 
     const char* http_date()
@@ -9256,6 +10116,7 @@ inline void session_core::close_now()
     if (!live_)
         return;
     live_ = false;
+    closed_pub.store(true, std::memory_order_release);
     auto self = weak_from_this().lock();        // erase below may drop the last reference
     if (auto s = srv.lock()) {
         s->on_close(info);
@@ -9313,6 +10174,7 @@ inline void session_core::deliver(request& req, std::uint64_t stream)
         return;
     }
     ++s->total_requests;
+    req.peer = info.peer;
 
     // Only pay for the access-log snapshot when something is listening. These
     // are three string copies per request, and most servers run with no tap
@@ -9492,13 +10354,29 @@ inline response_stream responder::stream(response headers)
     return out;
 }
 
+inline bool responder::connected() const noexcept
+{
+    auto s = s_.lock();
+    return s && !s->closed_pub.load(std::memory_order_acquire);
+}
+
+inline bool response_stream::open() const noexcept
+{
+    if (!open_)
+        return false;
+    auto s = s_.lock();
+    return s && !s->closed_pub.load(std::memory_order_acquire);
+}
+
 inline bool response_stream::write(const char* data, std::size_t n)
 {
-    if (!open_ || n == 0)
-        return open_;
-    auto s = s_.lock();
-    if (!s)
+    if (!open_)
         return false;
+    auto s = s_.lock();
+    if (!s || s->closed_pub.load(std::memory_order_acquire))
+        return false;
+    if (n == 0)
+        return true;
     if (s->poster.on_loop_thread()) {
         s->stream_write(stream_, data, n);
         return true;
@@ -9527,6 +10405,23 @@ inline void response_stream::end()
     auto keep = s;
     const std::uint64_t id = stream_;
     keep->poster.post([keep, id] { keep->end_stream(id); });
+}
+
+inline void response_stream::abort()
+{
+    if (!open_)
+        return;
+    open_ = false;
+    auto s = s_.lock();
+    if (!s)
+        return;
+    if (s->poster.on_loop_thread()) {
+        s->abort_stream(stream_);
+        return;
+    }
+    auto keep = s;
+    const std::uint64_t id = stream_;
+    keep->poster.post([keep, id] { keep->abort_stream(id); });
 }
 
 inline std::size_t response_stream::pending() const
@@ -9734,6 +10629,11 @@ public:
 
     // Close the listener and every live connection, without destroying the server
     void shutdown() { c_->shutdown(); }
+
+    // Close only the listener: connections already open are served to the
+    // end. The first half of a graceful stop - stop taking work, let the work
+    // in hand finish, then shutdown(). Loop thread, like shutdown().
+    void stop_accepting() { c_->close_listener(); }
 
     event_loop& loop() noexcept { return c_->loop; }
     std::uint16_t port() const noexcept { return c_->bound_port; }
@@ -10998,6 +11898,15 @@ public:
         s->streaming = false;
         s->out_end = true;
         last_bytes_ += pump(host);
+    }
+
+    // One stream fails; the connection and its other streams carry on
+    bool abort_stream(std::uint64_t sid, connection_host& host) override
+    {
+        detail::h2_stream* s = find(std::uint32_t(sid));
+        if (s && !s->end_sent)
+            stream_error(host, std::uint32_t(sid), h2_error::internal_error);
+        return true;
     }
 
     // Everything the send windows have refused so far, across every stream.

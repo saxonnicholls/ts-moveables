@@ -1,5 +1,5 @@
 //
-//  ts_server.hpp - amalgamated single-header build of ts-moveables
+//  ts_http_server.hpp - amalgamated single-header build of ts-moveables
 //
 //  Copyright 2010-2026 Saxon Herschel Nicholls
 //
@@ -1847,6 +1847,7 @@ public:
     std::string body;
     bool keep_alive = true;
     std::unordered_map<std::string, std::string> params;    // ":name" captures
+    std::string peer;                   // the client's address, numeric
 
     // Reset for reuse without releasing a single allocation. The strings keep
     // their capacity and the header vector keeps its buffer, so a connection
@@ -1863,6 +1864,7 @@ public:
         body.clear();
         keep_alive = true;
         params.clear();
+        peer.clear();
     }
 
     const std::string* header(const char* name) const noexcept { return headers.find(name); }
@@ -2877,6 +2879,13 @@ public:
     virtual void stream_write(std::uint64_t /*stream*/, const char* /*data*/,
                               std::size_t /*n*/, connection_host& /*host*/) {}
     virtual void end_stream(std::uint64_t /*stream*/, connection_host& /*host*/) {}
+
+    // End a streamed response as a failure rather than a completion, so the
+    // client can tell a truncated body from a finished one. end_stream() would
+    // send the terminal chunk and make the fragment look whole. Returns false
+    // when the protocol cannot fail one exchange on its own - HTTP/1.1 has no
+    // way to - and the connection is closed instead. HTTP/2 resets the stream.
+    virtual bool abort_stream(std::uint64_t /*stream*/, connection_host& /*host*/) { return false; }
 };
 
 } // namespace http
@@ -3151,7 +3160,9 @@ public:
     // send on a dead connection should be a quiet false, not a crash.
     std::weak_ptr<detail::session_core> session() const noexcept { return s_; }
     event_loop::poster session_poster() const;
-    bool connected() const noexcept { return !s_.expired(); }
+    // Safe from any thread. False once the connection has closed, not merely
+    // once its last reference is gone - see session_core::closed_pub.
+    bool connected() const noexcept;
     explicit operator bool() const noexcept { return !answered_ && connected(); }
 
 private:
@@ -3205,11 +3216,20 @@ public:
     // on a chunked body that never terminates
     ~response_stream() { end(); }
 
+    // False once the client has gone, from any thread - which is how a
+    // producer on a worker learns to stop. It can lag the disconnect by the
+    // time the loop takes to notice, never by more.
     bool write(const char* data, std::size_t n);
     bool write(std::string chunk) { return write(chunk.data(), chunk.size()); }
     void end();
 
-    bool open() const noexcept { return open_ && !s_.expired(); }
+    // End it as a failure: the producer broke partway, and the client must be
+    // able to tell the fragment from a finished body. end() would send the
+    // terminal chunk and make it look whole. HTTP/1.1 has no way to fail one
+    // response, so the connection closes; HTTP/2 resets just this stream.
+    void abort();
+
+    bool open() const noexcept;
     explicit operator bool() const noexcept { return open(); }
 
     // Bytes queued for this connection and not yet gone: the socket backlog
@@ -3496,6 +3516,13 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     // enforced inside the protocol on the loop thread.
     std::atomic<std::size_t> pending_pub{0};
 
+    // live_, published. live_ is the loop's own flag and a worker must not
+    // read it; the weak_ptr expiring is no substitute, because a task posted
+    // to the loop holds a strong reference, so a producer writing steadily to
+    // a closed connection keeps it looking alive indefinitely. Set wherever
+    // live_ goes false, read by the handles from any thread.
+    std::atomic<bool> closed_pub{false};
+
     void publish_pending() noexcept
     {
         pending_pub.store(pending_bytes(), std::memory_order_relaxed);
@@ -3554,6 +3581,18 @@ struct session_core final : connection_host, std::enable_shared_from_this<sessio
     }
 
     void end_stream(std::uint64_t id);
+
+    void abort_stream(std::uint64_t id)
+    {
+        if (!live_)
+            return;
+        if (protocol->abort_stream(id, *this)) {
+            if (!driving)
+                flush();
+            return;
+        }
+        close_politely(false);                  // no close_notify: this is not a clean end
+    }
 
     // ---- reactor plumbing
     void on_readable();
@@ -3623,20 +3662,27 @@ struct server_core : std::enable_shared_from_this<server_core> {
             ::close(reserve_fd);
     }
 
-    void shutdown()
+    void close_listener()
     {
-        sweep_conn.disconnect();
-        sweeper.cancel();
         listen_conn.disconnect();
         listen_watch.reset();
         if (listen_fd >= 0) {
             ::close(listen_fd);
             listen_fd = -1;
         }
+    }
+
+    void shutdown()
+    {
+        sweep_conn.disconnect();
+        sweeper.cancel();
+        close_listener();
         auto doomed = std::move(sessions);
         sessions.clear();
-        for (auto& kv : doomed)
+        for (auto& kv : doomed) {
             kv.second->live_ = false;
+            kv.second->closed_pub.store(true, std::memory_order_release);
+        }
     }
 
     const char* http_date()
@@ -3937,6 +3983,7 @@ inline void session_core::close_now()
     if (!live_)
         return;
     live_ = false;
+    closed_pub.store(true, std::memory_order_release);
     auto self = weak_from_this().lock();        // erase below may drop the last reference
     if (auto s = srv.lock()) {
         s->on_close(info);
@@ -3994,6 +4041,7 @@ inline void session_core::deliver(request& req, std::uint64_t stream)
         return;
     }
     ++s->total_requests;
+    req.peer = info.peer;
 
     // Only pay for the access-log snapshot when something is listening. These
     // are three string copies per request, and most servers run with no tap
@@ -4173,13 +4221,29 @@ inline response_stream responder::stream(response headers)
     return out;
 }
 
+inline bool responder::connected() const noexcept
+{
+    auto s = s_.lock();
+    return s && !s->closed_pub.load(std::memory_order_acquire);
+}
+
+inline bool response_stream::open() const noexcept
+{
+    if (!open_)
+        return false;
+    auto s = s_.lock();
+    return s && !s->closed_pub.load(std::memory_order_acquire);
+}
+
 inline bool response_stream::write(const char* data, std::size_t n)
 {
-    if (!open_ || n == 0)
-        return open_;
-    auto s = s_.lock();
-    if (!s)
+    if (!open_)
         return false;
+    auto s = s_.lock();
+    if (!s || s->closed_pub.load(std::memory_order_acquire))
+        return false;
+    if (n == 0)
+        return true;
     if (s->poster.on_loop_thread()) {
         s->stream_write(stream_, data, n);
         return true;
@@ -4208,6 +4272,23 @@ inline void response_stream::end()
     auto keep = s;
     const std::uint64_t id = stream_;
     keep->poster.post([keep, id] { keep->end_stream(id); });
+}
+
+inline void response_stream::abort()
+{
+    if (!open_)
+        return;
+    open_ = false;
+    auto s = s_.lock();
+    if (!s)
+        return;
+    if (s->poster.on_loop_thread()) {
+        s->abort_stream(stream_);
+        return;
+    }
+    auto keep = s;
+    const std::uint64_t id = stream_;
+    keep->poster.post([keep, id] { keep->abort_stream(id); });
 }
 
 inline std::size_t response_stream::pending() const
@@ -4415,6 +4496,11 @@ public:
 
     // Close the listener and every live connection, without destroying the server
     void shutdown() { c_->shutdown(); }
+
+    // Close only the listener: connections already open are served to the
+    // end. The first half of a graceful stop - stop taking work, let the work
+    // in hand finish, then shutdown(). Loop thread, like shutdown().
+    void stop_accepting() { c_->close_listener(); }
 
     event_loop& loop() noexcept { return c_->loop; }
     std::uint16_t port() const noexcept { return c_->bound_port; }

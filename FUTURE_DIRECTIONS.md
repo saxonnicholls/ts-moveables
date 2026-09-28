@@ -392,6 +392,34 @@ The structural expectation for the head-to-head was that a reactor holds the C10
 
 **Effort.** Large ×2 for phases 1–2, dominated by parser correctness; large again for h2; phase 4 is mostly integration, which is exactly why we wrap rather than write. Worth it: this is the first component that composes *everything* below it — loop, signals, queues, moveables — into something a stranger can drop into a project and use in one line.
 
+### A first real consumer: an engine behind someone else's interface
+
+`HTTP_ENGINE_WORK_ORDER.md` asked for the server behind asoMonoRepo1's
+`HttpServerInterface`, an httplib-shaped contract with synchronous handlers
+that may block, std::regex routing and a pull-model chunked provider. The
+engine lives in that repo, at
+`cpp/src/implementations/http/tsmoveables_http_server.hpp`. Its parity suite,
+`cpp/tests/http_engine_parity_test`, sends 18 identical requests to both
+engines and requires identical answers. Building it found five gaps here,
+now closed: `response_stream::abort()`, `server::stop_accepting()`,
+`request::peer`, the published closed flag, and the `mutex_task_pool`
+thundering herd. The last one cost 5× at p95 before it was found.
+
+What the engine taught about the architecture:
+
+- **A blocking pull provider costs a thread for its whole life, on any
+  engine.** llm_server's SSE provider waits for the next token, so each live
+  stream has its own thread and the handler pool is kept for request/response
+  work. The reactor's win is connections, keep-alive, slow clients, and a loop
+  that user code cannot stall. It does not make 100 streams free of threads.
+  That needs a push-shaped provider, which the interface does not have.
+- **Open: an HTTP/2 client that resets one stream is not reported to that
+  stream's producer.** The published flag is per connection. After a peer's
+  RST_STREAM, the protocol quietly drops the stream, and `write()` keeps
+  returning true until the connection itself closes. HTTP/1.1, which is what
+  nginx speaks upstream, is unaffected. The fix is a per-stream
+  "closed" flag published the same way.
+
 ---
 
 ## 9. Logging and telemetry — the fabric applied to itself
@@ -484,9 +512,10 @@ needed at the current scale.
 Everything above is about what the library does. This is about what the checks
 around it *fail* to notice, which is a different and easier thing to leave
 unrecorded. The first three were found while shipping 1.1.1; the sanitizer one
-came later, on a developer machine rather than in CI. None is fixed.
+came later, on a developer machine rather than in CI. The amalgamation gap is
+fixed; the rest are not.
 
-**The amalgamation gate proves less than it appears to.** `check-amalgamate`
+**The amalgamation gate proved less than it appeared to** ✅ *fixed after 1.2.1.* `check-amalgamate`
 regenerates `single_include/`, compiles a drop-in and runs it — but the drop-in
 is a one-line HTTP/1.1 server. So it verifies that *the amalgamation is not
 stale* and *the file compiles*, and nothing about what is in it. That is exactly
@@ -498,6 +527,10 @@ shipped component — construct an `http2_protocol`, a `ws_broadcast_hub`, a
 `websocket_client`, an `intern_pool` — so that "the single header contains the
 library" becomes an assertion rather than an assumption. A smoke test that only
 exercises the part that already worked cannot report on the part that did not.
+The fix is now in place: `scripts/check_amalgamation.py` requires every header
+in the tree to be in the file or on an explicit opt-in list, and
+`tests/amalgamation/drop_in.cpp` compiles against `single_include/` alone and uses
+each component. Removing `http2.hpp` from the umbrella fails both.
 
 **`make tsan` and `make asan` do not run on Intel macOS 26 at all.** Every
 sanitized binary dies with SIGILL inside `__pthread_init` before reaching
@@ -616,7 +649,7 @@ Written down so nobody — including us — spends a busy week on them:
 | 11 | `event_loop` phase 2 comforts — POSIX signals as emissions, `WSAPoll` backend | Medium | Next |
 | 12 | QUIC + HTTP/3 (§8 phase 5) — wrap, do not write | Large ×2 | After phase 5's interop bar is agreed |
 | 13 | Two-machine head-to-head vs nginx (§8 phase 6a) | Medium | Needs a second machine, not more code |
-| 14 | Make the amalgamation gate name each shipped component (§11) | Small | Next — it missed HTTP/2 for a whole release |
+| 14 | Make the amalgamation gate name each shipped component (§11) | Small | ✅ **Shipped** — coverage script plus a drop-in that uses every component; negative-controlled against the HTTP/2 miss |
 | 15 | Diagnose the Autobahn runner hang (§11) | Medium | Bounded for now; cause unknown |
 | 16 | Verify `reuse_port` actually balances (§11) — test + the Linux `bench-rpc` row | Small | Never observed, only assumed; unobservable on macOS |
-| 14 | `ws_broadcast_hub` fan-out + `intern_pool` (§10) | Medium | ✅ **Shipped** — shared-frame fan-out (up to ~94× at 8 KB × 1000), fixed-topic multi-webhook, `intern_pool`. Syscall batching / shared-mem transport / conflation deferred (§10) |
+| 17 | `ws_broadcast_hub` fan-out + `intern_pool` (§10) | Medium | ✅ **Shipped** — shared-frame fan-out (up to ~94× at 8 KB × 1000), fixed-topic multi-webhook, `intern_pool`. Syscall batching / shared-mem transport / conflation deferred (§10) |
