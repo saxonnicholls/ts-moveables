@@ -236,15 +236,19 @@ void check(bool ok, const char* what)
 
 int main(int argc, char** argv)
 {
-    bool quick = false;
+    bool quick = false, markdown = false;
     std::size_t bases = 0;                  // 0 = use the built-in size
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--quick")
             quick = true;
+        else if (a == "--markdown")         // CI: fence the output, and keep it short
+            markdown = quick = true;
         else if (a == "--bases" && i + 1 < argc)
             bases = static_cast<std::size_t>(std::stoull(argv[++i]));
     }
+    if (markdown)
+        std::printf("```\n");
 
     work_stealing_task_pool pool;
     std::printf("Burrows-Wheeler over DNA - parallel_sort + parallel_scan, %zu workers\n\n",
@@ -317,5 +321,7 @@ int main(int argc, char** argv)
     }
 
     std::printf("all BWT/DNA demo checks passed\n");
+    if (markdown)
+        std::printf("```\n");
     return 0;
 }

@@ -96,7 +96,7 @@ jobs:
       - name: Demos (self-verifying)
         run: |
           set -o pipefail
-          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo build/http_server_demo build/webhook_ws_hub_demo build/replay_loop_demo CXX=${{ matrix.cxx }}
+          make build/capture_replay_demo build/pcap_replay_demo build/taskflow_style_demo build/time_master_demo build/http_server_demo build/webhook_ws_hub_demo build/replay_loop_demo build/bwt_dna_demo CXX=${{ matrix.cxx }}
           {
             ./build/capture_replay_demo --markdown
             echo ""
@@ -111,6 +111,8 @@ jobs:
             ./build/webhook_ws_hub_demo --markdown
             echo ""
             ./build/replay_loop_demo --markdown
+            echo ""
+            ./build/bwt_dna_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Autobahn|Testsuite: the external RFC 6455 grader. x86-64 Linux only -

@@ -550,7 +550,7 @@ The self-verifying demos (every number below was produced while asserting orderi
 
 ## Demos
 
-Working programs, not snippets. Each builds and runs with one make target; the last three verify their own correctness and fail loudly, so CI runs them on every push as cross-platform integration tests.
+Working programs, not snippets. Each builds and runs with one make target, and most verify their own correctness and fail loudly — so CI runs those on every push, on all six platforms, as cross-platform integration tests.
 
 | Demo | Run with | What it shows |
 |---|---|---|
@@ -561,9 +561,23 @@ Working programs, not snippets. Each builds and runs with one make target; the l
 | [http_server_demo](demos/http_server_demo.cpp) | `make demo-http` | the [HTTP server](#http_server) under load, with every response verified: keep-alive and pipelined throughput, 1 KiB payload bandwidth, async responders answered off the loop thread, 2 MiB bodies round-tripped — and **10,000 simultaneous connections held open and served by a single loop on a single thread** |
 | [drone_fleet_demo](demos/drone_fleet_demo.cpp) | `make demo-drones` | the shape this was built for: ten aircraft streaming telemetry, five operators on live consoles, fifteen flight logs, and one listener relaying to New York, London, San Francisco and Sydney — with a training replay paced by the original timestamps. Verifies that the flight record loses nothing, every office receives its stream **in order**, and logging never stalls an aircraft thread (0.041 ms worst case across 4,000 calls) |
 | [replay_loop_demo](demos/replay_loop_demo.cpp) | `make demo-replay` | determinism: a scripted session over sockets, timers and cross-thread posts is journalled through the loop's dispatch tap, replayed into a *fresh* handler graph with no sockets, timers, threads or clock, and the digests match bit for bit — with a negative control that drops one event and asserts they then diverge |
+| [bwt_dna_demo](demos/bwt_dna_demo.cpp) | `make demo-bwt` | the [parallel algorithms](#parallel-algorithms) composing into a real one: a Burrows-Wheeler transform over DNA, whose suffix array is prefix doubling — and each round is literally a `parallel_sort` followed by a prefix scan, where **the inclusive scan of the "these differ" flags *is* the new rank**. Round-trip verified exactly; the clustering BWT exists to create shows up as longest-run 8 → 9,790. Dependency-free, including of [base-encode-decode](https://github.com/saxonnicholls/base-encode-decode), whose 2-bit ACGT packing suggested the alphabet but is not linked |
 | [time_master_demo](demos/time_master_demo.cpp) | `make demo-timemaster` | a production periodic-event scheduler (TimeMaster) rebuilt on [`event_loop`](#event_loop) in ~60 lines: closures at intervals, add-while-running from any thread, cancel by id, drift-free *and* burst-free cadence asserted, teardown measured in microseconds — and the whole scheduler is a moveable value, which its Boost.Asio ancestor never was |
 
 For the pcap demo, bring your own data — `./build/pcap_replay_demo capture.pcap` — or capture live traffic with [scripts/capture_pcap.sh](scripts/capture_pcap.sh), which auto-detects your default interface (`en0` on macOS, `eth0`-style on Linux), runs `sudo tcpdump -s 0 -w`, and prints the replay command. Public capture files to experiment with are indexed at [netresec.com/?page=PcapFiles](https://www.netresec.com/?page=PcapFiles) — note that many are pcapng or gzipped, and the reader takes classic pcap, so convert first: `tcpdump -r in.pcapng -w out.pcap`. Without any file, the demo synthesises a capture, so it always runs.
+
+**What the BWT demo measures**, since it is the one demo whose number is about this library rather than about the demo (`--bases N` to reproduce):
+
+| bases | serial | parallel (32 threads) | speedup |
+|---:|---:|---:|---:|
+| 100,000 | 27.6 ms | 9.9 ms | 2.79× |
+| 400,000 | 138.7 ms | 38.9 ms | 3.57× |
+| 1,600,000 | 791.0 ms | 177.0 ms | 4.47× |
+| 6,400,000 | 6,902.9 ms | 1,517.9 ms | **4.55×** |
+
+It climbs as per-round overhead amortises, then plateaus on [`parallel_sort`](#parallel-algorithms)'s own measured ceiling of 4.7× — which is what log2(n) synchronising rounds predict, and the prediction was written into the demo before it was measured.
+
+Two things that number is **not**. The serial baseline is the *same code path with a one-worker pool*, so this measures what parallelism buys this implementation, not that it beats a serial BWT. And it doesn't: prefix doubling is O(n log²n), while `libdivsufsort` and SA-IS are O(n) and would beat this baseline single-threaded before any parallelism enters. It is 4.55× faster than itself. The demo exists to show the primitives composing with an honest number attached, not to compete with specialised suffix-array libraries.
 
 ## thread_pool
 
