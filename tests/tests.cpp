@@ -835,8 +835,49 @@ void test_everything_in_one_object()
 
 } // namespace
 
-int main()
+// ./build/tests                  every suite, as always
+// ./build/tests concurrency       only the suites whose bugs are interleavings
+//
+// The filter exists so the concurrency suites can be run MANY times under a
+// sanitizer without paying for the HTTP, WebSocket and logging suites each
+// round. Race detection is probabilistic: a single green TSan run is weak
+// evidence for a library whose entire subject is concurrency, and the cheapest
+// way to strengthen it is repetition of the part that can actually race.
+int main(int argc, char** argv)
 {
+    bool concurrency_only = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "concurrency")
+            concurrency_only = true;
+
+    if (concurrency_only) {
+        test_atomic_basics();
+        test_atomic_copy_move();
+        test_atomic_threaded();
+        test_atomic_in_container();
+        test_atomic_flag();
+        test_mutex_basics();
+        test_mutex_exclusion();
+        test_mutex_move();
+        test_mutex_variants();
+        test_spin_lock();
+        test_condition_variable();
+        test_condition_variable_any();
+        run_synchronized_tests();
+        run_circular_buffer_tests();
+        run_disruptor_tests();
+        run_signal_tests();
+        run_mpmc_queue_tests();
+        run_thread_pool_tests();
+        run_parallel_for_tests();
+        test_once_flag();
+        test_semaphore();
+        test_latch();
+        test_barrier();
+        std::cout << "\nAll " << tests_run << " concurrency tests passed\n";
+        return 0;
+    }
+
     test_constexpr_and_noexcept();
     test_zero_size_overhead();
 

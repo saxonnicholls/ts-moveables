@@ -42,6 +42,7 @@ jobs:
             os: ubuntu-24.04-arm
             cxx: clang++
             tsan: true
+            asan: true
           - name: macOS ARM64 Apple Clang
             os: macos-latest
             cxx: c++
@@ -71,10 +72,10 @@ jobs:
         run: python3 scripts/check_version.py
 
       - name: Unit tests (C++17)
-        run: make clean && make test CXX=${{ matrix.cxx }} STD=c++17
+        run: make clean && make test CXX=${{ matrix.cxx }} STD=c++17 EXTRA_FLAGS=-Werror
 
       - name: Unit tests (C++20)
-        run: make clean && make test CXX=${{ matrix.cxx }} STD=c++20
+        run: make clean && make test CXX=${{ matrix.cxx }} STD=c++20 EXTRA_FLAGS=-Werror
 
       - name: Demo
         run: make demo CXX=${{ matrix.cxx }} STD=c++20
@@ -293,6 +294,20 @@ jobs:
             echo ""
             ./build/bench_compare --markdown --compare-only
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # The same suite with the optimiser off. Not redundant: -O0 is different
+      # code, schedules threads differently, widens the window a race can be
+      # caught in, and revives asserts that -O2 folded away.
+      - name: Unit tests (-O0, asserts live)
+        run: make test-debug CXX=${{ matrix.cxx }} STD=c++20 EXTRA_FLAGS=-Werror
+
+      # Race detection is probabilistic, so one green TSan run is weak evidence
+      # for a library whose whole subject is concurrency. This repeats only the
+      # suites whose bugs are interleavings (93 of 214), which is what makes
+      # repetition affordable.
+      - name: TSan stress (concurrency suites, repeated)
+        if: ${{ matrix.tsan }}
+        run: make stress CXX=${{ matrix.cxx }} STD=c++20 STRESS_RUNS=20
 
       - name: ThreadSanitizer
         if: ${{ matrix.tsan }}

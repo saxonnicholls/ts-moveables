@@ -15,6 +15,14 @@ CXX      ?= c++
 STD      ?= c++20
 CXXFLAGS ?= -std=$(STD) -Wall -Wextra -pedantic -O2 -g
 
+# Appended rather than folded into CXXFLAGS, because CXXFLAGS is ?= and a
+# caller overriding it would otherwise drop -std and the warning flags with it.
+# CI passes EXTRA_FLAGS=-Werror: a warning that nobody has to act on is a
+# warning that stays forever, and this library is deployed somewhere that
+# cannot afford one to be the interesting kind.
+EXTRA_FLAGS ?=
+CXXFLAGS += $(EXTRA_FLAGS)
+
 # Some targets (notably Clang on AArch64 Linux) lower std::atomic operations
 # such as is_lock_free() to libatomic calls instead of inlining them
 UNAME_S  := $(shell uname -s)
@@ -38,6 +46,9 @@ build/tests_tsan: $(TEST_SRC) $(HEADERS) | build
 
 build/tests_asan: $(TEST_SRC) $(HEADERS) | build
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined $(TEST_SRC) -o $@ $(LDLIBS)
+
+build/tests_o0: $(TEST_SRC) $(HEADERS) | build
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O0 -g $(EXTRA_FLAGS) -pthread $(TEST_SRC) -o $@ $(LDLIBS)
 
 build/demo: TSMoveables/main.cpp $(HEADERS) | build
 	$(CXX) $(CXXFLAGS) -pthread TSMoveables/main.cpp -o $@ $(LDLIBS)
@@ -101,6 +112,27 @@ check-tests:
 # One release, one number - checked rather than remembered.
 check-version:
 	python3 scripts/check_version.py
+
+# The same suite with the optimiser off. Not redundant with `test`: -O0 keeps
+# different code, schedules threads differently and widens the windows a race
+# has to be caught in, and an assert that -O2 folded away is live again here.
+test-debug: build/tests_o0
+	./build/tests_o0
+
+# Race detection is probabilistic, so one green TSan run is weak evidence for a
+# library whose whole subject is concurrency. This runs only the suites whose
+# bugs are interleavings - 93 of the 214 - repeatedly under TSan, which is the
+# cheapest way to turn "no race observed once" into something worth saying.
+STRESS_RUNS ?= 20
+stress: build/tests_tsan
+	@for i in $$(seq 1 $(STRESS_RUNS)); do \
+	    printf 'tsan concurrency run %s/%s ... ' "$$i" "$(STRESS_RUNS)"; \
+	    TSAN_OPTIONS="suppressions=tests/tsan.supp halt_on_error=1" \
+	        ./build/tests_tsan concurrency > /tmp/stress.$$$$.log 2>&1 \
+	        || { echo FAILED; cat /tmp/stress.$$$$.log; rm -f /tmp/stress.$$$$.log; exit 1; }; \
+	    echo ok; rm -f /tmp/stress.$$$$.log; \
+	done
+	@echo "$(STRESS_RUNS) TSan runs of the concurrency suites: clean"
 
 test: build/tests
 	./build/tests
@@ -314,4 +346,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
