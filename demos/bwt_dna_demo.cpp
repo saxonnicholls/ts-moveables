@@ -237,9 +237,14 @@ void check(bool ok, const char* what)
 int main(int argc, char** argv)
 {
     bool quick = false;
-    for (int i = 1; i < argc; ++i)
-        if (std::string(argv[i]) == "--quick")
+    std::size_t bases = 0;                  // 0 = use the built-in size
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--quick")
             quick = true;
+        else if (a == "--bases" && i + 1 < argc)
+            bases = static_cast<std::size_t>(std::stoull(argv[++i]));
+    }
 
     work_stealing_task_pool pool;
     std::printf("Burrows-Wheeler over DNA - parallel_sort + parallel_scan, %zu workers\n\n",
@@ -263,7 +268,7 @@ int main(int argc, char** argv)
 
     // ------------------------------------------------ round-trip at size
     {
-        const std::size_t n = quick ? 50000 : 400000;
+        const std::size_t n = bases ? bases : (quick ? 50000 : 400000);
         const std::string dna = make_dna(n, 20260929u);
         const auto t0 = clk::now();
         const std::string t = bwt_forward(pool, dna + sentinel);
@@ -288,7 +293,7 @@ int main(int argc, char** argv)
 
     // ------------------------------------------------ serial vs parallel
     {
-        const std::size_t n = quick ? 50000 : 400000;
+        const std::size_t n = bases ? bases : (quick ? 50000 : 400000);
         const std::string dna = make_dna(n, 7u) + sentinel;
 
         mutex_task_pool one(1);             // worker_count()==1 takes every serial path
