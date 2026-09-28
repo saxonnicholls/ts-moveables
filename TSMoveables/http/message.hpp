@@ -369,6 +369,7 @@ public:
     std::string body;
     bool keep_alive = true;
     std::unordered_map<std::string, std::string> params;    // ":name" captures
+    std::string peer;                   // the client's address, numeric
 
     // Reset for reuse without releasing a single allocation. The strings keep
     // their capacity and the header vector keeps its buffer, so a connection
@@ -385,6 +386,7 @@ public:
         body.clear();
         keep_alive = true;
         params.clear();
+        peer.clear();
     }
 
     const std::string* header(const char* name) const noexcept { return headers.find(name); }

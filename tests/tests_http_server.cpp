@@ -872,6 +872,104 @@ void test_server_streaming()
     pass("http server: streamed responses (chunked, sized, dropped, keep-alive)");
 }
 
+// A producer on a worker must learn the client has gone from write() itself -
+// the only signal it has. A posted task holds the session alive, so a steady
+// writer used to keep a closed connection looking open for as long as it wrote.
+void test_server_stream_notices_disconnect()
+{
+    running_server s;
+    std::atomic<bool> producer_stopped{false};
+    std::atomic<int> writes{0};
+    std::thread producer;
+    s.srv.get("/feed", [&](const request&, responder r) {
+        auto out = r.stream(response(200).type("text/event-stream"));
+        // Steady, throttled only by pending(): there is always a write in
+        // flight, which is exactly the case lifetime alone cannot detect
+        producer = std::thread([&, out = std::move(out)]() mutable {
+            while (out.write("data: tick\n\n")) {
+                writes.fetch_add(1);
+                if (out.pending() > 64u * 1024)
+                    std::this_thread::yield();
+            }
+            producer_stopped.store(true);
+        });
+    });
+    s.start();
+
+    {
+        client c(s.port);
+        c.send_raw("GET /feed HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert(c.pump());                       // the stream is flowing
+        spin_until([&] { return writes.load() > 3; });
+    }                                           // client closes mid-stream
+
+    assert(spin_until_for([&] { return producer_stopped.load(); },
+                          std::chrono::milliseconds(3000)));
+    producer.join();
+    pass("http server: a worker's stream write() fails once the client is gone");
+}
+
+// abort() must not look like end(): the client has to be able to tell the
+// fragment of a failed body from a finished one
+void test_server_stream_abort()
+{
+    running_server s;
+    s.srv.get("/broken", [](const request&, responder r) {
+        auto out = r.stream(response(200).type("text/plain"));
+        out.write("partial");
+        std::thread([out = std::move(out)]() mutable { out.abort(); }).join();
+    });
+    s.srv.get("/ok", [](const request&, responder r) { r.send(200, "text/plain", "ok"); });
+    s.start();
+
+    client c(s.port);
+    c.send_raw("GET /broken HTTP/1.1\r\nHost: t\r\n\r\n");
+    std::string raw;
+    assert(c.read_until_eof(raw));              // HTTP/1.1 can only close
+    assert(raw.find("Transfer-Encoding: chunked") != std::string::npos);
+    assert(raw.find("partial") != std::string::npos);
+    assert(raw.find("\r\n0\r\n\r\n") == std::string::npos);    // no terminal chunk
+
+    assert(get_line(s.port, "/ok") == "200 ok");   // the server carries on
+    pass("http server: an aborted stream closes without a terminal chunk");
+}
+
+// The first half of a graceful stop: no new connections, and the ones already
+// open are still served
+void test_server_stop_accepting_and_peer()
+{
+    running_server s;
+    s.srv.get("/peer", [](const request& q, responder r) { r.send(200, "text/plain", q.peer); });
+    s.start();
+
+    client kept(s.port);
+    int status = 0;
+    std::string head, body;
+    kept.send_raw("GET /peer HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert(kept.read_response(status, head, body));
+    assert(status == 200 && body == "127.0.0.1");
+
+    std::atomic<bool> closed{false};
+    s.srv.loop().make_poster().post([&] {
+        s.srv.stop_accepting();
+        closed.store(true);
+    });
+    spin_until([&] { return closed.load(); });
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(s.port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0);
+    ::close(fd);
+
+    kept.send_raw("GET /peer HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert(kept.read_response(status, head, body));
+    assert(status == 200);
+    pass("http server: stop_accepting() keeps open connections; request carries the peer");
+}
+
 void test_server_timeouts()
 {
     server_config cfg;
@@ -911,6 +1009,9 @@ void run_http_server_tests()
     test_server_async_responders();
     test_server_taps_and_moveability();
     test_server_streaming();
+    test_server_stream_notices_disconnect();
+    test_server_stream_abort();
+    test_server_stop_accepting_and_peer();
     test_server_timeouts();
 }
 

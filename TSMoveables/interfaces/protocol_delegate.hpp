@@ -97,6 +97,13 @@ public:
     virtual void stream_write(std::uint64_t /*stream*/, const char* /*data*/,
                               std::size_t /*n*/, connection_host& /*host*/) {}
     virtual void end_stream(std::uint64_t /*stream*/, connection_host& /*host*/) {}
+
+    // End a streamed response as a failure rather than a completion, so the
+    // client can tell a truncated body from a finished one. end_stream() would
+    // send the terminal chunk and make the fragment look whole. Returns false
+    // when the protocol cannot fail one exchange on its own - HTTP/1.1 has no
+    // way to - and the connection is closed instead. HTTP/2 resets the stream.
+    virtual bool abort_stream(std::uint64_t /*stream*/, connection_host& /*host*/) { return false; }
 };
 
 } // namespace http

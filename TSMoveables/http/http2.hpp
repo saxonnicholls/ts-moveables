@@ -1186,6 +1186,15 @@ public:
         last_bytes_ += pump(host);
     }
 
+    // One stream fails; the connection and its other streams carry on
+    bool abort_stream(std::uint64_t sid, connection_host& host) override
+    {
+        detail::h2_stream* s = find(std::uint32_t(sid));
+        if (s && !s->end_sent)
+            stream_error(host, std::uint32_t(sid), h2_error::internal_error);
+        return true;
+    }
+
     // Everything the send windows have refused so far, across every stream.
     //
     // Summed rather than carried as a running counter: the value is wanted
