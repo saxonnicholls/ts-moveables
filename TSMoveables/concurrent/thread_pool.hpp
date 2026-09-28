@@ -165,7 +165,8 @@ namespace snicholls
 
         void submit(task t) override {
             c_->comp.add();
-            c_->q.update([&t](detail::task_queue& d) { d.push_back(std::move(t)); });
+            // One task, one worker: waking them all is a thundering herd
+            c_->q.update_one([&t](detail::task_queue& d) { d.push_back(std::move(t)); });
         }
         void wait_idle() override { c_->comp.wait(); }
         std::size_t worker_count() const noexcept override { return c_->workers.size(); }
