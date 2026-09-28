@@ -83,7 +83,8 @@ if(TS_MOVEABLES_BUILD_TESTS)
     target_compile_definitions(ts_moveables_signal_slot_demo PRIVATE NDEBUG)
 
     foreach(demo capture_replay_demo pcap_replay_demo taskflow_style_demo time_master_demo
-                 http_server_demo webhook_ws_hub_demo replay_loop_demo drone_fleet_demo)
+                 http_server_demo webhook_ws_hub_demo replay_loop_demo drone_fleet_demo
+                 bwt_dna_demo)
         add_executable(ts_moveables_${demo} demos/${demo}.cpp)
         target_link_libraries(ts_moveables_${demo} PRIVATE snicholls::ts_moveables)
         target_compile_definitions(ts_moveables_${demo} PRIVATE NDEBUG)

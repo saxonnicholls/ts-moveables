@@ -69,6 +69,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | **run a loop across cores** | [`parallel_for`](#parallel_for) / `parallel_for_each` — over any `task_pool`, blocking, exception-propagating |
 | **unroll a loop at compile time**, or index by a constant | [`constexpr_for`](#constexpr_for) — a step, nested to any depth, and the index as a template argument |
 | **fork/join a few tasks** and wait | [`task_group`](#task_group) — run, wait, first exception rethrown; safe to nest |
+| **run a dependency graph**, or ask what can run at once | [`task_graph`](#task_graph) — level-synchronous, reports its own `depth()` and `width()` |
 | **reduce / map-reduce** a range | [`parallel_reduce`](#parallel-algorithms) — deterministic, only needs associativity |
 | a **prefix scan**, or a **parallel sort** | [`parallel_inclusive_scan`](#parallel-algorithms), [`parallel_sort`](#parallel-algorithms) |
 | an **event loop** for fds and timers without the usual scars | [`event_loop`](#event_loop) — POSIX reactor, typed dispatch, loud contracts |
@@ -636,6 +637,31 @@ g.wait();                            // both done, or the first throw rethrown h
 Exceptions are collected, not lost: the first one is rethrown from `wait()` after every other task has finished. The destructor waits, because every task captures the caller's frame and returning from it early is a dangling reference, not a race you might get away with — a forgotten `wait()` should stall visibly rather than corrupt quietly.
 
 **The waiting thread runs tasks too**, and that is what makes a group safe to nest. A group waited on from inside a pool task occupies a worker; if every worker did that, no thread would be left to run what they are all waiting for. So `run()` keeps the closure in the group as well as offering it to the pool, exactly one of the two executes it, and `wait()` runs whatever nobody started. Nested groups degrade to serial instead of deadlocking — tested on a deliberately two-worker pool.
+
+## task_graph
+
+A dependency graph, executed level by level:
+
+```cpp
+snicholls::task_graph g(pool);
+const auto fetch = g.add([&] { data = fetch_it(); });
+const auto parse = g.add([&] { tree = parse(data); });
+g.precede(fetch, parse);
+g.run();
+```
+
+`precede` is spelled the way [stl-topological-sorting](https://github.com/saxonnicholls/stl-topological-sorting) spells it, because it's the same relation.
+
+**It answers a different question from a topological sort.** A sequential topo sort answers *in what order may these run?* and returns one linearisation. This returns **levels** — antichains, where every node has its dependencies satisfied by earlier levels and none by its neighbours, so the whole level runs at once. That set is the useful product; the linear order is a by-product of concatenating the levels. If a linear order is all you want, a sequential sort is the better tool.
+
+**The ceiling is a property of the graph, not the machine**, which is why `depth()` and `width()` are public:
+
+- **`width()`** — the largest level, i.e. the most parallelism that exists. Eight cores don't help a graph whose widest level is three.
+- **`depth()`** — the number of levels, i.e. the critical path. A hard serial floor: a 10,000-node chain has depth 10,000 and width 1, and runs at exactly serial speed on any number of cores.
+
+Every level also pays a join, so a deep narrow graph can finish *slower* than running it on one thread. Those two numbers are what explain a disappointing speedup; a benchmark reporting speedup without them isn't reporting anything. Cycles are refused loudly, with a count of how many nodes are stuck.
+
+This is deliberately **not** a graph library — no traversal, no shortest path, no components. Just enough to say what can run together, and a runner that does it.
 
 ## Parallel algorithms
 

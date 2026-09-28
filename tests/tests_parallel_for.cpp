@@ -17,6 +17,7 @@
 #include "test_helpers.hpp"
 
 #include "../TSMoveables/concurrent/parallel_for.hpp"
+#include "../TSMoveables/concurrent/task_graph.hpp"
 #include "../TSMoveables/concurrent/task_group.hpp"
 #include "../TSMoveables/concurrent/thread_pool.hpp"
 #include "../TSMoveables/moveable/mutex.hpp"
@@ -635,6 +636,130 @@ void test_parallel_stable_sort_is_stable()
     pass("parallel_stable_sort: equal keys keep their original order");
 }
 
+// ---------------------------------------------------------------- task_graph
+
+void test_task_graph_levels_and_order()
+{
+    // A diamond: a must precede b and c, both must precede d. Two levels of
+    // one, one level of two - so depth 3, width 2.
+    work_stealing_task_pool pool(4);
+    task_graph g(pool);
+
+    moveable_mutex<> mtx;
+    std::vector<int> order;
+    auto record = [&](int id) {
+        std::lock_guard<moveable_mutex<>> l(mtx);
+        order.push_back(id);
+    };
+
+    const auto a = g.add([&] { record(0); });
+    const auto b = g.add([&] { record(1); });
+    const auto c = g.add([&] { record(2); });
+    const auto d = g.add([&] { record(3); });
+    g.precede(a, b);
+    g.precede(a, c);
+    g.precede(b, d);
+    g.precede(c, d);
+
+    assert(g.size() == 4);
+    assert(g.depth() == 3);
+    assert(g.width() == 2);
+    assert(g.levels()[1].size() == 2);          // b and c together
+
+    g.run();
+    assert(order.size() == 4);
+    assert(order.front() == 0);                 // a first, always
+    assert(order.back() == 3);                  // d last, always
+
+    pass("task_graph: levels are antichains, and dependencies are respected");
+}
+
+void test_task_graph_reports_its_own_ceiling()
+{
+    // The two numbers that explain a disappointing speedup. A chain has no
+    // parallelism at all whatever the core count; a fully independent set is
+    // all parallelism and one level.
+    work_stealing_task_pool pool(4);
+
+    task_graph chain(pool);
+    std::vector<task_graph::node_id> n;
+    for (int i = 0; i < 50; ++i)
+        n.push_back(chain.add([] {}));
+    for (int i = 1; i < 50; ++i)
+        chain.precede(n[std::size_t(i - 1)], n[std::size_t(i)]);
+    assert(chain.depth() == 50);                // critical path: a serial floor
+    assert(chain.width() == 1);                 // no two nodes may ever overlap
+
+    task_graph wide(pool);
+    std::atomic<int> ran{0};
+    for (int i = 0; i < 64; ++i)
+        wide.add([&] { ran.fetch_add(1); });
+    assert(wide.depth() == 1);
+    assert(wide.width() == 64);
+    wide.run();
+    assert(ran.load() == 64);
+
+    pass("task_graph: depth and width report the graph's own parallelism limit");
+}
+
+void test_task_graph_refuses_a_cycle()
+{
+    work_stealing_task_pool pool(2);
+    task_graph g(pool);
+    const auto a = g.add();
+    const auto b = g.add();
+    const auto c = g.add();
+    g.precede(a, b);
+    g.precede(b, c);
+    g.precede(c, a);                            // closes the loop
+
+    bool caught = false;
+    try {
+        g.levels();
+    } catch (const task_graph_cycle& e) {
+        caught = true;
+        assert(e.stuck() == 3);                 // and it says how much is stuck
+    }
+    assert(caught);
+
+    // A self-edge is refused at the point of the mistake rather than surfacing
+    // much later as an unsatisfiable graph.
+    bool self_caught = false;
+    try {
+        task_graph h(pool);
+        const auto x = h.add();
+        h.precede(x, x);
+    } catch (const std::invalid_argument&) {
+        self_caught = true;
+    }
+    assert(self_caught);
+
+    pass("task_graph: a cycle is refused loudly, with the count of stuck nodes");
+}
+
+void test_task_graph_stops_at_a_failed_level()
+{
+    // A node whose dependency threw must not run: it was waiting on the thing
+    // that failed, so running it would be running on unfinished input.
+    work_stealing_task_pool pool(4);
+    task_graph g(pool);
+    std::atomic<int> later{0};
+    const auto a = g.add([] { throw std::runtime_error("boom"); });
+    const auto b = g.add([&] { later.fetch_add(1); });
+    g.precede(a, b);
+
+    bool caught = false;
+    try {
+        g.run();
+    } catch (const std::runtime_error& e) {
+        caught = std::string(e.what()) == "boom";
+    }
+    assert(caught);
+    assert(later.load() == 0);                  // the dependent level never ran
+
+    pass("task_graph: a throwing node stops the levels that depended on it");
+}
+
 } // namespace
 
 void run_parallel_for_tests()
@@ -664,4 +789,8 @@ void run_parallel_for_tests()
     test_parallel_scan_matches_std();
     test_parallel_sort_matches_std();
     test_parallel_stable_sort_is_stable();
+    test_task_graph_levels_and_order();
+    test_task_graph_reports_its_own_ceiling();
+    test_task_graph_refuses_a_cycle();
+    test_task_graph_stops_at_a_failed_level();
 }

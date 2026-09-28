@@ -98,6 +98,7 @@ MOVEABLE(sharded_task_pool);
 MOVEABLE(dispatch_task_pool);
 MOVEABLE(mpmc_task_pool);
 MOVEABLE(work_stealing_task_pool);
+MOVEABLE(task_graph);
 
 // ------------------------------------------------ the reactor and its users
 MOVEABLE(event_loop);
