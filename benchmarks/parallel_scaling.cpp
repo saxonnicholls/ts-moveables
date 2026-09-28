@@ -28,6 +28,7 @@
 //
 
 #include "../TSMoveables/concurrent/parallel_for.hpp"
+#include "../TSMoveables/concurrent/task_group.hpp"
 #include "../TSMoveables/concurrent/thread_pool.hpp"
 #include "../TSMoveables/utils/constexpr_for.hpp"
 
@@ -36,6 +37,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <functional>
+#include <numeric>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -274,6 +278,76 @@ int main(int argc, char** argv)
         std::printf("  The value here is not speed - it is that I and J are constant\n"
                     "  expressions, so std::get<I>, template arguments and fixed-size\n"
                     "  kernels become possible at all.\n");
+    }
+
+    // ------------------------------------------------- reduce / scan / sort
+    //
+    // The three algorithms against their serial equivalents. Each has a
+    // different ceiling and it is worth seeing all three together: reduce is
+    // one pass and scales like parallel_for; scan is two passes over the data,
+    // so it starts from behind; sort loses parallelism every merge round.
+    {
+        rule("reduce / scan / sort against the serial equivalent");
+        std::printf("  %-26s %12s %12s %10s\n", "algorithm", "serial ms", "parallel ms", "speedup");
+        work_stealing_task_pool pool(hw);
+
+        const std::size_t n = std::size_t{1} << (23 - shift);
+        std::vector<double> v(n), out(n);
+        for (std::size_t i = 0; i < n; ++i)
+            v[i] = double(i % 1000) * 0.5;
+
+        const double s_red = best_ms(runs, [&] {
+            volatile double t = std::accumulate(v.begin(), v.end(), 0.0);
+            (void)t;
+        });
+        const double p_red = best_ms(runs, [&] {
+            volatile double t = parallel_reduce(pool, std::size_t{0}, n, 0.0,
+                                                [&](std::size_t i) { return v[i]; },
+                                                std::plus<double>{});
+            (void)t;
+        });
+        std::printf("  %-26s %12.2f %12.2f %9.2fx\n", "reduce (sum)", s_red, p_red, s_red / p_red);
+
+        const double s_scan = best_ms(runs, [&] {
+            std::inclusive_scan(v.begin(), v.end(), out.begin(), std::plus<double>{}, 0.0);
+        });
+        const double p_scan = best_ms(runs, [&] {
+            parallel_inclusive_scan(pool, v.begin(), v.end(), out.begin(), 0.0, std::plus<double>{});
+        });
+        std::printf("  %-26s %12.2f %12.2f %9.2fx\n", "inclusive_scan", s_scan, p_scan, s_scan / p_scan);
+
+        std::mt19937 rng(7);
+        std::vector<int> base(n);
+        for (std::size_t i = 0; i < n; ++i)
+            base[i] = int(rng());
+        std::vector<int> a, b;
+        const double s_sort = best_ms(runs, [&] { a = base; std::sort(a.begin(), a.end()); });
+        const double p_sort = best_ms(runs, [&] { b = base; parallel_sort(pool, b.begin(), b.end()); });
+        std::printf("  %-26s %12.2f %12.2f %9.2fx\n", "sort (int)", s_sort, p_sort, s_sort / p_sort);
+
+        std::printf("\n  scan does two passes over the data where the serial one does a single\n"
+                    "  pass, so it starts a factor behind and needs cores to climb back. sort\n"
+                    "  halves its parallelism every merge round - the last round is one merge on\n"
+                    "  one thread - so neither reaches the core count, and neither should be\n"
+                    "  expected to.\n");
+    }
+
+    // ------------------------------------------------------------ task_group
+    {
+        rule("task_group - what one fork/join costs");
+        std::printf("  %-26s %14s\n", "tasks per group", "ms per group");
+        work_stealing_task_pool pool(hw);
+        for (std::size_t t : {std::size_t{1}, std::size_t{8}, std::size_t{64}, std::size_t{512}}) {
+            std::atomic<std::size_t> sink{0};
+            const int iters = quick ? 20 : 100;
+            const double ms = best_ms(iters, [&] {
+                task_group g(pool);
+                for (std::size_t i = 0; i < t; ++i)
+                    g.run([&] { sink.fetch_add(1, std::memory_order_relaxed); });
+                g.wait();
+            });
+            std::printf("  %-26zu %14.4f\n", t, ms);
+        }
     }
 
     if (markdown) std::printf("```\n");

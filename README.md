@@ -68,6 +68,9 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | **run tasks on a pool** | [`task_pool`](#thread_pool) — `work_stealing_` for fork-join, `mpmc_` for general submit, `dispatch_` for a single feed |
 | **run a loop across cores** | [`parallel_for`](#parallel_for) / `parallel_for_each` — over any `task_pool`, blocking, exception-propagating |
 | **unroll a loop at compile time**, or index by a constant | [`constexpr_for`](#constexpr_for) — a step, nested to any depth, and the index as a template argument |
+| **fork/join a few tasks** and wait | [`task_group`](#task_group) — run, wait, first exception rethrown; safe to nest |
+| **reduce / map-reduce** a range | [`parallel_reduce`](#parallel-algorithms) — deterministic, only needs associativity |
+| a **prefix scan**, or a **parallel sort** | [`parallel_inclusive_scan`](#parallel-algorithms), [`parallel_sort`](#parallel-algorithms) |
 | an **event loop** for fds and timers without the usual scars | [`event_loop`](#event_loop) — POSIX reactor, typed dispatch, loud contracts |
 | an **HTTP server** that does not park a thread per connection | [`http_server`](#http_server) — routes, async responders, or one drop-in header |
 | **WebSockets**, or `wss` | [`websocket`](#websocket) — Autobahn-clean, one route handler |
@@ -618,6 +621,49 @@ There is **no global pool and no implicit parallelism** — you pass the pool yo
 The second row is the one worth publishing. A streaming body stops scaling long before it runs out of threads, and a benchmark that only showed the first row would be advertising. Efficiency above 100% at 2–4 workers is cache residency, not magic: each worker's slice fits a private cache level the whole array did not.
 
 The parallel call pays for itself from roughly **128 elements** of a non-trivial body and loses below that — the crossover is printed too, because it is the number a caller actually needs. The default grain lands within 5% of the best hand-picked value; grain 1 is 10× worse.
+
+## task_group
+
+Fork/join over any pool — the shape most divide-and-conquer code actually wants:
+
+```cpp
+snicholls::task_group g(pool);
+g.run([&] { left  = solve(a); });
+g.run([&] { right = solve(b); });
+g.wait();                            // both done, or the first throw rethrown here
+```
+
+Exceptions are collected, not lost: the first one is rethrown from `wait()` after every other task has finished. The destructor waits, because every task captures the caller's frame and returning from it early is a dangling reference, not a race you might get away with — a forgotten `wait()` should stall visibly rather than corrupt quietly.
+
+**The waiting thread runs tasks too**, and that is what makes a group safe to nest. A group waited on from inside a pool task occupies a worker; if every worker did that, no thread would be left to run what they are all waiting for. So `run()` keeps the closure in the group as well as offering it to the pool, exactly one of the two executes it, and `wait()` runs whatever nobody started. Nested groups degrade to serial instead of deadlocking — tested on a deliberately two-worker pool.
+
+## Parallel algorithms
+
+Built on the same chunk engine as [`parallel_for`](#parallel_for), so they inherit its claiming, its exception handling and its caller-participates nesting safety.
+
+```cpp
+double total = parallel_reduce(pool, 0, n, 0.0,
+                               [&](int i) { return v[i] * w[i]; },   // map
+                               std::plus<double>{});                 // reduce
+
+parallel_inclusive_scan(pool, v.begin(), v.end(), out.begin(), 0.0, std::plus<double>{});
+parallel_sort(pool, v.begin(), v.end());
+parallel_stable_sort(pool, v.begin(), v.end(), std::greater<>{});
+```
+
+`parallel_reduce` **is** map-reduce — the `map` is the transform — which is why there's no separate `parallel_map_reduce`.
+
+**Its result is deterministic**, and that's the decision worth knowing about. Each chunk folds locally, then the per-chunk results fold **in chunk order, never completion order**, so the answer doesn't depend on how the scheduler interleaved the work and a floating-point sum is reproducible run to run. Completion-ordered reduction is the obvious implementation, and what TBB's `parallel_reduce` does by default; it's also how a total that won't reconcile ends up in a support ticket. Verified bit-identical across 50 runs. A useful consequence: `reduce` must be **associative but need not be commutative**, so string concatenation and matrix products are safe here.
+
+**Measured** (`make bench-parallel`, 32 threads, 8M elements):
+
+| algorithm | serial | parallel | speedup | ceiling |
+|---|---|---|---|---|
+| `parallel_reduce` (sum) | 9.6 ms | 0.61 ms | **15.7×** | one pass — scales like `parallel_for` |
+| `parallel_inclusive_scan` | 11.1 ms | 2.4 ms | **4.6×** | traverses the data **twice** |
+| `parallel_sort` (int) | 356.5 ms | 75.3 ms | **4.7×** | each merge round halves parallelism |
+
+The last two columns are the honest part. A scan does two passes where the serial version does one, so it starts a factor behind and needs cores to climb back. A sort loses half its parallelism every merge round — the final round is a single merge on one thread. Neither reaches the core count, and neither should be expected to.
 
 ## constexpr_for
 

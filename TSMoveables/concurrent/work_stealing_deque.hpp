@@ -63,6 +63,27 @@ namespace snicholls
         work_stealing_deque(const work_stealing_deque&) = delete;
         work_stealing_deque& operator=(const work_stealing_deque&) = delete;
 
+        // Immovable, and said out loud rather than left to fall out of the
+        // deleted copy above - which is what was happening, since a
+        // user-declared copy constructor suppresses the implicit move and
+        // nothing recorded that this was intended.
+        //
+        // It is the one type here that should NOT get the library's usual
+        // treatment. Everything else is moveable because immovability was
+        // imposed on it by a member and spread virally; this one is immovable
+        // because its address is part of its contract. Thieves hold a pointer
+        // to it and steal concurrently, so a live deque that moved would strand
+        // them mid-operation - the same reason a std::mutex cannot move, rather
+        // than an oversight to fix. work_stealing_task_pool accordingly keeps
+        // them in a std::deque for stable addresses and constructs in place.
+        //
+        // Deleting the move explicitly is what makes a later `= default` an
+        // argument rather than an accident, and turns
+        // std::vector<work_stealing_deque<T>> - which would reallocate and
+        // break live thieves silently - into a compile error.
+        work_stealing_deque(work_stealing_deque&&) = delete;
+        work_stealing_deque& operator=(work_stealing_deque&&) = delete;
+
         std::size_t capacity() const noexcept { return mask_ + 1; }
 
         // Owner only. Returns false if the deque is full.

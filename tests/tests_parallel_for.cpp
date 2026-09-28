@@ -17,14 +17,18 @@
 #include "test_helpers.hpp"
 
 #include "../TSMoveables/concurrent/parallel_for.hpp"
+#include "../TSMoveables/concurrent/task_group.hpp"
 #include "../TSMoveables/concurrent/thread_pool.hpp"
 #include "../TSMoveables/moveable/mutex.hpp"
 #include "../TSMoveables/utils/constexpr_for.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -410,6 +414,227 @@ void test_parallel_for_unrolled_matches_plain()
     pass("parallel_for<Unroll>: same result as the plain loop");
 }
 
+// ---------------------------------------------------------------- task_group
+
+void test_task_group_runs_all_and_waits()
+{
+    work_stealing_task_pool pool(4);
+    std::atomic<int> n{0};
+    {
+        task_group g(pool);
+        for (int i = 0; i < 200; ++i)
+            g.run([&] { n.fetch_add(1); });
+        g.wait();
+        assert(n.load() == 200);
+    }
+    // And the destructor waits too, so forgetting wait() stalls rather than
+    // letting tasks touch a dead frame.
+    std::atomic<int> m{0};
+    {
+        task_group g(pool);
+        for (int i = 0; i < 128; ++i)
+            g.run([&] { m.fetch_add(1); });
+    }
+    assert(m.load() == 128);
+
+    pass("task_group: runs every task, and the destructor waits");
+}
+
+void test_task_group_propagates_the_first_exception()
+{
+    work_stealing_task_pool pool(4);
+    std::atomic<int> ran{0};
+    bool caught = false;
+    try {
+        task_group g(pool);
+        g.run([&] { throw std::runtime_error("boom"); });
+        for (int i = 0; i < 64; ++i)
+            g.run([&] { ran.fetch_add(1); });
+        g.wait();
+    } catch (const std::runtime_error& e) {
+        caught = std::string(e.what()) == "boom";
+    }
+    assert(caught);
+    pass("task_group: the first exception reaches wait(), and it does not hang");
+}
+
+void test_task_group_nests_without_deadlock()
+{
+    // The case the waiting thread running tasks exists for: every worker is
+    // parked in an inner wait(), so if waiting were passive there would be no
+    // thread left to run what they are waiting for. Two workers, eight outer
+    // tasks - guaranteed to occupy them all.
+    work_stealing_task_pool pool(2);
+    std::atomic<int> n{0};
+    task_group outer(pool);
+    for (int i = 0; i < 8; ++i)
+        outer.run([&] {
+            task_group inner(pool);
+            for (int k = 0; k < 32; ++k)
+                inner.run([&] { n.fetch_add(1); });
+            inner.wait();
+        });
+    outer.wait();
+    assert(n.load() == 8 * 32);
+    pass("task_group: nested groups complete rather than deadlock");
+}
+
+// ------------------------------------------------------------------- reduce
+
+void test_parallel_reduce_matches_serial()
+{
+    work_stealing_task_pool pool;
+    const int n = 100000;
+    std::vector<double> v(n);
+    for (int i = 0; i < n; ++i)
+        v[i] = double((i % 97) + 1);
+
+    const double got = parallel_reduce(pool, 0, n, 0.0,
+                                       [&](int i) { return v[i]; }, std::plus<double>{});
+    const double want = std::accumulate(v.begin(), v.end(), 0.0);
+    assert(got == want);                    // exact: these are small integers in doubles
+
+    // Empty and single ranges.
+    assert(parallel_reduce(pool, 0, 0, 7.0, [&](int) { return 1.0; }, std::plus<double>{}) == 7.0);
+    assert(parallel_reduce(pool, 3, 4, 0.0, [&](int i) { return double(i); }, std::plus<double>{}) == 3.0);
+
+    pass("parallel_reduce: matches the serial fold, and handles empty ranges");
+}
+
+void test_parallel_reduce_is_deterministic()
+{
+    // The property the chunk-ordered fold buys. Values chosen so the sum is
+    // genuinely order-sensitive in floating point: without the ordering this
+    // varies run to run.
+    work_stealing_task_pool pool;
+    const int n = 200000;
+    std::vector<double> v(n);
+    for (int i = 0; i < n; ++i)
+        v[i] = 1.0 / double(i + 1);
+
+    const double first = parallel_reduce(pool, 0, n, 0.0,
+                                         [&](int i) { return v[i]; }, std::plus<double>{});
+    for (int r = 0; r < 50; ++r) {
+        const double again = parallel_reduce(pool, 0, n, 0.0,
+                                             [&](int i) { return v[i]; }, std::plus<double>{});
+        assert(again == first);             // bit for bit, whatever the scheduler did
+    }
+
+    pass("parallel_reduce: bit-identical across 50 runs, not completion-ordered");
+}
+
+void test_parallel_reduce_keeps_index_order()
+{
+    // Associativity is required; commutativity is NOT, because the fold runs in
+    // chunk order. String concatenation would scramble under a
+    // completion-ordered reduction.
+    work_stealing_task_pool pool;
+    std::vector<std::string> w;
+    for (char c = 'a'; c <= 'z'; ++c)
+        w.push_back(std::string(1, c));
+
+    const std::string got = parallel_reduce_each(
+        pool, w.begin(), w.end(), std::string{},
+        [](const std::string& s) { return s; },
+        [](std::string a, std::string b) { return a + b; }, 1);
+    assert(got == "abcdefghijklmnopqrstuvwxyz");
+
+    pass("parallel_reduce: folds in index order, so non-commutative ops are safe");
+}
+
+void test_parallel_reduce_propagates_exceptions()
+{
+    work_stealing_task_pool pool;
+    bool caught = false;
+    try {
+        parallel_reduce(pool, 0, 4096, 0,
+                        [&](int i) -> int { if (i == 2000) throw std::runtime_error("boom"); return 1; },
+                        std::plus<int>{});
+    } catch (const std::runtime_error& e) {
+        caught = std::string(e.what()) == "boom";
+    }
+    assert(caught);
+    pass("parallel_reduce: a throwing map propagates and does not hang");
+}
+
+// --------------------------------------------------------------------- scan
+
+void test_parallel_scan_matches_std()
+{
+    work_stealing_task_pool pool;
+    for (int n : {0, 1, 2, 3, 17, 1000, 100000}) {
+        const std::size_t sz = static_cast<std::size_t>(n);
+        std::vector<double> v(sz);
+        for (int i = 0; i < n; ++i)
+            v[static_cast<std::size_t>(i)] = double((i % 7) + 1);
+
+        std::vector<double> got(sz, -1.0), want(sz, -1.0);
+        const double total =
+            parallel_inclusive_scan(pool, v.begin(), v.end(), got.begin(), 0.0, std::plus<double>{});
+        std::inclusive_scan(v.begin(), v.end(), want.begin(), std::plus<double>{}, 0.0);
+        assert(got == want);
+        if (n)
+            assert(total == want.back());
+
+        std::vector<double> gotx(sz, -1.0), wantx(sz, -1.0);
+        parallel_exclusive_scan(pool, v.begin(), v.end(), gotx.begin(), 0.0, std::plus<double>{});
+        if (n)
+            std::exclusive_scan(v.begin(), v.end(), wantx.begin(), 0.0, std::plus<double>{});
+        assert(gotx == wantx);
+    }
+    pass("parallel_scan: inclusive and exclusive match std, across chunk boundaries");
+}
+
+// --------------------------------------------------------------------- sort
+
+void test_parallel_sort_matches_std()
+{
+    work_stealing_task_pool pool;
+    std::mt19937 rng(1234);
+    for (int n : {0, 1, 2, 3, 4097, 200000}) {
+        const std::size_t sz = static_cast<std::size_t>(n);
+        std::vector<int> v(sz);
+        for (int i = 0; i < n; ++i)
+            v[static_cast<std::size_t>(i)] = int(rng() % 1000);          // duplicates on purpose
+        std::vector<int> want = v;
+
+        parallel_sort(pool, v.begin(), v.end());
+        std::sort(want.begin(), want.end());
+        assert(v == want);
+    }
+
+    // A comparator other than less<>.
+    std::vector<int> g(50000);
+    for (std::size_t i = 0; i < g.size(); ++i)
+        g[i] = int(rng() % 100);
+    std::vector<int> gw = g;
+    parallel_sort(pool, g.begin(), g.end(), std::greater<>{});
+    std::sort(gw.begin(), gw.end(), std::greater<>{});
+    assert(g == gw);
+
+    pass("parallel_sort: matches std::sort, with duplicates and a comparator");
+}
+
+void test_parallel_stable_sort_is_stable()
+{
+    work_stealing_task_pool pool;
+    struct item { int key; int id; };
+    std::vector<item> v(40000);
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        v[i].key = int(i % 13);                             // many equal keys
+        v[i].id  = int(i);
+    }
+    parallel_stable_sort(pool, v.begin(), v.end(),
+                         [](const item& a, const item& b) { return a.key < b.key; });
+
+    for (std::size_t i = 1; i < v.size(); ++i) {
+        assert(v[i - 1].key <= v[i].key);
+        if (v[i - 1].key == v[i].key)
+            assert(v[i - 1].id < v[i].id);                  // equal keys kept their order
+    }
+    pass("parallel_stable_sort: equal keys keep their original order");
+}
+
 } // namespace
 
 void run_parallel_for_tests()
@@ -429,4 +654,14 @@ void run_parallel_for_tests()
     test_constexpr_nest_unrolls_nested_loops();
     test_unrolled_for_covers_range_and_tail();
     test_parallel_for_unrolled_matches_plain();
+    test_task_group_runs_all_and_waits();
+    test_task_group_propagates_the_first_exception();
+    test_task_group_nests_without_deadlock();
+    test_parallel_reduce_matches_serial();
+    test_parallel_reduce_is_deterministic();
+    test_parallel_reduce_keeps_index_order();
+    test_parallel_reduce_propagates_exceptions();
+    test_parallel_scan_matches_std();
+    test_parallel_sort_matches_std();
+    test_parallel_stable_sort_is_stable();
 }
