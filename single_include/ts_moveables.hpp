@@ -67,7 +67,7 @@
 
 #define SNICHOLLS_VERSION_MAJOR 1
 #define SNICHOLLS_VERSION_MINOR 3
-#define SNICHOLLS_VERSION_PATCH 0
+#define SNICHOLLS_VERSION_PATCH 1
 
 // Comparable in the preprocessor. Two decimal digits each for minor and patch,
 // which is plenty and keeps the number readable: 1.0.0 is 10000, 1.2.3 is
@@ -5360,10 +5360,28 @@ namespace snicholls
 
             bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
 
-            void rethrow_if_failed() const
+            // MOVES the exception out: after this the slot holds nothing, so the
+            // caller's local is the only owner of the exception object.
+            //
+            // That is the whole point, and the reason there is no
+            // rethrow-in-place counterpart. Rethrowing while the slot still owned
+            // it left the exception co-owned by shared state that OUTLIVES the
+            // call - a worker task holding the last shared_ptr destroys the state,
+            // and with it the exception_ptr, while the caller is still inside its
+            // catch block reading what(). That is an unsynchronised delete against
+            // a live read, and TSan found it on run 16 of 20 in CI: a write from
+            // ~runtime_error on a pool thread against a strlen on main. One run
+            // would never have seen it.
+            //
+            // With the exception moved out, no other thread has a reference left
+            // to drop, so the race cannot be expressed. The caller then rethrows
+            // from its local, which is the same shape std::future::get() uses.
+            std::exception_ptr take()
             {
-                if (error_)
-                    std::rethrow_exception(error_);
+                std::lock_guard<std::mutex> g(m_);
+                std::exception_ptr out = std::move(error_);
+                error_ = nullptr;           // explicit: moved-from is only "valid"
+                return out;
             }
 
         private:
@@ -5398,6 +5416,12 @@ namespace snicholls
             try {
                 drain_pending();
                 s_->gate.wait();
+                // Release any unreported exception HERE, on the owning thread,
+                // rather than leaving it for whichever pool task happens to drop
+                // the last reference to the state. Same reasoning as take() in
+                // wait(): an exception object destroyed on an arbitrary thread is
+                // a race waiting for someone to read it.
+                (void)s_->err.take();
             } catch (...) {
             }
         }
@@ -5425,7 +5449,8 @@ namespace snicholls
         {
             drain_pending();
             s_->gate.wait();
-            s_->err.rethrow_if_failed();
+            if (std::exception_ptr e = s_->err.take())
+                std::rethrow_exception(e);
         }
 
         // Has any task thrown so far? Useful to abandon work early in a
@@ -5880,7 +5905,12 @@ namespace snicholls
 
             st->drain();                    // the caller is a worker too
             st->gate.wait();
-            st->err.rethrow_if_failed();
+
+            // take(), not a rethrow in place: the exception must not still be
+            // owned by state that a late worker can destroy while the caller is
+            // inside its catch block. See error_slot::take in task_group.hpp.
+            if (std::exception_ptr e = st->err.take())
+                std::rethrow_exception(e);
         }
 
     } // namespace detail

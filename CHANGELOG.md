@@ -9,6 +9,42 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-09-29
+
+### Fixed
+
+- **A data race on the exception object thrown out of `parallel_for`,
+  `parallel_reduce`, `parallel_scan`, `parallel_sort`, `task_graph::run` and
+  `task_group::wait`** — found by the 20x TSan stress added in 1.3.0, on run
+  **16 of 20**. A single TSan run never saw it, which is the entire argument
+  for having added repetition.
+
+  The shared chunk state is held by `shared_ptr` and deliberately outlives the
+  call: a pool task that starts late finds the cursor exhausted and retires
+  without doing anything. The comment said such a task "touches nothing but the
+  gate", and that was wrong — dropping the last reference destroys the state,
+  and with it the `exception_ptr` the error slot was still holding. So a worker
+  thread could run `~runtime_error` and free the message buffer while the
+  caller was inside its `catch` block reading `what()`. TSan caught exactly
+  that: `operator delete` on a pool thread against `strlen` on main.
+
+  The fix removes the possibility rather than narrowing the window.
+  `error_slot::take()` **moves** the exception out under the lock, so the
+  caller's local is the sole owner before the rethrow and no other thread has a
+  reference left to drop. The rethrow-in-place counterpart is gone rather than
+  fixed, so it cannot be reintroduced by accident. `task_group`'s destructor
+  also releases any unreported exception on the owning thread instead of
+  leaving it to whichever pool task drops the last reference.
+
+- **`tests_moveability.cpp` could not build on Windows**, breaking both MSVC
+  jobs while all six POSIX ones stayed green. It asserted on `event_loop`,
+  `time_master` and the HTTP and WebSocket types unconditionally, but those are
+  POSIX-only and compile to nothing on Windows — so the assertions were not a
+  stricter test, they were a test that could not compile. Each is now guarded on
+  the same macro the component itself uses, including `websocket_client`'s own
+  rather than its parent's.
+
+
 ## [1.3.0] — 2026-09-29
 
 The parallel-algorithms release, plus a hardened CI. Additive throughout —
@@ -686,6 +722,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.3.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.3.1
 [1.3.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.3.0
 [1.2.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.2.1
 [1.2.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.2.0

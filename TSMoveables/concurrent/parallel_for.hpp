@@ -179,7 +179,12 @@ namespace snicholls
 
             st->drain();                    // the caller is a worker too
             st->gate.wait();
-            st->err.rethrow_if_failed();
+
+            // take(), not a rethrow in place: the exception must not still be
+            // owned by state that a late worker can destroy while the caller is
+            // inside its catch block. See error_slot::take in task_group.hpp.
+            if (std::exception_ptr e = st->err.take())
+                std::rethrow_exception(e);
         }
 
     } // namespace detail

@@ -101,16 +101,34 @@ MOVEABLE(work_stealing_task_pool);
 MOVEABLE(task_graph);
 
 // ------------------------------------------------ the reactor and its users
+//
+// Guarded on the same macros the components themselves are guarded on. The
+// reactor and everything above it is POSIX-only and compiles to nothing on
+// Windows, so asserting on the types unconditionally is not a stricter test -
+// it is a test that cannot build, which is how the first version of this file
+// broke both Windows jobs while every POSIX one stayed green.
+#if SNICHOLLS_HAS_EVENT_LOOP
 MOVEABLE(event_loop);
+#endif
+#if SNICHOLLS_HAS_TIME_MASTER
 MOVEABLE(time_master);
+#endif
+#if SNICHOLLS_HAS_HTTP_SERVER
 MOVEABLE(http::server);
 MOVEABLE(http::responder);
 MOVEABLE(http::response_stream);
 MOVEABLE(http::request);
 MOVEABLE(http::response);
+#endif
+#if SNICHOLLS_HAS_WEBSOCKET
 MOVEABLE(http::websocket);
-MOVEABLE(http::websocket_client);
+#endif
+#if SNICHOLLS_HAS_WEBSOCKET_CLIENT
+MOVEABLE(http::websocket_client);      // its own macro, not the parent's
+#endif
+#if SNICHOLLS_HAS_WS_BROADCAST_HUB
 MOVEABLE(http::ws_broadcast_hub);
+#endif
 MOVEABLE(log::logger);
 
 // ------------------------------------------------- deliberately immovable
