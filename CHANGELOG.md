@@ -9,6 +9,93 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ## [Unreleased]
 
+Five findings from an independent errata review by a downstream consumer
+(crtp2, pinned at v1.3.1), worked in its priority order. Each was measured or
+worked around downstream; the workarounds can go when a pin includes this.
+
+### Fixed
+
+- **`event_loop::stop()` could be lost during start-up, hanging the loop
+  forever.** `run()` published `running == true` through `run_guard` and only
+  *then* reset `stop_flag` — so the documented start-up pattern (start `run()`
+  on a thread, spin until `running()`, then `stop()`) could land its stop in
+  between. The flag was wiped, its `wake()` consumed by the first `iterate`,
+  and the next `iterate(-1)` blocked with nothing left to wake it. **The
+  consumer's CI hung for 8–9 hours** on both macOS and Ubuntu; rare in
+  isolation, reliable under load.
+
+  `stop_flag` is now cleared when a run *ends*, never when it begins, so
+  nothing touches it while `running == true` is observable. The clear happens
+  before `run_guard` lowers `running`, or a second `run()` could race it.
+  One deliberate consequence: a `stop()` issued *before* `run()` is now
+  honoured and `run()` returns immediately, where the entry clear used to
+  discard it — refusing to start after a stop was requested is the more
+  defensible of the two. Regression test runs the exact pattern 2000 times and
+  is bounded, so a reappearance fails in seconds instead of reproducing the
+  original multi-hour hang.
+
+- **An abrupt peer loss never fired `on_close`.** `~websocket_protocol` marked
+  the handle disconnected but announced nothing, so a handler only ever ran for
+  a peer polite enough to send a Close frame — and the common case in
+  production is the opposite: a crashed tab, a killed process, a pulled cable.
+  A hub that unsubscribes on close therefore kept fanning out to a peer that
+  had gone, and kept counting it, until the idle timeout; the consumer measured
+  `subscribers() == 1` five seconds after the peer left, against milliseconds
+  for a comparable server. `on_close` now fires with **1006** (`ws_abnormal_closure`,
+  which RFC 6455 reserves for exactly this and forbids on the wire), using the
+  same `open.exchange(false)` guard `send_close` uses so exactly one side
+  announces.
+
+- **`websocket_client::close()` sent no Close frame**, so RFC 6455 §7.1.2 was
+  not met and the peer saw a bare EOF — reporting 1006 and making every
+  *deliberate* close indistinguishable from a crash. It now sends Close(1000),
+  flushes, and half-closes so the FIN follows the frame rather than racing it.
+  Written directly rather than through `queue_out`, whose failure path would
+  have fired `on_close` twice for one close.
+
+### Added
+
+- **`websocket_client::send_binary()`** — the client could always carry binary
+  (`queue_out` has taken an opcode from the start); only the public door was
+  missing, so callers with arbitrary bytes had to encode them as text. The
+  consumer was hex-encoding at 2× the bytes and CPU, and had moved its object
+  sender to the server side to avoid the asymmetry. Mirrors
+  `websocket::send_binary`.
+
+- **`ws_broadcast_hub::mount_ws()` and `set_poster()`.** `mount()` was the only
+  way to obtain the poster `publish()` needs from a foreign thread, and it
+  always registered an ingest route as well — a write endpoint the application
+  never asked for, and a reachable one, since no-Origin callers are allowed by
+  design. `mount_ws()` registers the read side alone, `set_poster()` gives the
+  poster with no routes at all, and an empty `ingest_path` to `mount()` now
+  means "do not register".
+
+- **`net/tcp.hpp` — `tcp_stream` and `tcp_listener`**, a plain TCP byte stream
+  with deadlines. The library had a reactor, an HTTP server and a WebSocket
+  client, and no way to just move bytes; the consumer shipped ~250 lines of
+  POSIX as a documented stopgap.
+
+  Blocking **with deadlines**, deliberately: the deadline is computed once and
+  respected across `EINTR` and partial transfers rather than being restarted by
+  each retry, which is the usual way a one-second timeout quietly becomes
+  unbounded. A timeout reports `ETIMEDOUT` so it is distinguishable from EOF,
+  which reads as 0.
+
+  `shutdown()` is the one call safe to make while another thread is parked in
+  `read()` or `write_all()`, and the distinction from `close()` is load-bearing:
+  closing an fd another thread is about to use is a use-after-free with extra
+  steps, since the number is immediately reusable and the racing read can end up
+  pointed at somebody else's socket. A `transport_delegate` plugs in, so TLS is
+  `s.set_transport(ctx.connect(host))` — verified to compile and run, not just
+  asserted. Ten tests.
+
+  **Not included:** a reactor-driven variant with `on_readable` and a write
+  queue. It would duplicate most of what `http::session_core` already does, and
+  a second copy of that machinery earns its place only once something needs it
+  that the existing one cannot serve. Stated rather than left as a gap to
+  discover.
+
+
 ## [1.3.1] — 2026-09-29
 
 ### Fixed

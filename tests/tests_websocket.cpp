@@ -491,10 +491,51 @@ void test_ws_server_initiated()
     pass("websocket: server-initiated push");
 }
 
+// An abrupt loss is reported as 1006, the code RFC 6455 reserves for "the
+// connection went without a Close frame". Reported to the application only and
+// never written to the wire, which is why send_close is never called with it.
+//
+// Before this, on_close only ever fired for a peer polite enough to send a
+// Close frame - so any handler doing cleanup silently missed every crash, which
+// is the common case in production rather than the rare one.
+void test_ws_abrupt_loss_reports_1006()
+{
+    server srv;
+    std::atomic<std::uint16_t> code{0};
+    std::atomic<int> fires{0};
+
+    srv.get("/ws", websocket_route([&](websocket ws) {
+        ws.on_close([&](websocket, std::uint16_t c, const std::string&) {
+            code.store(c, std::memory_order_release);
+            fires.fetch_add(1, std::memory_order_acq_rel);
+        });
+    }));
+    const std::uint16_t port = srv.listen("127.0.0.1", 0);
+    std::thread th([&] { srv.run(); });
+    spin_until([&] { return srv.running(); });
+
+    {
+        ws_client c;
+        assert(c.connect_to(port, "/ws"));
+        assert(c.status() == 101);
+    }   // destructor closes the socket: a bare EOF, no Close frame
+
+    assert(spin_until_for([&] { return fires.load(std::memory_order_acquire) > 0; }));
+    assert(code.load(std::memory_order_acquire) == ws_abnormal_closure);
+    assert(fires.load(std::memory_order_acquire) == 1);   // announced exactly once
+
+    srv.stop();
+    if (th.joinable())
+        th.join();
+
+    pass("websocket: an abrupt peer loss fires on_close with 1006, once");
+}
+
 } // namespace
 
 void run_websocket_tests()
 {
+    test_ws_abrupt_loss_reports_1006();
     test_ws_primitives();
     test_ws_utf8();
     test_ws_handshake_and_echo();

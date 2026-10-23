@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -361,6 +362,72 @@ void test_loop_dispatch_tap()
 
 } // namespace
 
+// A stop() that lands immediately after running() must not be lost.
+//
+// run() used to publish running == true (via run_guard) and only THEN clear
+// stop_flag, so a stop in that window was wiped, its wake consumed by the first
+// iterate, and the loop parked in iterate(-1) with nothing left to wake it. The
+// start-up pattern this test performs is the documented one, which is what made
+// it reachable; a downstream consumer's CI hung 8-9 hours on it.
+//
+// Deliberately bounded. If the stop is lost the loop never exits, and a test
+// that simply join()s would reproduce the original failure - a silent multi-hour
+// hang - instead of reporting it. So detect the wedge, break it on purpose, and
+// fail.
+void test_loop_stop_right_after_running_is_not_lost()
+{
+    for (int i = 0; i < 2000; ++i) {
+        event_loop loop;
+        std::thread th([&loop] { loop.run(); });
+        spin_until([&loop] { return loop.running(); });
+        loop.stop();
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool stopped = true;
+        while (loop.running()) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                stopped = false;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        if (!stopped)
+            loop.post([&loop] { loop.stop(); });   // unwedge so join() can return
+        th.join();
+        assert(stopped);
+    }
+
+    pass("event_loop: a stop() right after running() is never lost (2000 rounds)");
+}
+
+// The flag is cleared when a run ends, so the loop is reusable - and a stop
+// issued before a run is honoured rather than discarded, which is the one
+// deliberate behaviour change that came with the fix.
+void test_loop_stop_flag_lifecycle()
+{
+    event_loop loop;
+
+    // Run, stop, run again: the second run must not inherit the first's stop.
+    for (int round = 0; round < 3; ++round) {
+        std::thread th([&loop] { loop.run(); });
+        spin_until([&loop] { return loop.running(); });
+        std::atomic<bool> ran{false};
+        loop.post([&ran] { ran.store(true); });
+        spin_until([&ran] { return ran.load(); });   // it really is dispatching
+        loop.stop();
+        th.join();
+        assert(!loop.running());
+    }
+
+    // A stop before a run is now honoured: run() returns rather than blocking.
+    loop.stop();
+    std::thread th([&loop] { loop.run(); });
+    th.join();                                      // returns promptly, or this test hangs
+    assert(!loop.running());
+
+    pass("event_loop: stop_flag clears on exit, so a loop is reusable");
+}
+
 void run_event_loop_tests()
 {
     test_loop_fd_events();
@@ -371,6 +438,8 @@ void run_event_loop_tests()
     test_loop_reentrancy();
     test_loop_moveability();
     test_loop_dispatch_tap();
+    test_loop_stop_right_after_running_is_not_lost();
+    test_loop_stop_flag_lifecycle();
 }
 
 #else // !SNICHOLLS_HAS_EVENT_LOOP

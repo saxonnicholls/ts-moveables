@@ -32,6 +32,7 @@ void run_mpmc_queue_tests();
 void run_thread_pool_tests();
 void run_parallel_for_tests();
 void run_moveability_tests();
+void run_tcp_tests();
 void run_event_loop_tests();
 void run_http_server_tests();
 void run_websocket_tests();
@@ -908,6 +909,7 @@ int main(int argc, char** argv)
     run_thread_pool_tests();
     run_parallel_for_tests();
     run_moveability_tests();
+    run_tcp_tests();
     run_event_loop_tests();
     run_http_server_tests();
     run_websocket_tests();

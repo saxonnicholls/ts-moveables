@@ -352,10 +352,34 @@ public:
                const std::string& ws_path     = "/ws",
                const std::string& ingest_path = "/ingest/:topic")
     {
-        h_->poster = srv.loop().make_poster();
+        set_poster(srv.loop().make_poster());
         srv.get(ws_path, ws_route());
-        srv.post(ingest_path, ingest_handler());
+        if (!ingest_path.empty())
+            srv.post(ingest_path, ingest_handler());
     }
+
+    // The read side only: subscribers, no write endpoint.
+    //
+    // For the common case of an application that publishes from its own feed
+    // thread and wants nobody else writing. mount() used to be the only way to
+    // obtain the poster that publish() needs from a foreign thread, so asking
+    // for one meant accepting the other - and the ingest route that came with
+    // it is a write endpoint the application never asked for. Origin-checked,
+    // but no-Origin callers (curl, anything not a browser) are allowed by
+    // design, so it is genuinely reachable.
+    void mount_ws(server& srv, const std::string& ws_path = "/ws")
+    {
+        mount(srv, ws_path, std::string{});
+    }
+
+    // Remember the loop, so publish() from a foreign thread marshals onto it
+    // rather than reading each socket's backlog from the wrong thread.
+    //
+    // Public and separate because wanting the poster and wanting routes are
+    // different wishes: a hub mounted on somebody else's router, or fed only
+    // through publish(), still needs this and should not have to take an
+    // endpoint to get it.
+    void set_poster(event_loop::poster p) { h_->poster = std::move(p); }
 
     // Does this request's Origin pass the hub's policy? The hub's own handlers
     // already ask this. You need it when you write your own route that

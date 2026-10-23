@@ -75,6 +75,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | an **event loop** for fds and timers without the usual scars | [`event_loop`](#event_loop) — POSIX reactor, typed dispatch, loud contracts |
 | an **HTTP server** that does not park a thread per connection | [`http_server`](#http_server) — routes, async responders, or one drop-in header |
 | **WebSockets**, or `wss` | [`websocket`](#websocket) — Autobahn-clean, one route handler |
+| **just move bytes over TCP**, with timeouts | [`tcp_stream`](#tcp_stream) — connect/accept/read/write-all on a deadline, TLS plugs in |
 | to **run closures on a schedule** | [`time_master`](#time_master) — periodic and one-shot, cancellable, moveable |
 | to **log or emit telemetry** from anywhere | [`logging`](#logging) — `SN_LOG_INFO() << ...`, any thread, sinks in isolated lanes |
 | the **fastest possible raw single-op queue** | honestly? [moodycamel](#which-should-you-use). We tell you when *not* to pick us. |
@@ -146,6 +147,7 @@ Moved-from objects are always left valid and usable.
 | `concurrent/disruptor.hpp` | `disruptor<T, WaitStrategy>` + `multi_producer_disruptor<T>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
 | `concurrent/thread_pool.hpp` | `task_pool` interface + `mutex_` / `sharded_` / `dispatch_` / `mpmc_` / `work_stealing_task_pool` | Taskflow / TBB / `std::async` | — | moveable handle (heap core) |
 | `concurrent/parallel_for.hpp` | `parallel_for` / `parallel_for_each` over any `task_pool` | `tbb::parallel_for` / `std::for_each(par)` | — | free functions (stateless) |
+| `net/tcp.hpp` | `tcp_stream` / `tcp_listener` — blocking byte stream with deadlines (POSIX) | Asio's blocking sockets / hand-rolled POSIX | — | moveable, owns one fd |
 | `event/loop.hpp` | `event_loop` + `fd_watch` / `timer` (POSIX; self-disables on Windows) | Asio / libuv / libevent | — | moveable handles, loop handle moves mid-run |
 | `event/time_master.hpp` | `time_master` — named, cancellable, repeating timers on the loop | Boost.Asio timer wrappers | — | moveable handle (heap core) |
 | `http/server.hpp` | `server` + `responder` / `response_stream`, HTTP/1.1 delegate | cpp-httplib (blocking) / Asio | — | moveable handle (heap core) |
@@ -1026,6 +1028,36 @@ srv.post("/ingest/:topic", [&hub](const auto& req, auto res) {
 
 Or register `hub.ingest_handler()` and get the hub's semantics plus the check
 rather than re-implementing it.
+
+## tcp_stream
+
+Sometimes you just want to move bytes:
+
+```cpp
+auto l = snicholls::net::tcp_listener::bind("127.0.0.1", 0);   // 0 = pick one
+auto peer = l.accept(5s);
+
+auto s = snicholls::net::tcp_stream::connect("127.0.0.1", l.port(), 2s);
+s.write_all(data, n, 1s);
+const auto got = s.read(buf, sizeof buf, 1s);    // 0 = peer closed, -1 = error
+```
+
+The library had a reactor, an HTTP server and a WebSocket client and no way to do that, so consumers wrote their own sockets.
+
+**Blocking, with deadlines — deliberately.** Request/response code, tools and test harnesses read better written straight through, and blocking is only a problem when it can block *forever*. Every call takes a timeout and means it: the deadline is computed once and respected across `EINTR` and partial transfers, rather than being restarted by each retry, which is the usual way a one-second timeout quietly becomes unbounded. A timeout reports `ETIMEDOUT`, so it is distinguishable from EOF, which reads as `0`. For many connections on one thread, use the reactor and the protocols on top of it.
+
+**`shutdown()` is the one call safe from another thread**, and the distinction from `close()` is load-bearing rather than pedantic. Closing an fd that another thread is about to use is a use-after-free with extra steps — the number is immediately reusable, so the racing read can end up pointed at whatever the next `accept()` returned, silently reading somebody else's socket. `shutdown()` leaves the descriptor in place and tears the connection down under it, so the parked call returns and the owner closes when it is ready.
+
+**TLS is one line**, through the same `transport_delegate` the server uses — the stream moves bytes, the delegate transforms them, neither knows what the other is:
+
+```cpp
+snicholls::http::openssl_client_context ctx;       // verifies by default
+auto s = snicholls::net::tcp_stream::connect(host, 443, 2s);
+s.set_transport(ctx.connect(host));                // the one line
+s.handshake(5s);
+```
+
+**Not here yet:** a reactor-driven variant with `on_readable` and a write queue. It would duplicate most of what the HTTP server's session machinery already does, and a second copy of that earns its place only once something needs it the existing one cannot serve.
 
 ## http_server
 

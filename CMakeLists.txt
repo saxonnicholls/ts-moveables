@@ -59,6 +59,7 @@ if(TS_MOVEABLES_BUILD_TESTS)
         tests/tests_thread_pool.cpp
         tests/tests_parallel_for.cpp
         tests/tests_moveability.cpp
+        tests/tests_tcp.cpp
         tests/tests_event_loop.cpp
         tests/tests_http_server.cpp
         tests/tests_websocket.cpp

@@ -684,10 +684,40 @@ namespace snicholls
         }
 
         // Run until stop(). One thread; a second concurrent run throws.
+        //
+        // stop_flag is cleared when a run ENDS, never when it begins, and that
+        // ordering is the whole correctness argument rather than a tidiness
+        // preference.
+        //
+        // Clearing on entry used to lose a stop completely. run_guard publishes
+        // running == true, and only after that did run() reset stop_flag - so the
+        // documented start-up pattern (start run() on a thread, spin until
+        // running(), then stop()) could land its stop in between: the flag was
+        // wiped, its wake() was consumed by the first iterate, and the next
+        // iterate(-1) blocked with nothing left to wake it. Found by a downstream
+        // consumer whose CI hung for 8-9 hours on both macOS and Ubuntu; rare in
+        // isolation, reliable under load.
+        //
+        // Clearing on exit cannot lose one, because nothing touches the flag
+        // while running == true is observable. The clear also has to happen
+        // BEFORE run_guard lowers running, or a second run() could start and race
+        // it - hence the declaration order here, which the reverse destruction
+        // order then gets right.
+        //
+        // One deliberate consequence: a stop() issued BEFORE run() is now
+        // honoured and run() returns immediately, where previously the entry
+        // clear discarded it. Refusing to start after a stop was requested is the
+        // more defensible of the two, and silently ignoring it was never asked
+        // for.
         void run() {
             auto keep = c_;                     // core outlives even a moved/destroyed handle
             run_guard guard(*keep);
-            keep->stop_flag.store(false, std::memory_order_release);
+
+            struct clear_on_exit {
+                core& c;
+                ~clear_on_exit() { c.stop_flag.store(false, std::memory_order_release); }
+            } clear{*keep};
+
             while (!keep->stop_flag.load(std::memory_order_acquire))
                 keep->iterate(-1);
         }

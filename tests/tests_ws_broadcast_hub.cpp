@@ -1134,6 +1134,71 @@ void test_hub_cardinality_cap_can_be_disabled()
     pass("ws_broadcast_hub: max_topics 0 disables the cap");
 }
 
+// A peer that vanishes without a Close frame must unsubscribe, and promptly.
+//
+// This is the production case, not the polite one: a crashed browser tab, a
+// killed process, a pulled cable. The server used to notice only that the
+// socket was gone - it set the handle to disconnected but never announced the
+// close - so a hub that unsubscribes from on_close kept the subscriber, kept
+// fanning out to it, and kept counting it until the idle timeout. A downstream
+// consumer measured subscribers() == 1 a full five seconds after the peer had
+// gone, against milliseconds for a comparable server.
+void test_hub_unsubscribes_on_abrupt_peer_loss()
+{
+    hub_server s;
+
+    ws_client c;
+    assert(c.connect_to(s.port, "/ws?topic=alerts"));
+    assert(c.status() == 101);
+    spin_until([&] { return s.hub.subscribers() == 1; });
+
+    // No Close frame: just drop the socket, which is what a crash looks like.
+    c.close();
+
+    // Bounded, so a regression fails here rather than waiting out a timeout.
+    assert(spin_until_for([&] { return s.hub.subscribers() == 0; }));
+
+    pass("ws_broadcast_hub: a peer that vanishes without a Close frame unsubscribes");
+}
+
+// mount_ws registers the read side and nothing else.
+//
+// mount() was the only way to get the poster publish() needs from a foreign
+// thread, so an application that only wanted to broadcast had to accept an
+// ingest endpoint as well - a write door it never asked for, reachable by any
+// no-Origin caller since those are allowed by design.
+void test_hub_mount_ws_registers_no_write_endpoint()
+{
+    server srv;
+    ws_broadcast_hub hub;
+    hub.mount_ws(srv);                              // read side only
+    const std::uint16_t port = srv.listen("127.0.0.1", 0);
+    std::thread th([&srv] { srv.run(); });
+    spin_until([&] { return srv.running(); });
+
+    // The read side works, and publish() from this (foreign) thread still
+    // marshals correctly - which is what the poster was needed for.
+    ws_client c;
+    assert(c.connect_to(port, "/ws?topic=feed"));
+    assert(c.status() == 101);
+    spin_until([&] { return hub.subscribers() == 1; });
+    hub.publish("feed", "from-a-foreign-thread");
+    ws_opcode op;
+    std::string payload;
+    assert(c.read_frame(op, payload));
+    assert(contains(payload, "from-a-foreign-thread"));
+
+    // And the write side simply is not there.
+    assert(http_post(port, "/ingest/feed", "unwanted") == 404);
+
+    c.close();
+    srv.stop();
+    if (th.joinable())
+        th.join();
+
+    pass("ws_broadcast_hub: mount_ws gives the poster without a write endpoint");
+}
+
 } // namespace
 
 void run_ws_broadcast_hub_tests()
@@ -1156,6 +1221,8 @@ void run_ws_broadcast_hub_tests()
     test_hub_origin_check_opts_out();
     test_hub_ingest_rejects_foreign_origin();
     test_hub_custom_route_guards_itself();
+    test_hub_unsubscribes_on_abrupt_peer_loss();
+    test_hub_mount_ws_registers_no_write_endpoint();
     test_hub_frames_carry_a_stable_epoch();
     test_hub_epoch_changes_on_restart_where_seq_does_not();
     test_hub_epochs_are_distinct_within_one_millisecond();

@@ -21,11 +21,14 @@
 
 #include "../TSMoveables/http/websocket_client.hpp"
 #include "../TSMoveables/http/ws_broadcast_hub.hpp"
+#include "../TSMoveables/moveable/mutex.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -48,12 +51,20 @@ struct echo_server {
     std::uint16_t port = 0;
     std::thread th;
     std::atomic<int> connections{0};
+    // What the server was told about each close, so a test can tell a polite
+    // goodbye (1000) from a socket that just vanished (1006).
+    std::atomic<int> closes{0};
+    std::atomic<std::uint16_t> last_close{0};
 
     explicit echo_server(std::uint16_t fixed = 0)
     {
         srv.get("/feed", websocket_route([this](websocket ws) {
             connections.fetch_add(1, std::memory_order_relaxed);
             ws.on_message([](websocket sock, const ws_message& m) { sock.send_text(m.data); });
+            ws.on_close([this](websocket, std::uint16_t code, const std::string&) {
+                last_close.store(code, std::memory_order_release);
+                closes.fetch_add(1, std::memory_order_acq_rel);
+            });
         }));
         port = srv.listen("127.0.0.1", fixed);
         assert(port != 0);
@@ -306,6 +317,97 @@ void test_ws_client_close_is_final()
     pass("websocket_client: close() is final - no reconnect follows");
 }
 
+// A deliberate close must look deliberate to the peer.
+//
+// RFC 6455 7.1.2 asks the closing endpoint to send a Close frame. close() used
+// to go straight to ::close(fd), so the server read a bare EOF and reported
+// 1006 - abnormal closure - making an orderly shutdown indistinguishable from
+// a crash. Anything that branches on the difference (reconnect policy,
+// alerting, unsubscribing) was being told the wrong thing every time.
+void test_ws_client_close_sends_a_close_frame()
+{
+    echo_server s;
+    s.start();
+    loop_thread lt;
+
+    std::atomic<int> opens{0};
+    websocket_client c;
+    c.on_open([&opens] { opens.fetch_add(1); });
+    assert(c.connect(lt.loop, "ws://127.0.0.1:" + std::to_string(s.port) + "/feed"));
+    lt.start();
+    assert(spin_until_for([&] { return opens.load() == 1; }));
+
+    c.close();
+
+    assert(spin_until_for([&] { return s.closes.load(std::memory_order_acquire) > 0; }));
+    // The point of the test: 1000, not 1006.
+    assert(s.last_close.load(std::memory_order_acquire) == ws_normal);
+    assert(s.closes.load(std::memory_order_acquire) == 1);
+
+    lt.stop();
+    pass("websocket_client: close() sends a Close frame - the peer sees 1000, not 1006");
+}
+
+// Binary out, with the bytes arriving intact and as a BINARY frame.
+//
+// The client could always carry binary - queue_out has taken an opcode from the
+// start - but only send_text was public, so callers with arbitrary bytes had to
+// encode them as text. A downstream consumer hex-encoded at 2x the bytes and
+// moved its object sender to the server side rather than pay it.
+void test_ws_client_sends_binary()
+{
+    server srv;
+    moveable_mutex<> mtx;
+    std::vector<std::pair<bool, std::string>> got;   // {was_binary, bytes}
+
+    srv.get("/sink", websocket_route([&](websocket ws) {
+        ws.on_message([&](websocket, const ws_message& m) {
+            std::lock_guard<moveable_mutex<>> g(mtx);
+            got.emplace_back(!m.is_text, m.data);
+        });
+    }));
+    const std::uint16_t port = srv.listen("127.0.0.1", 0);
+    std::thread sth([&] { srv.run(); });
+    spin_until([&] { return srv.running(); });
+
+    loop_thread lt;
+    std::atomic<int> opens{0};
+    websocket_client c;
+    c.on_open([&opens] { opens.fetch_add(1); });
+    assert(c.connect(lt.loop, "ws://127.0.0.1:" + std::to_string(port) + "/sink"));
+    lt.start();
+    assert(spin_until_for([&] { return opens.load() == 1; }));
+
+    // Bytes that are not valid UTF-8 and include an embedded NUL: exactly what
+    // a text frame cannot legally carry.
+    std::string payload;
+    payload.push_back('\x00');
+    payload.push_back('\xff');
+    payload.push_back('\xfe');
+    payload.push_back('A');
+    payload.push_back('\x80');
+    assert(c.send_binary(payload));
+
+    assert(spin_until_for([&] {
+        std::lock_guard<moveable_mutex<>> g(mtx);
+        return !got.empty();
+    }));
+    {
+        std::lock_guard<moveable_mutex<>> g(mtx);
+        assert(got.size() == 1);
+        assert(got[0].first);                  // arrived as binary, not text
+        assert(got[0].second == payload);      // byte for byte, NUL and all
+    }
+
+    c.close();
+    lt.stop();
+    srv.stop();
+    if (sth.joinable())
+        sth.join();
+
+    pass("websocket_client: send_binary carries arbitrary bytes as a binary frame");
+}
+
 void test_ws_client_relays_into_the_hub()
 {
     // The N-in half joined to the M-out half: an upstream feed arrives on a
@@ -345,6 +447,8 @@ void run_all()
     test_ws_client_rejects_a_non_websocket_endpoint();
     test_ws_client_reconnects_after_the_upstream_dies();
     test_ws_client_close_is_final();
+    test_ws_client_close_sends_a_close_frame();
+    test_ws_client_sends_binary();
     test_ws_client_relays_into_the_hub();
 }
 

@@ -191,6 +191,11 @@ enum ws_close : std::uint16_t {
     ws_protocol_error    = 1002,
     ws_unsupported_data  = 1003,
     ws_invalid_payload   = 1007,
+    // Reported to the application when the socket went without a Close frame -
+    // a crashed tab, a pulled cable, a process killed. RFC 6455 reserves it for
+    // exactly this and forbids sending it ON THE WIRE, so it only ever reaches
+    // an on_close handler; send_close is never called with it.
+    ws_abnormal_closure  = 1006,
     ws_policy_violation  = 1008,
     ws_message_too_big   = 1009,
     ws_internal_error    = 1011
@@ -500,7 +505,25 @@ public:
     ~websocket_protocol() override
     {
         if (st_) {
-            st_->open.store(false, std::memory_order_release);
+            // The socket is gone. If nobody has announced the close yet then it
+            // went WITHOUT a Close frame, and that has to be reported too -
+            // otherwise an on_close handler only ever runs for peers polite
+            // enough to say goodbye, and the common case in production is the
+            // opposite: a crashed tab, a killed process, a pulled cable.
+            //
+            // A downstream consumer found this the expensive way. Its hub kept
+            // fanning out to a subscriber whose peer had hung up, because the
+            // hub unsubscribes from on_close - so the subscriber lingered until
+            // the idle timeout, and subscribers() reported it the whole time.
+            //
+            // The same exchange guard send_close uses, so exactly one side
+            // announces, and announced AFTER open is already false: by the time
+            // a handler is told the socket closed, connected() agrees.
+            //
+            // Fired before kept.clear(), because the handler that wants to know
+            // is usually parked in kept.
+            if (st_->open.exchange(false, std::memory_order_acq_rel))
+                st_->on_close(ws_abnormal_closure, "");
             st_->kept.clear();
         }
     }

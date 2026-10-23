@@ -300,23 +300,49 @@ public:
         event_loop* l = c->loop.load(std::memory_order_relaxed);
         if (!l)
             return;
-        l->post([c] { c->shutdown(ws_client_status::closed_locally, true); });
+        l->post([c] { c->close_gracefully(); });
     }
 
     // Queue a text message. Safe from any thread; returns false only when the
     // client is stopped, since a message sent while reconnecting is queued.
+    //
+    // Text means UTF-8 (RFC 6455 5.6) - a peer is entitled to drop the
+    // connection over a malformed sequence, which is why arbitrary bytes want
+    // send_binary rather than this.
     bool send_text(std::string payload)
+    {
+        return queue(ws_opcode::text, std::move(payload));
+    }
+
+    // Queue a binary message - arbitrary bytes, no encoding contract.
+    //
+    // The client could always carry binary (queue_out has taken an opcode from
+    // the start); only the public door was missing, so callers with bytes had
+    // to encode them as text. A downstream consumer was hex-encoding, paying
+    // 2x the bytes and the CPU to do it, and moved its object sender to the
+    // server side to avoid the asymmetry. Same signature as
+    // websocket::send_binary on the server handle.
+    bool send_binary(std::string payload)
+    {
+        return queue(ws_opcode::binary, std::move(payload));
+    }
+
+private:
+    // One door for both opcodes: the stopped check and the hop onto the loop
+    // are the same, and duplicating them is how they drift apart.
+    bool queue(ws_opcode op, std::string payload)
     {
         auto c = c_;
         event_loop* l = c->loop.load(std::memory_order_relaxed);
         if (!l || c->stopped.load(std::memory_order_relaxed))
             return false;
-        l->post([c, p = std::move(payload)]() mutable {
-            c->queue_out(ws_opcode::text, std::move(p));
+        l->post([c, op, p = std::move(payload)]() mutable {
+            c->queue_out(op, std::move(p));
         });
         return true;
     }
 
+public:
     stats snapshot() const { return c_->snapshot(); }
     bool connected() const noexcept { return c_->open.load(std::memory_order_relaxed); }
     // By value, not by reference: the member is rewritten by connect(), and a
@@ -790,6 +816,36 @@ private:
         }
 
         // ------------------------------------------------------- teardown
+
+        // RFC 6455 7.1.2: the endpoint that initiates a close sends a Close
+        // frame before the socket goes. Without one the peer reads a bare EOF
+        // and reports 1006 - abnormal closure - so every DELIBERATE close was
+        // indistinguishable from a crash, and a server that treats the two
+        // differently (reconnect policy, alerting, unsubscribing) learned
+        // nothing from a clean shutdown.
+        //
+        // Written directly rather than through queue_out, which calls fail() on
+        // a write error: that would run shutdown() once here and once below,
+        // firing on_close twice for a single close. A frame we could not write
+        // is simply skipped - the socket is going anyway.
+        //
+        // SHUT_WR after the frame so the FIN follows it rather than racing it:
+        // the peer reads Close, then EOF, in that order.
+        void close_gracefully()
+        {
+            if (fd >= 0 && open.load(std::memory_order_relaxed)) {
+                std::string body;
+                body.push_back(char((ws_normal >> 8) & 0xff));
+                body.push_back(char(ws_normal & 0xff));
+                const std::string f = detail::ws_frame_masked(
+                    ws_opcode::close, body.data(), body.size(), mask_key());
+                if (write_app(f.data(), f.size()))
+                    flush();
+                if (fd >= 0)
+                    ::shutdown(fd, SHUT_WR);
+            }
+            shutdown(ws_client_status::closed_locally, true);
+        }
 
         void fail(ws_client_status why) { shutdown(why, false); }
 
