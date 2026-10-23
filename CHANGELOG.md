@@ -89,11 +89,25 @@ worked around downstream; the workarounds can go when a pin includes this.
   `s.set_transport(ctx.connect(host))` — verified to compile and run, not just
   asserted. Ten tests.
 
-  **Not included:** a reactor-driven variant with `on_readable` and a write
-  queue. It would duplicate most of what `http::session_core` already does, and
-  a second copy of that machinery earns its place only once something needs it
-  that the existing one cannot serve. Stated rather than left as a gap to
-  discover.
+- **`tcp_connection` and `tcp_acceptor`** — the reactor-driven half of the same
+  header: many connections on one loop thread, nobody blocking. `on_data` hands
+  the handler the connection's **own** read buffer, so whatever it does not
+  consume stays for the next readable event and a length-prefixed frame
+  arriving in pieces costs nothing to handle. `send()` is **bounded**: above
+  `write_high_water` it returns false and queues nothing, rather than accepting
+  everything and growing until the process dies — which is the unbounded
+  client-side queue the errata asked to be able to see coming — and `on_drain`
+  says when to resume, so nobody polls `backlog()`.
+
+  An open connection **owns itself**, which is the difference between an API
+  people can use and a trap. The natural spelling —
+  `acc.on_accept([](auto c) { c.on_data(...); })` — used to do nothing at all:
+  `c` is a handle, it dies when the handler returns, and the watch deliberately
+  holds only a weak reference, so the socket closed and the peer saw a
+  connection accepted and then hung up on. Caught by the tests before it
+  shipped, and confirmed by a negative control. Self-ownership is released in
+  `teardown()`, which every path reaches, and the acceptor tracks what it
+  accepted so closing it closes them. Four tests.
 
 
 ## [1.3.1] — 2026-09-29

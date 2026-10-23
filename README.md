@@ -1057,7 +1057,20 @@ s.set_transport(ctx.connect(host));                // the one line
 s.handshake(5s);
 ```
 
-**Not here yet:** a reactor-driven variant with `on_readable` and a write queue. It would duplicate most of what the HTTP server's session machinery already does, and a second copy of that earns its place only once something needs it the existing one cannot serve.
+**For many connections on one thread**, the same header has the reactor-driven half:
+
+```cpp
+snicholls::net::tcp_acceptor acc(loop, "127.0.0.1", 9000);
+acc.on_accept([](snicholls::net::tcp_connection c) {
+    c.on_data([](auto conn, std::string& buf) {
+        conn.send(consume_frames(buf));     // leave a partial frame in buf
+    });
+});
+```
+
+`on_data` hands over the connection's **own** read buffer, so whatever the handler doesn't consume stays for the next readable event — a length-prefixed frame arriving in pieces costs nothing to handle. `send()` is **bounded**: above `write_high_water` it returns false and queues nothing rather than growing until the process dies, and `on_drain` says when to resume, so nobody polls `backlog()`.
+
+An open connection **owns itself**. That matters because the code above is the natural spelling, and without self-ownership it does nothing: `c` is a handle, it dies when the handler returns, the watch holds only a weak reference, and the peer sees a connection accepted and then hung up on. Requiring every caller to park the handle somewhere would be a lifetime puzzle set by the library for no reason. Ownership is released on teardown, and closing the acceptor closes what it accepted.
 
 ## http_server
 

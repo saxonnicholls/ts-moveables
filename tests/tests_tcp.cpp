@@ -18,14 +18,17 @@
 #include "test_helpers.hpp"
 
 #include "../TSMoveables/net/tcp.hpp"
+#include "../TSMoveables/moveable/mutex.hpp"
 
 #if SNICHOLLS_HAS_TCP
 
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -264,6 +267,187 @@ void test_tcp_listener_reports_the_chosen_port()
     pass("tcp_listener: port 0 reports the port the kernel actually chose");
 }
 
+// ------------------------------------------------------------------ reactor
+#if SNICHOLLS_HAS_EVENT_LOOP
+
+// A loop on its own thread, stoppable, so a reactor test can drive it.
+struct loop_on_a_thread {
+    event_loop loop;
+    std::thread th;
+
+    void start()
+    {
+        th = std::thread([this] { loop.run(); });
+        spin_until([this] { return loop.running(); });
+    }
+    void stop()
+    {
+        loop.post([this] { loop.stop(); });
+        if (th.joinable())
+            th.join();
+    }
+    ~loop_on_a_thread() { stop(); }
+};
+
+void test_tcp_reactor_echoes_many_connections_on_one_thread()
+{
+    // The case tcp_stream is the wrong shape for: several connections, one
+    // thread, nobody blocking.
+    loop_on_a_thread lt;
+    net::tcp_acceptor acc(lt.loop, "127.0.0.1", 0);
+    std::atomic<int> accepted{0};
+
+    acc.on_accept([&accepted](net::tcp_connection c) {
+        accepted.fetch_add(1);
+        c.on_data([](net::tcp_connection conn, std::string& buf) {
+            conn.send(buf);                 // echo
+            buf.clear();                    // consumed
+        });
+    });
+    const std::uint16_t port = acc.port();
+    assert(port != 0);
+    lt.start();
+
+    constexpr int clients = 8;
+    std::vector<net::tcp_stream> peers;
+    for (int i = 0; i < clients; ++i) {
+        peers.push_back(net::tcp_stream::connect("127.0.0.1", port, 2s));
+        assert(peers.back().valid());
+    }
+    assert(spin_until_for([&] { return accepted.load() == clients; }));
+
+    for (int i = 0; i < clients; ++i) {
+        const std::string msg = "client-" + std::to_string(i);
+        assert(peers[std::size_t(i)].write_all(msg.data(), msg.size(), 2s));
+        assert(read_exactly(peers[std::size_t(i)], msg.size()) == msg);
+    }
+
+    pass("tcp_acceptor: eight connections echoed by one loop thread");
+}
+
+void test_tcp_reactor_send_is_bounded_and_drains()
+{
+    // The backpressure the errata asked to be able to see coming: above the
+    // high-water mark send() refuses and queues nothing, rather than accepting
+    // everything and growing until the process dies.
+    loop_on_a_thread lt;
+    net::tcp_conn_config cfg;
+    cfg.write_high_water = 64 * 1024;
+    net::tcp_acceptor acc(lt.loop, "127.0.0.1", 0, 128, cfg);
+
+    std::atomic<bool> refused{false};
+    std::atomic<bool> drained{false};
+    std::atomic<std::size_t> peak{0};
+
+    acc.on_accept([&](net::tcp_connection c) {
+        c.on_drain([&drained](net::tcp_connection) { drained.store(true); });
+        // Push until it says no. A reader that never reads is what makes the
+        // queue back up at all.
+        for (int i = 0; i < 10000; ++i) {
+            if (!c.send(std::string(4096, 'x'))) {
+                refused.store(true);
+                break;
+            }
+            const std::size_t b = c.backlog();
+            if (b > peak.load())
+                peak.store(b);
+        }
+    });
+    const std::uint16_t port = acc.port();
+    lt.start();
+
+    net::tcp_stream peer = net::tcp_stream::connect("127.0.0.1", port, 2s);
+    assert(peer.valid());
+
+    assert(spin_until_for([&] { return refused.load(); }));
+    assert(peak.load() <= cfg.write_high_water);     // the bound held
+
+    // Now drain it: once the peer reads everything, on_drain must fire.
+    char buf[16384];
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!drained.load() && std::chrono::steady_clock::now() < deadline) {
+        if (peer.read(buf, sizeof buf, 200ms) <= 0)
+            break;
+    }
+    assert(drained.load());
+
+    pass("tcp_connection: send() refuses above the high-water mark, on_drain follows");
+}
+
+void test_tcp_reactor_reports_close_once()
+{
+    loop_on_a_thread lt;
+    net::tcp_acceptor acc(lt.loop, "127.0.0.1", 0);
+    std::atomic<int> closes{0};
+
+    acc.on_accept([&closes](net::tcp_connection c) {
+        c.on_close([&closes](net::tcp_connection) { closes.fetch_add(1); });
+        c.on_data([](net::tcp_connection, std::string& buf) { buf.clear(); });
+    });
+    const std::uint16_t port = acc.port();
+    lt.start();
+
+    {
+        net::tcp_stream peer = net::tcp_stream::connect("127.0.0.1", port, 2s);
+        assert(peer.valid());
+    }   // the peer goes
+
+    assert(spin_until_for([&] { return closes.load() > 0; }));
+    std::this_thread::sleep_for(150ms);
+    assert(closes.load() == 1);              // announced exactly once
+
+    pass("tcp_connection: a peer close is announced exactly once");
+}
+
+void test_tcp_reactor_handler_may_leave_a_partial_frame()
+{
+    // on_data hands over the connection's own buffer, so a half-arrived
+    // length-prefixed frame costs nothing: look, decide it is short, return.
+    loop_on_a_thread lt;
+    net::tcp_acceptor acc(lt.loop, "127.0.0.1", 0);
+    std::atomic<int> frames{0};
+
+    acc.on_accept([&frames](net::tcp_connection c) {
+        c.on_data([&frames](net::tcp_connection, std::string& buf) {
+            // Frames are "4 bytes of length, then that many bytes".
+            for (;;) {
+                if (buf.size() < 4)
+                    return;                  // keep the partial header
+                std::uint32_t len = 0;
+                std::memcpy(&len, buf.data(), 4);
+                if (buf.size() < 4 + len)
+                    return;                  // keep the partial body
+                buf.erase(0, 4 + len);
+                frames.fetch_add(1);
+            }
+        });
+    });
+    const std::uint16_t port = acc.port();
+    lt.start();
+
+    net::tcp_stream peer = net::tcp_stream::connect("127.0.0.1", port, 2s);
+    assert(peer.valid());
+
+    // Send three frames split across writes so the handler sees partials.
+    std::string wire;
+    for (int i = 0; i < 3; ++i) {
+        const std::string body(100 + i, char('a' + i));
+        std::uint32_t len = std::uint32_t(body.size());
+        wire.append(reinterpret_cast<const char*>(&len), 4);
+        wire += body;
+    }
+    for (std::size_t off = 0; off < wire.size(); off += 7) {
+        const std::size_t n = (off + 7 < wire.size()) ? 7 : wire.size() - off;
+        assert(peer.write_all(wire.data() + off, n, 2s));
+    }
+
+    assert(spin_until_for([&] { return frames.load() == 3; }));
+
+    pass("tcp_connection: on_data leaves a partial frame buffered for next time");
+}
+
+#endif // SNICHOLLS_HAS_EVENT_LOOP
+
 } // namespace
 
 void run_tcp_tests()
@@ -278,6 +462,12 @@ void run_tcp_tests()
     test_tcp_connect_refused_and_timed_out();
     test_tcp_handles_move_without_double_closing();
     test_tcp_listener_reports_the_chosen_port();
+#if SNICHOLLS_HAS_EVENT_LOOP
+    test_tcp_reactor_echoes_many_connections_on_one_thread();
+    test_tcp_reactor_send_is_bounded_and_drains();
+    test_tcp_reactor_reports_close_once();
+    test_tcp_reactor_handler_may_leave_a_partial_frame();
+#endif
 }
 
 #else // !SNICHOLLS_HAS_TCP

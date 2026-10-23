@@ -30,13 +30,12 @@
 //  restarted by each retry, which is the usual way a 1-second timeout quietly
 //  becomes unbounded.
 //
-//  For many connections on one thread, use the reactor and the protocols built
-//  on it. A reactor-driven tcp_stream - on_readable, a write queue with
-//  backpressure - is a reasonable thing to want and is NOT here yet: it would
-//  duplicate most of what http::session_core already does, and a second
-//  implementation of that machinery earns its place only once something needs
-//  it that the existing one cannot serve. Said plainly rather than left as a
-//  gap to discover.
+//  For many connections on one thread there is tcp_connection and tcp_acceptor
+//  below: the same bytes, driven by the reactor instead of by your thread, with
+//  a bounded write queue and a drain signal so a producer can be told to wait
+//  rather than growing memory. Reach for those when the count of connections is
+//  the thing that matters; reach for tcp_stream when the clarity of straight-
+//  line code is.
 //
 //  ------------------------------------------------------------ TLS is one line
 //
@@ -80,10 +79,15 @@
 
 #if SNICHOLLS_HAS_TCP
 
+#include "../event/loop.hpp"
 #include "../interfaces/transport_delegate.hpp"
 
 #include <chrono>
+#include <algorithm>
+#include <functional>
 #include <memory>
+#include <vector>
+#include <stdexcept>
 #include <utility>
 
 #include <cerrno>
@@ -616,6 +620,15 @@ public:
     // tcp_stream::shutdown() is: the descriptor stays put.
     bool shutdown() { return fd_ >= 0 && ::shutdown(fd_, SHUT_RDWR) == 0; }
 
+    // Give up ownership of the descriptor without closing it - for handing a
+    // bound listener to something that will own it from here (tcp_acceptor).
+    int release() noexcept
+    {
+        const int f = fd_;
+        fd_ = -1;
+        return f;
+    }
+
     void close()
     {
         if (fd_ >= 0) {
@@ -643,6 +656,428 @@ private:
     int           fd_ = -1;
     std::uint16_t port_ = 0;
 };
+
+// ===================================================================== reactor
+//
+// The same bytes, driven by the loop instead of by your thread. For the case
+// tcp_stream is the wrong shape for: many connections, one thread, nobody
+// blocking.
+//
+//     net::tcp_acceptor acc(loop, "127.0.0.1", 9000);
+//     acc.on_accept([](net::tcp_connection c) {
+//         c.on_data([](net::tcp_connection conn, std::string& buf) {
+//             conn.send(consume_frames(buf));     // leave a partial frame in buf
+//         });
+//     });
+//
+// -------------------------------------------------------------- backpressure
+//
+// send() is bounded and says so. Above write_high_water it returns false and
+// queues nothing, rather than accepting everything and growing until the
+// process dies - which is the failure an unbounded client-side queue produces,
+// and the one the errata that prompted this file asked to be able to see
+// coming. on_drain fires when the queue empties, so a producer can stop on
+// false and resume on the signal instead of polling backlog().
+//
+// ------------------------------------------------------- consuming the buffer
+//
+// on_data hands over the connection's OWN read buffer by reference, and the
+// handler erases what it has consumed. Anything left stays for the next
+// readable event, so a half-arrived length-prefixed frame costs nothing to
+// handle: look, decide it is short, return. A callback taking (ptr, len)
+// instead would force every caller to keep a second buffer for exactly that
+// case.
+//
+// Everything runs on the loop thread except send() and close(), which marshal.
+
+#if SNICHOLLS_HAS_EVENT_LOOP
+
+struct tcp_conn_config {
+    std::size_t read_chunk       = 64u * 1024;
+    // send() refuses above this. Not a hint: the point is for a producer to be
+    // told, while there is still memory left to tell it with.
+    std::size_t write_high_water = 1u * 1024 * 1024;
+};
+
+class tcp_connection
+{
+public:
+    tcp_connection() = default;
+
+    // Moveable handle over a shared core, like every other connection type
+    // here: the handlers it hands out keep the core alive exactly as long as
+    // the loop holds them.
+    tcp_connection(tcp_connection&&) noexcept = default;
+    tcp_connection& operator=(tcp_connection&&) noexcept = default;
+    tcp_connection(const tcp_connection&) = default;
+    tcp_connection& operator=(const tcp_connection&) = default;
+
+    // One handler each; setting again replaces. These are deliberately not
+    // signals - a byte stream has one owner, and fanning raw bytes to several
+    // handlers means each of them is guessing what the others consumed.
+    void on_data(std::function<void(tcp_connection, std::string&)> f) const
+    {
+        if (c_) c_->on_data = std::move(f);
+    }
+    void on_close(std::function<void(tcp_connection)> f) const
+    {
+        if (c_) c_->on_close = std::move(f);
+    }
+    void on_drain(std::function<void(tcp_connection)> f) const
+    {
+        if (c_) c_->on_drain = std::move(f);
+    }
+
+    // Queue bytes. Safe from any thread. false means either closed, or the
+    // queue is already at write_high_water and nothing was taken - check
+    // connected() to tell which.
+    bool send(std::string bytes) const
+    {
+        if (!c_ || !c_->open.load(std::memory_order_acquire))
+            return false;
+        if (c_->queued.load(std::memory_order_acquire) + bytes.size() > c_->cfg.write_high_water)
+            return false;
+        c_->queued.fetch_add(bytes.size(), std::memory_order_acq_rel);
+        auto core = c_;
+        if (core->poster.on_loop_thread()) {
+            core->append_and_flush(std::move(bytes));
+        } else {
+            core->poster.post([core, b = std::move(bytes)]() mutable {
+                core->append_and_flush(std::move(b));
+            });
+        }
+        return true;
+    }
+
+    std::size_t backlog() const noexcept
+    {
+        return c_ ? c_->queued.load(std::memory_order_acquire) : 0;
+    }
+    bool connected() const noexcept
+    {
+        return c_ && c_->open.load(std::memory_order_acquire);
+    }
+    int fd() const noexcept { return c_ ? c_->fd : -1; }
+
+    // Safe from any thread.
+    void close() const
+    {
+        if (!c_)
+            return;
+        auto core = c_;
+        if (core->poster.on_loop_thread())
+            core->teardown();
+        else
+            core->poster.post([core] { core->teardown(); });
+    }
+
+private:
+    friend class tcp_acceptor;
+
+    struct core : std::enable_shared_from_this<core> {
+        int                        fd = -1;
+        tcp_conn_config            cfg;
+        event_loop::poster         poster;
+        event_loop::fd_watch       watch;
+        std::string                in;
+        std::string                out;
+        std::size_t                sent = 0;
+        std::atomic<std::size_t>   queued{0};
+        std::atomic<bool>          open{true};
+
+        std::function<void(tcp_connection, std::string&)> on_data;
+        std::function<void(tcp_connection)>              on_close;
+        std::function<void(tcp_connection)>              on_drain;
+
+        // An open connection OWNS ITSELF, and that is the difference between an
+        // API people can use and a trap.
+        //
+        // Without it the natural spelling silently does nothing:
+        //
+        //     acc.on_accept([](tcp_connection c) { c.on_data(...); });
+        //
+        // c is a handle; it dies when the handler returns, and the watch holds
+        // only a weak reference (deliberately - a strong one there would be a
+        // cycle that never frees). So the core went with it, the socket closed,
+        // and the peer saw a connection that was accepted and then hung up on.
+        // Requiring every caller to park the handle somewhere would be a
+        // lifetime puzzle set by the library for no reason.
+        //
+        // Released in teardown(), which every path reaches - EOF, error, or an
+        // explicit close - so the cycle is broken deliberately rather than
+        // left to leak.
+        std::shared_ptr<core> self;
+
+        void append_and_flush(std::string bytes)
+        {
+            if (!open.load(std::memory_order_acquire))
+                return;
+            out += bytes;
+            flush();
+        }
+
+        void flush()
+        {
+            while (sent < out.size()) {
+#if defined(MSG_NOSIGNAL)
+                const ssize_t n = ::send(fd, out.data() + sent, out.size() - sent, MSG_NOSIGNAL);
+#else
+                const ssize_t n = ::send(fd, out.data() + sent, out.size() - sent, 0);
+#endif
+                if (n > 0) {
+                    sent += std::size_t(n);
+                    continue;
+                }
+                if (n < 0 && (errno == EINTR))
+                    continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    // Ask to be told when there is room, and keep the rest.
+                    want_write(true);
+                    compact();
+                    return;
+                }
+                teardown();
+                return;
+            }
+            out.clear();
+            sent = 0;
+            queued.store(0, std::memory_order_release);
+            want_write(false);
+            if (on_drain)
+                on_drain(handle());
+        }
+
+        // Drop what has gone rather than erase-per-write: the same reason
+        // websocket_client stopped memmoving its whole buffer per frame.
+        void compact()
+        {
+            if (sent == 0)
+                return;
+            if (sent * 2 >= out.size()) {
+                out.erase(0, sent);
+                sent = 0;
+            }
+            queued.store(out.size() - sent, std::memory_order_release);
+        }
+
+        void want_write(bool on)
+        {
+            if (writing == on || fd < 0)
+                return;
+            writing = on;
+            try {
+                watch.set_interest(on ? (fd_interest::read |
+                                         fd_interest::write)
+                                      : fd_interest::read);
+            } catch (...) {
+                // The watch is gone; teardown is already under way.
+            }
+        }
+
+        void readable()
+        {
+            if (!open.load(std::memory_order_acquire))
+                return;
+            std::string chunk;
+            chunk.resize(cfg.read_chunk);
+            for (;;) {
+                const ssize_t n = ::recv(fd, chunk.data(), chunk.size(), 0);
+                if (n > 0) {
+                    in.append(chunk.data(), std::size_t(n));
+                    if (on_data)
+                        on_data(handle(), in);
+                    if (!open.load(std::memory_order_acquire))
+                        return;              // the handler closed us
+                    if (std::size_t(n) < chunk.size())
+                        return;              // drained
+                    continue;
+                }
+                if (n == 0) {
+                    teardown();              // clean EOF
+                    return;
+                }
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    return;
+                teardown();
+                return;
+            }
+        }
+
+        // Idempotent, and announces exactly once - the same discipline the
+        // WebSocket close path needed: a handler told twice that one connection
+        // closed will double-free something.
+        void teardown()
+        {
+            if (!open.exchange(false, std::memory_order_acq_rel))
+                return;
+            auto keep = handle();            // alive for the rest of this call
+            self.reset();                    // give up self-ownership
+            watch.reset();
+            if (fd >= 0) {
+                ::close(fd);
+                fd = -1;
+            }
+            out.clear();
+            sent = 0;
+            queued.store(0, std::memory_order_release);
+
+            // Drop the handlers too. One that captured its own tcp_connection
+            // is a cycle, and this is where it gets broken - the same rule the
+            // WebSocket state follows when it clears its parked connections.
+            on_data = nullptr;
+            on_drain = nullptr;
+            auto announce = std::move(on_close);
+            on_close = nullptr;
+            if (announce)
+                announce(keep);
+        }
+
+        tcp_connection handle()
+        {
+            tcp_connection c;
+            c.c_ = shared_from_this();
+            return c;
+        }
+
+        bool writing = false;
+    };
+
+    static tcp_connection adopt(event_loop& loop, int fd, tcp_conn_config cfg)
+    {
+        auto core = std::make_shared<struct core>();
+        core->fd = fd;
+        core->cfg = cfg;
+        core->poster = loop.make_poster();
+        detail::set_nonblocking(fd, true);
+        core->watch = loop.watch(fd, fd_interest::read);
+
+        std::weak_ptr<struct core> weak = core;
+        core->watch.on_readable([weak] {
+            if (auto c = weak.lock())
+                c->readable();
+        });
+        core->watch.on_writable([weak] {
+            if (auto c = weak.lock())
+                c->flush();
+        });
+        core->watch.on_error([weak] {
+            if (auto c = weak.lock())
+                c->teardown();
+        });
+
+        core->self = core;              // open connections keep themselves alive
+
+        tcp_connection out;
+        out.c_ = std::move(core);
+        return out;
+    }
+
+    std::shared_ptr<core> c_;
+};
+
+// Accepts on the loop and hands each connection to on_accept.
+class tcp_acceptor
+{
+public:
+    tcp_acceptor() = default;
+
+    tcp_acceptor(event_loop& loop, const std::string& host, std::uint16_t port,
+                 int backlog = 128, tcp_conn_config conn = tcp_conn_config{})
+    {
+        std::string err;
+        auto l = tcp_listener::bind(host, port, backlog, &err);
+        if (!l.valid())
+            throw std::runtime_error("tcp_acceptor: " + err);
+
+        s_ = std::make_shared<state>();
+        s_->port = l.port();
+        s_->fd = l.fd();
+        s_->conn = conn;
+        s_->loop = &loop;
+        l.release();                         // the acceptor owns the fd now
+
+        s_->watch = loop.watch(s_->fd, fd_interest::read);
+        std::weak_ptr<state> weak = s_;
+        s_->watch.on_readable([weak] {
+            if (auto st = weak.lock())
+                st->accept_ready();
+        });
+    }
+
+    std::uint16_t port() const noexcept { return s_ ? s_->port : 0; }
+
+    void on_accept(std::function<void(tcp_connection)> f) const
+    {
+        if (s_) s_->on_accept = std::move(f);
+    }
+
+    // Stops accepting AND closes what was accepted: an acceptor is the owner
+    // of its connections, so outliving it would leave them driven by a loop
+    // nobody is stopping.
+    void close() const
+    {
+        if (!s_)
+            return;
+        s_->watch.reset();
+        if (s_->fd >= 0) {
+            ::close(s_->fd);
+            s_->fd = -1;
+        }
+        for (auto& w : s_->live)
+            if (auto c = w.lock())
+                c->teardown();
+        s_->live.clear();
+    }
+
+private:
+    struct state {
+        int                                 fd = -1;
+        std::uint16_t                       port = 0;
+        tcp_conn_config                     conn;
+        event_loop*                         loop = nullptr;
+        event_loop::fd_watch                watch;
+        std::function<void(tcp_connection)> on_accept;
+        std::vector<std::weak_ptr<tcp_connection::core>> live;
+
+        void prune()
+        {
+            live.erase(std::remove_if(live.begin(), live.end(),
+                                      [](const std::weak_ptr<tcp_connection::core>& w) {
+                                          return w.expired();
+                                      }),
+                       live.end());
+        }
+
+        void accept_ready()
+        {
+            for (;;) {
+                const int cfd = ::accept(fd, nullptr, nullptr);
+                if (cfd < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    return;                  // EAGAIN: drained, or a real error
+                }
+                tcp_connection c = tcp_connection::adopt(*loop, cfd, conn);
+                // Track it weakly, so closing the acceptor closes what it
+                // accepted. Without this a connection nobody holds would
+                // outlive the loop that drives it - self-ownership keeps it
+                // alive, and only teardown() releases that.
+                prune();
+                live.push_back(c.c_);
+                if (on_accept)
+                    on_accept(c);
+                else
+                    c.close();               // nobody wants it; do not leak the fd
+            }
+        }
+    };
+
+    std::shared_ptr<state> s_;
+};
+
+#endif // SNICHOLLS_HAS_EVENT_LOOP
 
 } // namespace net
 } // namespace snicholls
