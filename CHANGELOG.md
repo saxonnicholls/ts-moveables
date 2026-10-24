@@ -13,6 +13,43 @@ Five findings from an independent errata review by a downstream consumer
 (crtp2, pinned at v1.3.1), worked in its priority order. Each was measured or
 worked around downstream; the workarounds can go when a pin includes this.
 
+### Added
+
+- **`event/clock.hpp` — the loop's sense of time is replaceable.** Timers were
+  nailed to `steady_clock::now()`, which serves exactly one case and no other.
+  The consumer that reported this needs the same strategy timers to run live,
+  in replay at 0.01x–100x, paused and single-stepped — so with the clock
+  hard-wired it carries its own `event_clock`, its own timer heap *and* its own
+  pacer in parallel with the loop's. Three pieces of duplicated machinery to
+  avoid one `now()`. A test pays the same tax in smaller currency: "does this
+  fire after an hour" costs an hour, so it gets written as milliseconds and
+  tests something subtly different, or does not get written.
+
+  `loop.set_clock(...)` takes `manual_clock` (`advance`, `advance_to` — time
+  moves on command), `scaled_clock` (`set_speed`, `pause`, `resume`) or
+  `steady_clock_source` (the default, stated explicitly). `time_master`
+  inherits it with no change, because it schedules through the loop's timers
+  and had no clock calls of its own. Ties still break on the loop's sequence
+  number, so same-deadline timers keep creation order whatever the clock.
+
+  **A clock needs two methods, not one.** The obvious design is a `now()`
+  callback and it is broken: the loop must also decide how long to block the
+  **poller**, and that is a different number as soon as the timelines diverge.
+  At 100x a virtual second is 10 real milliseconds, and a manual clock must not
+  be waited on at all, since only an `advance()` will ever make its deadline
+  arrive. Hence `block_for()` beside `now()` — without it a virtual clock
+  either spins hot or sleeps through its own timers.
+
+  **Speed changes re-anchor.** `set_speed(10.0)` an hour into a 1x run must not
+  retroactively rewrite that hour, or the run jumps ten hours forward, which is
+  not what anybody means by "speed up". Both ends re-anchor first.
+
+  **The default costs nothing.** The loop holds a null clock pointer and calls
+  `steady_clock::now()` directly — one predictable branch, no virtual call —
+  and a test asserts the unchanged real-time behaviour. Six tests, including an
+  hour-long timer that fires in no wall time, and a negative control: making
+  the loop ignore the clock fails it.
+
 ### Fixed
 
 - **`event_loop::stop()` could be lost during start-up, hanging the loop

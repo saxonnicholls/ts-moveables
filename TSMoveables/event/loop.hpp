@@ -55,6 +55,7 @@
 #include <poll.h>
 #endif
 
+#include "clock.hpp"
 #include "../moveable/signal.hpp"
 #include "../concurrent/mpmc_queue.hpp"
 
@@ -331,6 +332,15 @@ namespace snicholls
                                            " must run on the loop thread (or before run())");
             }
 
+            // The loop's sense of time. Null means the real monotonic clock, which
+            // is the default and costs one predictable branch rather than a
+            // virtual call - see event/clock.hpp on why this is opt-in.
+            std::shared_ptr<loop_clock> clk;
+
+            loop_clock::time_point now_tp() const noexcept {
+                return clk ? clk->now() : std::chrono::steady_clock::now();
+            }
+
             void wake() noexcept {
                 char b = 'x';
                 [[maybe_unused]] ssize_t r = ::write(wake_write, &b, 1);   // EAGAIN: already signalled
@@ -365,7 +375,7 @@ namespace snicholls
                 }
 
                 // 2. Due timers
-                auto now = std::chrono::steady_clock::now();
+                auto now = now_tp();
                 while (!timers.empty() && timers.top().deadline <= now) {
                     heap_entry e = timers.top();
                     timers.pop();
@@ -390,10 +400,19 @@ namespace snicholls
                 if (stop_flag.load(std::memory_order_acquire)) {
                     timeout_ms = 0;
                 } else if (!timers.empty()) {
-                    const auto until = std::chrono::ceil<std::chrono::milliseconds>(
-                                           timers.top().deadline - std::chrono::steady_clock::now())
-                                           .count();
-                    timeout_ms = until < 0 ? 0 : until;
+                    // How long in REAL time, for a deadline in the clock's own
+                    // timeline - not the same number once the two differ. A
+                    // manual clock answers 0 (only an advance can make it due);
+                    // a paused one answers -1 (nothing ever will).
+                    long long until;
+                    if (clk) {
+                        until = clk->block_for(timers.top().deadline);
+                    } else {
+                        until = std::chrono::ceil<std::chrono::milliseconds>(
+                                    timers.top().deadline - std::chrono::steady_clock::now())
+                                    .count();
+                    }
+                    timeout_ms = until < 0 ? (clk ? -1 : 0) : until;
                     if (max_wait_ms >= 0 && timeout_ms > max_wait_ms)
                         timeout_ms = max_wait_ms;
                 } else {
@@ -752,6 +771,31 @@ namespace snicholls
         // The journal tap: every delivery (task, timer, fd event) is announced
         // here before it is dispatched - subscribe to record, re-drive handler
         // signals to replay
+        // Replace the loop's sense of time. Call before run(), or from the loop
+        // thread; nullptr restores the real monotonic clock.
+        //
+        // The waker is installed here rather than left to the caller, because a
+        // clock that moves on command must be able to wake a loop asleep in the
+        // poller - otherwise its deadline comes due and nobody looks.
+        void set_clock(std::shared_ptr<loop_clock> c) {
+            auto keep = c_;
+            if (keep->running.load(std::memory_order_acquire))
+                keep->require_loop_thread("set_clock");
+            keep->clk = c;
+            if (c) {
+                std::weak_ptr<core> weak = keep;
+                c->set_waker([weak] {
+                    if (auto cc = weak.lock())
+                        cc->wake();
+                });
+            }
+        }
+
+        const std::shared_ptr<loop_clock>& clock() const noexcept { return c_->clk; }
+
+        // The loop's current time, through whatever clock it is using.
+        loop_clock::time_point now() const noexcept { return c_->now_tp(); }
+
         moveable_signal<const dispatch_info&>& on_dispatch() { return c_->tap; }
 
     private:
@@ -761,7 +805,7 @@ namespace snicholls
             auto st = std::make_shared<timer_state>();
             st->id = c->next_timer_id++;
             st->period = period;
-            c->timers.push(heap_entry{std::chrono::steady_clock::now() + delay,
+            c->timers.push(heap_entry{c->now_tp() + delay,
                                       c->next_seq++, st});
             return timer(std::move(st));
         }

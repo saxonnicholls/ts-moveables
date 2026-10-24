@@ -14,6 +14,7 @@
 #include "test_helpers.hpp"
 
 #include "../TSMoveables/event/loop.hpp"
+#include "../TSMoveables/event/clock.hpp"
 
 #if SNICHOLLS_HAS_EVENT_LOOP
 
@@ -428,6 +429,178 @@ void test_loop_stop_flag_lifecycle()
     pass("event_loop: stop_flag clears on exit, so a loop is reusable");
 }
 
+// A manual clock makes a deadline arrive for free.
+//
+// Timers were nailed to steady_clock, so "does this fire after an hour" cost an
+// hour - which in practice means the test gets written as milliseconds and
+// checks something subtly different, or does not get written. Here the whole
+// hour passes in no wall time at all.
+void test_loop_manual_clock_costs_no_wall_time()
+{
+    event_loop loop;
+    auto clk = std::make_shared<manual_clock>();
+    loop.set_clock(clk);
+
+    int fired = 0;
+    auto t = loop.after(1h);
+    auto c = t.on_fire().connect([&] { ++fired; });
+
+    const auto t0 = std::chrono::steady_clock::now();
+
+    loop.run_once();
+    assert(fired == 0);                        // nothing due yet
+
+    clk->advance(59min);
+    loop.run_once();
+    assert(fired == 0);                        // still short
+
+    clk->advance(1min);
+    loop.run_once();
+    assert(fired == 1);                        // an hour later, exactly
+
+    assert(std::chrono::steady_clock::now() - t0 < 2s);   // and no hour waited
+
+    pass("event_loop: a manual clock fires an hour-long timer in no wall time");
+}
+
+// Single-stepping: one advance, one fire, in due order.
+void test_loop_manual_clock_single_steps_in_order()
+{
+    event_loop loop;
+    auto clk = std::make_shared<manual_clock>();
+    loop.set_clock(clk);
+
+    std::vector<int> order;
+    auto a = loop.after(30ms);
+    auto ca = a.on_fire().connect([&] { order.push_back(3); });
+    auto b = loop.after(10ms);
+    auto cb = b.on_fire().connect([&] { order.push_back(1); });
+    auto d = loop.after(20ms);
+    auto cd = d.on_fire().connect([&] { order.push_back(2); });
+
+    for (int step = 0; step < 3; ++step) {
+        clk->advance(10ms);
+        loop.run_once();
+    }
+    assert((order == std::vector<int>{1, 2, 3}));   // due order, not creation order
+
+    // Ties break on the loop's own sequence, so same-deadline timers keep
+    // creation order whatever the clock.
+    std::vector<int> tied;
+    auto t1 = loop.after(5ms);
+    auto c1 = t1.on_fire().connect([&] { tied.push_back(1); });
+    auto t2 = loop.after(5ms);
+    auto c2 = t2.on_fire().connect([&] { tied.push_back(2); });
+    clk->advance(5ms);
+    loop.run_once();
+    assert((tied == std::vector<int>{1, 2}));
+
+    pass("event_loop: a manual clock single-steps, and ties keep creation order");
+}
+
+// A repeating timer must not burst when virtual time jumps.
+void test_loop_manual_clock_repeats_without_bursting()
+{
+    event_loop loop;
+    auto clk = std::make_shared<manual_clock>();
+    loop.set_clock(clk);
+
+    int ticks = 0;
+    auto t = loop.every(10ms);
+    auto c = t.on_fire().connect([&] { ++ticks; });
+
+    // One big jump fires once and skips ahead, rather than firing ten times -
+    // the same stalled-loop rule the real clock follows.
+    clk->advance(100ms);
+    loop.run_once();
+    assert(ticks == 1);
+
+    for (int i = 0; i < 5; ++i) {
+        clk->advance(10ms);
+        loop.run_once();
+    }
+    assert(ticks == 6);
+
+    pass("event_loop: a repeating timer does not burst on a virtual jump");
+}
+
+// Scaled time: the same timer, finished in a fraction of the wall clock.
+void test_loop_scaled_clock_replays_faster()
+{
+    event_loop loop;
+    auto clk = std::make_shared<scaled_clock>(100.0);
+    loop.set_clock(clk);
+
+    std::atomic<bool> fired{false};
+    auto t = loop.after(2s);
+    auto c = t.on_fire().connect([&] { fired.store(true); });
+
+    std::thread th([&loop] { loop.run(); });
+    spin_until([&loop] { return loop.running(); });
+
+    // Two virtual seconds at 100x is ~20 real ms. The claim under test is
+    // "far less than two seconds", not a precise ratio - a ratio would be a
+    // timing test, and therefore flaky.
+    const auto t0 = std::chrono::steady_clock::now();
+    assert(spin_until_for([&fired] { return fired.load(); }));
+    assert(std::chrono::steady_clock::now() - t0 < 1s);
+
+    loop.stop();
+    th.join();
+    pass("event_loop: a scaled clock replays a 2s timer in well under 2s");
+}
+
+// Paused means paused: time stops, so a deadline cannot arrive.
+void test_loop_scaled_clock_pauses_and_resumes()
+{
+    auto clk = std::make_shared<scaled_clock>(1.0);
+    const auto before = clk->now();
+    clk->pause();
+    assert(clk->paused());
+
+    const auto held = clk->now();
+    std::this_thread::sleep_for(60ms);
+    assert(clk->now() == held);                  // frozen, not merely slowed
+    assert(clk->now() >= before);
+
+    clk->resume();
+    assert(!clk->paused());
+    spin_until([&] { return clk->now() > held; });
+
+    // A speed change re-anchors rather than rewriting time already passed: no
+    // jump in either direction.
+    auto fast = std::make_shared<scaled_clock>(1.0);
+    std::this_thread::sleep_for(50ms);
+    const auto at_change = fast->now();
+    fast->set_speed(10.0);
+    assert(fast->now() >= at_change);
+    assert(fast->now() < at_change + 1s);
+
+    pass("scaled_clock: pause freezes time, and a speed change re-anchors");
+}
+
+// Nothing changes for a caller who never asks for a clock.
+void test_loop_default_clock_is_real_time()
+{
+    event_loop loop;
+    assert(!loop.clock());                       // null means the steady clock
+
+    const auto a = loop.now();
+    std::this_thread::sleep_for(20ms);
+    assert(loop.now() > a);                      // real time, moving
+
+    std::atomic<bool> fired{false};
+    auto t = loop.after(10ms);
+    auto c = t.on_fire().connect([&] { fired.store(true); });
+    std::thread th([&loop] { loop.run(); });
+    spin_until([&loop] { return loop.running(); });
+    assert(spin_until_for([&fired] { return fired.load(); }));
+    loop.stop();
+    th.join();
+
+    pass("event_loop: with no clock set it is real time, as before");
+}
+
 void run_event_loop_tests()
 {
     test_loop_fd_events();
@@ -440,6 +613,12 @@ void run_event_loop_tests()
     test_loop_dispatch_tap();
     test_loop_stop_right_after_running_is_not_lost();
     test_loop_stop_flag_lifecycle();
+    test_loop_default_clock_is_real_time();
+    test_loop_manual_clock_costs_no_wall_time();
+    test_loop_manual_clock_single_steps_in_order();
+    test_loop_manual_clock_repeats_without_bursting();
+    test_loop_scaled_clock_replays_faster();
+    test_loop_scaled_clock_pauses_and_resumes();
 }
 
 #else // !SNICHOLLS_HAS_EVENT_LOOP
