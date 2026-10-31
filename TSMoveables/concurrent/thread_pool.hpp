@@ -502,6 +502,51 @@ namespace snicholls
         std::size_t worker_count() const noexcept override { return c_->n; }
     };
 
+    // ----------------------------------------------------- deterministic
+    //
+    // Runs every task on the submitting thread, immediately, in submission
+    // order. No threads, no queue, no scheduling - which is the point.
+    //
+    //     inline_task_pool pool;
+    //     parallel_for(pool, 0, n, body);     // runs serially, in index order
+    //     task_graph g(pool);  g.run();       // level order, then node order
+    //
+    // Why a pool that does not pool: REPRODUCIBILITY. Analytics run in parallel
+    // inside a backtest complete in whatever order the scheduler chose, so
+    // anything that depends on completion order - first result wins, the
+    // accumulation order of a floating-point sum - gives a different answer on
+    // a different run, and a backtest whose number moves when nothing changed
+    // is not evidence of anything. Swapping the pool for this one makes the
+    // whole dependent stack deterministic without touching the code under test.
+    //
+    // It works on everything built on task_pool because worker_count() == 1 is
+    // the signal those algorithms already respect: parallel_for, parallel_reduce,
+    // parallel_scan and parallel_sort all take their serial path at one worker,
+    // task_group runs each unit as it is handed over, and task_graph walks its
+    // levels in order and each level in node order. One is also the honest
+    // answer - there IS one thread doing the work, the caller's - and it keeps
+    // the grain arithmetic away from a division by zero.
+    //
+    // One difference worth knowing: submit() is a direct call, so an exception
+    // from a task propagates out of submit() rather than being collected for a
+    // later wait_idle(). Inside task_group and the parallel algorithms that is
+    // invisible, because they catch at the unit boundary either way.
+    class inline_task_pool final : public task_pool {
+    public:
+        inline_task_pool() = default;
+
+        void submit(task t) override
+        {
+            if (t)
+                t();
+        }
+
+        // Nothing is ever outstanding: it all ran before submit() returned.
+        void wait_idle() override {}
+
+        std::size_t worker_count() const noexcept override { return 1; }
+    };
+
 } // namespace snicholls
 
 #endif /* thread_pool_hpp */

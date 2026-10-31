@@ -15,6 +15,54 @@ worked around downstream; the workarounds can go when a pin includes this.
 
 ### Added
 
+- **`inline_task_pool`** — runs every task on the submitting thread,
+  immediately, in submission order. A pool that does not pool, for
+  **reproducibility**: analytics run in parallel inside a backtest complete in
+  whatever order the scheduler chose, so anything depending on completion order
+  — first result wins, the accumulation order of a floating-point sum — gives a
+  different answer on a different run, and a backtest whose number moves when
+  nothing changed is not evidence of anything. It needed no "deterministic
+  mode" anywhere else, because `worker_count() == 1` is a signal every
+  algorithm already respects: `parallel_for`, `reduce`, `scan` and `sort` take
+  their serial path, `task_group` runs each unit as it is handed over, and
+  `task_graph` walks its levels in order and each level in node order. A float
+  sum on it matches the serial one **bit for bit**. Three tests.
+
+- **`websocket_client` write-side backpressure** — `backlog()`, a
+  `max_queue_bytes` bound (default 8 MB, 0 disables), and `rejected` in the
+  stats. The server handle has had `backlog()` from the start; the client
+  queued every send with no bound and no signal, so a producer could only
+  discover it was outrunning the upstream by running out of memory.
+
+### Fixed
+
+- **Both send bounds were soft, and both refused oversized messages forever.**
+  Found by writing the tests for the bound above, and the same two defects were
+  in `tcp_connection::send()`.
+
+  *Soft:* the bound was checked against bytes the loop had **appended**, but
+  `send()` posts a task and returns — so a fast producer could post far past
+  the cap before the loop caught up, and the bound was a suggestion. Both now
+  count **in-flight** bytes (accepted, not yet appended) as well, reserving
+  before checking so two threads racing for the last of the headroom cannot
+  both get it, and releasing *after* the append so a byte is briefly counted
+  twice rather than ever not at all. A test parks the loop so every accepted
+  send stays in flight, then asserts the cap holds exactly.
+
+  *Oversized:* `0 + size > bound` refused a single message larger than the
+  bound even on an **empty** queue — so the bound doubled as an undocumented
+  cap on message size, and a 10 MB message under an 8 MB bound was unsendable
+  forever, the only symptom a `false` that retrying could never turn `true`.
+  Both now refuse only when something is already waiting, the same rule the
+  hub's replay ring follows for a chunk larger than its whole budget.
+
+  *And one more, in `tcp_connection`:* `compact()` returned early when nothing
+  had been sent — which is precisely the backed-up case, socket full and the
+  queue just grown — so the backlog was never published and `send()` never
+  refused. It had been masked by `send()` bumping the counter itself; once the
+  loop became the only publisher, the existing backpressure test caught it.
+  All three graded by negative control.
+
 - **`event/clock.hpp` — the loop's sense of time is replaceable.** Timers were
   nailed to `steady_clock::now()`, which serves exactly one case and no other.
   The consumer that reported this needs the same strategy timers to run live,

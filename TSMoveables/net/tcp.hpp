@@ -735,23 +735,40 @@ public:
     {
         if (!c_ || !c_->open.load(std::memory_order_acquire))
             return false;
-        if (c_->queued.load(std::memory_order_acquire) + bytes.size() > c_->cfg.write_high_water)
+        // Reserve, then check: two threads racing for the last of the headroom
+        // cannot both get it. Refuse only when something is already waiting,
+        // so one message larger than the bound can still go out on an empty
+        // queue rather than being unsendable forever.
+        const std::size_t size = bytes.size();
+        const std::size_t hw = c_->cfg.write_high_water;
+        const std::size_t before = c_->in_flight.fetch_add(size, std::memory_order_acq_rel);
+        const std::size_t held = before + c_->queued.load(std::memory_order_acquire);
+        if (held != 0 && held + size > hw) {
+            c_->in_flight.fetch_sub(size, std::memory_order_acq_rel);
             return false;
-        c_->queued.fetch_add(bytes.size(), std::memory_order_acq_rel);
+        }
         auto core = c_;
         if (core->poster.on_loop_thread()) {
             core->append_and_flush(std::move(bytes));
+            core->in_flight.fetch_sub(size, std::memory_order_acq_rel);
         } else {
-            core->poster.post([core, b = std::move(bytes)]() mutable {
+            core->poster.post([core, size, b = std::move(bytes)]() mutable {
                 core->append_and_flush(std::move(b));
+                // After the append: briefly counted twice, never not at all.
+                core->in_flight.fetch_sub(size, std::memory_order_acq_rel);
             });
         }
         return true;
     }
 
+    // Everything accepted and not yet on the wire: posted-but-unprocessed as
+    // well as appended. Counting only the second made the bound soft by
+    // however much a producer could post before the loop caught up.
     std::size_t backlog() const noexcept
     {
-        return c_ ? c_->queued.load(std::memory_order_acquire) : 0;
+        return c_ ? c_->in_flight.load(std::memory_order_acquire) +
+                    c_->queued.load(std::memory_order_acquire)
+                  : 0;
     }
     bool connected() const noexcept
     {
@@ -782,7 +799,8 @@ private:
         std::string                in;
         std::string                out;
         std::size_t                sent = 0;
-        std::atomic<std::size_t>   queued{0};
+        std::atomic<std::size_t>   queued{0};      // appended, not yet sent - loop-published
+        std::atomic<std::size_t>   in_flight{0};   // accepted by send(), not yet appended
         std::atomic<bool>          open{true};
 
         std::function<void(tcp_connection, std::string&)> on_data;
@@ -851,12 +869,16 @@ private:
         // websocket_client stopped memmoving its whole buffer per frame.
         void compact()
         {
-            if (sent == 0)
-                return;
-            if (sent * 2 >= out.size()) {
+            if (sent != 0 && sent * 2 >= out.size()) {
                 out.erase(0, sent);
                 sent = 0;
             }
+            // ALWAYS publish, including when nothing was written this round.
+            // That is precisely the backed-up case - socket full, sent still
+            // 0, out just grew - and an early return there left the backlog
+            // invisible, so send() never refused. It used to be masked by
+            // send() bumping the counter itself; with the loop as the only
+            // publisher, this line is what the bound rests on.
             queued.store(out.size() - sent, std::memory_order_release);
         }
 

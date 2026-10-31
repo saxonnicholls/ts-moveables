@@ -408,6 +408,90 @@ void test_ws_client_sends_binary()
     pass("websocket_client: send_binary carries arbitrary bytes as a binary frame");
 }
 
+// The bound counts what is IN FLIGHT, not only what the loop has appended.
+//
+// Made deterministic rather than timing-dependent by parking the loop: while it
+// is frozen nothing posted gets processed, so every accepted send stays in
+// flight. A bound measured only against appended bytes would see an empty
+// queue throughout and accept forever - which is exactly what the first
+// version of it did, making the cap a suggestion a fast producer could post
+// straight past.
+void test_ws_client_bound_counts_in_flight()
+{
+    echo_server s;
+    s.start();
+    loop_thread lt;
+
+    ws_client_config cfg;
+    cfg.max_queue_bytes = 64 * 1024;
+    websocket_client c(cfg);
+    std::atomic<int> opens{0};
+    c.on_open([&opens] { opens.fetch_add(1); });
+    assert(c.connect(lt.loop, "ws://127.0.0.1:" + std::to_string(s.port) + "/feed"));
+    lt.start();
+    assert(spin_until_for([&] { return opens.load() == 1; }));
+
+    std::atomic<bool> parked{false}, release{false};
+    lt.loop.post([&] {
+        parked.store(true);
+        while (!release.load())
+            std::this_thread::yield();
+    });
+    spin_until([&] { return parked.load(); });
+
+    std::size_t accepted = 0;
+    bool refused = false;
+    for (int i = 0; i < 1000 && !refused; ++i) {
+        if (c.send_binary(std::string(4096, 'x')))
+            accepted += 4096;
+        else
+            refused = true;
+    }
+
+    assert(refused);                                   // it said no...
+    assert(accepted <= cfg.max_queue_bytes);           // ...within the bound, hard
+    assert(c.backlog() <= cfg.max_queue_bytes);        // and backlog() agrees
+    assert(c.snapshot().rejected >= 1);
+
+    release.store(true);                               // let it all drain
+    assert(spin_until_for([&] { return c.backlog() == 0; }));
+
+    c.close();
+    lt.stop();
+    pass("websocket_client: the send bound counts in-flight bytes, so it is hard");
+}
+
+// One message bigger than the whole bound, sent onto an EMPTY queue, must go.
+//
+// Refusing it would make max_queue_bytes a silent cap on message size as well
+// - a 10MB message under an 8MB bound would be unsendable forever, with the
+// only symptom a false that retrying can never turn true.
+void test_ws_client_oversized_message_on_empty_queue_is_sent()
+{
+    echo_server s;
+    s.start();
+    loop_thread lt;
+
+    ws_client_config cfg;
+    cfg.max_queue_bytes = 1024;                        // far smaller than the message
+    websocket_client c(cfg);
+    std::atomic<int> opens{0};
+    std::atomic<std::size_t> echoed{0};
+    c.on_open([&opens] { opens.fetch_add(1); });
+    c.on_message([&echoed](const ws_message& m) { echoed.store(m.data.size()); });
+    assert(c.connect(lt.loop, "ws://127.0.0.1:" + std::to_string(s.port) + "/feed"));
+    lt.start();
+    assert(spin_until_for([&] { return opens.load() == 1; }));
+
+    const std::string big(64 * 1024, 'q');
+    assert(c.send_binary(big));                        // empty queue: allowed
+    assert(spin_until_for([&] { return echoed.load() == big.size(); }));
+
+    c.close();
+    lt.stop();
+    pass("websocket_client: a message larger than the bound still goes on an empty queue");
+}
+
 void test_ws_client_relays_into_the_hub()
 {
     // The N-in half joined to the M-out half: an upstream feed arrives on a
@@ -449,6 +533,8 @@ void run_all()
     test_ws_client_close_is_final();
     test_ws_client_close_sends_a_close_frame();
     test_ws_client_sends_binary();
+    test_ws_client_bound_counts_in_flight();
+    test_ws_client_oversized_message_on_empty_queue_is_sent();
     test_ws_client_relays_into_the_hub();
 }
 

@@ -760,6 +760,110 @@ void test_task_graph_stops_at_a_failed_level()
     pass("task_graph: a throwing node stops the levels that depended on it");
 }
 
+// ------------------------------------------------- deterministic execution
+
+void test_inline_pool_makes_everything_deterministic()
+{
+    // The reproducibility problem: analytics run in parallel inside a backtest
+    // complete in whatever order the scheduler chose, so anything depending on
+    // completion order gives a different answer each run - and a backtest whose
+    // number moves when nothing changed is not evidence of anything.
+    inline_task_pool pool;
+    assert(pool.worker_count() == 1);
+
+    // parallel_for: index order, on this thread, every time.
+    std::vector<int> order;
+    const std::thread::id here = std::this_thread::get_id();
+    std::vector<std::thread::id> threads;
+    parallel_for(pool, 0, 64, [&](int i) {
+        order.push_back(i);
+        threads.push_back(std::this_thread::get_id());
+    });
+    for (int i = 0; i < 64; ++i)
+        assert(order[std::size_t(i)] == i);         // strictly in order
+    for (const auto& id : threads)
+        assert(id == here);                         // and all on the caller
+
+    // parallel_reduce: the fold order is fixed, so a non-commutative op is
+    // exactly predictable rather than merely associative-safe.
+    std::vector<std::string> w{"a", "b", "c", "d", "e"};
+    const std::string cat = parallel_reduce_each(
+        pool, w.begin(), w.end(), std::string{},
+        [](const std::string& x) { return x; },
+        [](std::string a, std::string b) { return a + b; });
+    assert(cat == "abcde");
+
+    // task_group: each unit runs as it is handed over.
+    std::vector<int> ran;
+    {
+        task_group g(pool);
+        for (int i = 0; i < 20; ++i)
+            g.run([&ran, i] { ran.push_back(i); });
+        g.wait();
+    }
+    for (int i = 0; i < 20; ++i)
+        assert(ran[std::size_t(i)] == i);
+
+    pass("inline_task_pool: parallel_for, reduce and task_group all run in order");
+}
+
+void test_inline_pool_makes_task_graph_deterministic()
+{
+    // Topological order with a stable tie-break: levels in order, and each
+    // level in node order - so a dependency graph replays identically.
+    inline_task_pool pool;
+
+    std::vector<int> first, second;
+    for (std::vector<int>* out : {&first, &second}) {
+        task_graph g(pool);
+        std::vector<task_graph::node_id> ids;
+        for (int i = 0; i < 6; ++i) {
+            const int n = i;
+            ids.push_back(g.add([out, n] { out->push_back(n); }));
+        }
+        // 0 -> {1,2,3} -> {4,5}: one wide level in the middle, so a scheduler
+        // would be free to reorder it and an inline pool is not.
+        g.precede(ids[0], ids[1]);
+        g.precede(ids[0], ids[2]);
+        g.precede(ids[0], ids[3]);
+        g.precede(ids[1], ids[4]);
+        g.precede(ids[2], ids[4]);
+        g.precede(ids[3], ids[5]);
+        assert(g.depth() == 3);
+        assert(g.width() == 3);
+        g.run();
+    }
+
+    assert(first == second);                        // identical across runs
+    assert((first == std::vector<int>{0, 1, 2, 3, 4, 5}));
+
+    pass("inline_task_pool: task_graph replays in topological, tie-broken order");
+}
+
+void test_inline_pool_floating_point_sum_is_bit_stable()
+{
+    // The concrete symptom the errata names: an accumulation whose order
+    // decides its last bits. On an inline pool the order is fixed, so the sum
+    // is not merely deterministic run to run - it is exactly the serial one.
+    inline_task_pool pool;
+    const int n = 10000;
+    const std::size_t sz = static_cast<std::size_t>(n);
+    std::vector<double> v(sz);
+    for (int i = 0; i < n; ++i)
+        v[std::size_t(i)] = 1.0 / double(i + 1);
+
+    const double par = parallel_reduce(pool, 0, n, 0.0,
+                                       [&](int i) { return v[std::size_t(i)]; },
+                                       std::plus<double>{});
+    double serial = 0.0;
+    for (int i = 0; i < n; ++i)
+        serial += v[std::size_t(i)];
+
+    assert(par == serial);                          // bit for bit
+
+    pass("inline_task_pool: a float sum matches the serial one bit for bit");
+}
+
 } // namespace
 
 void run_parallel_for_tests()
@@ -793,4 +897,7 @@ void run_parallel_for_tests()
     test_task_graph_reports_its_own_ceiling();
     test_task_graph_refuses_a_cycle();
     test_task_graph_stops_at_a_failed_level();
+    test_inline_pool_makes_everything_deterministic();
+    test_inline_pool_makes_task_graph_deterministic();
+    test_inline_pool_floating_point_sum_is_bit_stable();
 }

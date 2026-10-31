@@ -374,6 +374,32 @@ void test_tcp_reactor_send_is_bounded_and_drains()
     pass("tcp_connection: send() refuses above the high-water mark, on_drain follows");
 }
 
+// A message larger than the high-water mark, on an empty queue, still goes.
+//
+// The first bound refused it - 0 + size > high_water - so any message bigger
+// than the mark was unsendable forever and the bound doubled as an
+// undocumented cap on message size.
+void test_tcp_reactor_oversized_send_on_empty_queue()
+{
+    loop_on_a_thread lt;
+    net::tcp_conn_config cfg;
+    cfg.write_high_water = 4 * 1024;
+    net::tcp_acceptor acc(lt.loop, "127.0.0.1", 0, 128, cfg);
+
+    const std::string big(256 * 1024, 'z');               // 64x the mark
+    std::atomic<bool> accepted{false};
+    acc.on_accept([&](net::tcp_connection c) { accepted.store(c.send(big)); });
+    const std::uint16_t port = acc.port();
+    lt.start();
+
+    net::tcp_stream peer = net::tcp_stream::connect("127.0.0.1", port, 2s);
+    assert(peer.valid());
+    assert(read_exactly(peer, big.size(), 5s) == big);    // all of it arrived
+    assert(accepted.load());
+
+    pass("tcp_connection: one send larger than the high water still goes on an empty queue");
+}
+
 void test_tcp_reactor_reports_close_once()
 {
     loop_on_a_thread lt;
@@ -465,6 +491,7 @@ void run_tcp_tests()
 #if SNICHOLLS_HAS_EVENT_LOOP
     test_tcp_reactor_echoes_many_connections_on_one_thread();
     test_tcp_reactor_send_is_bounded_and_drains();
+    test_tcp_reactor_oversized_send_on_empty_queue();
     test_tcp_reactor_reports_close_once();
     test_tcp_reactor_handler_may_leave_a_partial_frame();
 #endif

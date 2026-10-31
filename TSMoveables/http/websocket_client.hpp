@@ -191,6 +191,13 @@ struct ws_client_config {
     std::chrono::milliseconds session_grace{5000};
 
     std::size_t max_message = 16u * 1024 * 1024;   // reassembled, across fragments
+
+    // Outbound bound. send_text/send_binary refuse above this and queue
+    // NOTHING, rather than accepting everything and growing until the process
+    // dies - the failure mode of an unbounded client queue, and one that only
+    // shows up once the upstream is slow, which is exactly when you can least
+    // afford it. 0 disables the bound, which is the old behaviour said out loud.
+    std::size_t max_queue_bytes = 8u * 1024 * 1024;
     bool auto_reconnect = true;
 
     // Sent as-is in the handshake: Authorization, Sec-WebSocket-Protocol, and
@@ -244,6 +251,10 @@ struct ws_client_stats {
     std::uint64_t bytes_in      = 0;
     bool          connected     = false;
     std::uint32_t attempt       = 0;   // consecutive failures; 0 when healthy
+    // Bytes queued for the socket right now. The server handle has had
+    // backlog() from the start; the client had no way to see the same thing.
+    std::uint64_t backlog       = 0;
+    std::uint64_t rejected      = 0;   // sends refused by max_queue_bytes
 };
 
 // ---------------------------------------------------------------- the client
@@ -336,13 +347,48 @@ private:
         event_loop* l = c->loop.load(std::memory_order_relaxed);
         if (!l || c->stopped.load(std::memory_order_relaxed))
             return false;
-        l->post([c, op, p = std::move(payload)]() mutable {
+        // Bounded, and refusing takes NOTHING - so a producer told false has
+        // not half-sent a message and can retry the same bytes once backlog()
+        // has fallen. Checked here rather than on the loop, so a caller finds
+        // out at the call rather than later in a counter.
+        //
+        // Reserve-then-check rather than check-then-add, so two threads racing
+        // the last of the headroom cannot both get it. And refuse only when
+        // something is ALREADY waiting: a single message bigger than the bound,
+        // sent onto an empty queue, must still be sendable, or the bound would
+        // quietly cap message size as well - the same rule the hub's replay
+        // ring follows for a chunk larger than its whole budget.
+        const std::size_t size = payload.size();
+        const std::size_t cap = c->cfg.max_queue_bytes;
+        const std::uint64_t before = c->in_flight.fetch_add(size, std::memory_order_acq_rel);
+        if (cap != 0) {
+            const std::uint64_t held = before + c->queued_bytes.load(std::memory_order_acquire);
+            if (held != 0 && held + size > cap) {
+                c->in_flight.fetch_sub(size, std::memory_order_acq_rel);
+                c->n_rejected.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        l->post([c, op, size, p = std::move(payload)]() mutable {
             c->queue_out(op, std::move(p));
+            // Released AFTER the append, so for a moment it is counted twice
+            // rather than not at all: over-counting is the safe direction for
+            // a bound.
+            c->in_flight.fetch_sub(size, std::memory_order_acq_rel);
         });
         return true;
     }
 
 public:
+    // Bytes queued for the socket. The server handle has had this since the
+    // start; the client had no way to see the same thing, so a producer could
+    // only find out it was outrunning the upstream by running out of memory.
+    std::size_t backlog() const noexcept
+    {
+        return static_cast<std::size_t>(c_->in_flight.load(std::memory_order_acquire) +
+                                        c_->queued_bytes.load(std::memory_order_acquire));
+    }
+
     stats snapshot() const { return c_->snapshot(); }
     bool connected() const noexcept { return c_->open.load(std::memory_order_relaxed); }
     // By value, not by reference: the member is rewritten by connect(), and a
@@ -411,6 +457,16 @@ private:
         std::size_t in_off = 0;         // how much of `in` is already consumed
         std::string out;                // bytes awaiting the socket
         std::size_t sent = 0;
+        // Published so send() can bound itself from ANY thread without taking
+        // the loop. Written on the loop, read anywhere.
+        std::atomic<std::uint64_t> queued_bytes{0};   // appended, not yet on the wire
+        // Accepted by send() but still in a posted task the loop has not run.
+        // Counted separately because the loop only knows what it has APPENDED:
+        // bound against that alone and a fast producer can post far past the
+        // cap before the loop catches up, which makes it a suggestion rather
+        // than a bound.
+        std::atomic<std::uint64_t> in_flight{0};
+        std::atomic<std::uint64_t> n_rejected{0};
         std::string accept_expected;
 
         // Fragment reassembly, per RFC 6455 §5.4
@@ -439,6 +495,9 @@ private:
             s.bytes_in     = n_bytes_in.load(std::memory_order_relaxed);
             s.connected    = open.load(std::memory_order_relaxed);
             s.attempt      = attempt.load(std::memory_order_relaxed);
+            s.backlog      = in_flight.load(std::memory_order_acquire) +
+                             queued_bytes.load(std::memory_order_acquire);
+            s.rejected     = n_rejected.load(std::memory_order_relaxed);
             return s;
         }
 
@@ -591,6 +650,7 @@ private:
                 if (n < 0 && errno == EINTR)
                     continue;
                 if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    publish_backlog();          // the queue is real; say how deep
                     watch.set_interest(fd_interest::read_write);
                     return;
                 }
@@ -598,6 +658,7 @@ private:
             }
             out.clear();
             sent = 0;
+            publish_backlog();
             watch.set_interest(fd_interest::read);
         }
 
@@ -801,6 +862,11 @@ private:
             return true;
         }
 
+        void publish_backlog()
+        {
+            queued_bytes.store(out.size() - sent, std::memory_order_release);
+        }
+
         void queue_out(ws_opcode op, std::string payload)
         {
             if (fd < 0)
@@ -813,6 +879,7 @@ private:
                 n_messages_out.fetch_add(1, std::memory_order_relaxed);
             if (open.load(std::memory_order_relaxed) || handshaking)
                 flush();
+            publish_backlog();
         }
 
         // ------------------------------------------------------- teardown
@@ -863,6 +930,7 @@ private:
             in_off = 0;
             out.clear();
             sent = 0;
+            queued_bytes.store(0, std::memory_order_release);
 
             if (final_)
                 stopped.store(true, std::memory_order_relaxed);
