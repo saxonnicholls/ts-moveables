@@ -72,6 +72,7 @@ if(TS_MOVEABLES_BUILD_TESTS)
         tests/tests_disruptor.cpp
         tests/tests_signal.cpp
         tests/tests_mpmc_queue.cpp
+        tests/tests_seqlock.cpp
         tests/tests_thread_pool.cpp
         tests/tests_parallel_for.cpp
         tests/tests_moveability.cpp

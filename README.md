@@ -62,6 +62,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 |---|---|
 | make a class holding a mutex / atomic / cv / … **moveable** | the [moveable primitive](#the-types) — `moveable_mutex`, `moveable_atomic`, `moveable_semaphore`, `moveable_latch`, … |
 | touch a value **only under its lock** | [`synchronized<T>`](#synchronizedt) (+ heterogeneous `variant` / `tuple` / `any` / type-map / bag) |
+| **publish a latest value** to many readers — a quote, a portfolio, a limit | [`seqlock<T>`](#seqlock) — readers write nothing shared, the writer never waits |
 | **hand off between two threads**, lock-free | [`circular_buffer<T>`](#circular_buffer) — reach for `push_n`/`pop_n` when you need throughput |
 | **broadcast an event** to many typed listeners | [`moveable_signal`](#moveable_signal) |
 | a **pipeline** with consumer dependency graphs | [`disruptor<T>`](#disruptor) |
@@ -140,6 +141,7 @@ Moved-from objects are always left valid and usable.
 | `moveable/signal.hpp` | `moveable_signal<Args...>` + `connection` / `scoped_connection` | Boost.Signals2 / sigslot | — | connections survive the move |
 | `concurrent/synchronized.hpp` | `synchronized<T, M>` / `synchronized_waitable<T, M>` | `folly::Synchronized` / P0290 | locked | locked / checked |
 | `concurrent/synchronized_heterogeneous.hpp` | `synchronized_variant<Ts...>`, `synchronized_tuple<Ts...>`, `synchronized_any`, `synchronized_type_map`, `synchronized_bag` | — | locked | locked |
+| `concurrent/seqlock.hpp` | `seqlock<T>` — one writer, many lock-free readers, trivially copyable `T` | Linux kernel `seqlock_t` / folly | — | quiescent |
 | `concurrent/circular_buffer.hpp` | `circular_buffer<T>` / `circular_buffer<T, N>` | `boost::lockfree::spsc_queue` (immovable) | checked | checked, contents transfer |
 | `concurrent/intern_pool.hpp` | `intern_pool<T, Hash, Eq>` — content-addressed interning (hash-consing) | `boost::flyweight` | — (would fork identity) | quiescent; canonical pointers survive |
 | `concurrent/mpmc_queue.hpp` | `mpmc_queue<T>` (bounded, lock-free) | Vyukov bounded MPMC / moodycamel | — | quiescent, contents transfer |
@@ -241,6 +243,33 @@ auto ints = bag.extract<int>();
 ```
 
 (plus `synchronized_any` for a single value of unknown type). Value-returning reads (`try_get`, `holds`, `count`) are snapshots; the closure forms (`visit`, `apply`, `with`, `for_each`) are the race-free read-modify-write paths. Everything is built on `synchronized<T>`, so the whole structure still moves.
+
+## seqlock
+
+One writer publishes a value; any number of readers take consistent copies; nobody waits on anybody.
+
+```cpp
+snicholls::seqlock<quote> top;
+
+top.write(q);                                   // the one writer - never blocks, never fails
+quote now = top.read();                         // any reader - retries while a write overlaps, never blocks the writer
+if (top.try_read(now)) { /* ... */ }            // one attempt, for a reader that must not spin
+auto [value, version] = top.read_versioned();   // "has it changed since?" without comparing values
+```
+
+A reader writes **nothing shared**: it reads a sequence number, copies the value, reads the number again, and retries if a write happened in between. Every reader of a mutex or `shared_mutex` writes the lock's cache line instead, so they slow each other — and the writer — down. The rules: `T` is trivially copyable and default constructible, there is one writer at a time, and `T` should be small, because every read copies all of it.
+
+**Without the textbook data race.** The usual seqlock copies the value with `memcpy` while the writer may be writing it and relies on the retry to throw a torn copy away — but in C++ that concurrent non-atomic access is undefined behaviour whatever happens afterwards, and ThreadSanitizer reports it. Here the value is an array of `std::atomic<std::uint64_t>` words (Boehm, *Can seqlocks get along with programming language memory models?*, 2012), ordered by release stores and acquire loads rather than fences, which ThreadSanitizer cannot model. On x86-64 each of those is a plain `mov`; on ARM64, one `ldar`/`stlr` per 8 bytes.
+
+**Measured** (`make bench`, a 32-byte quote, one writer paced to ~1 write/µs like a busy feed, 8 readers, best of 3):
+
+| | Linux, GCC 13, 20 cores | macOS, 32 cores |
+|---|---:|---:|
+| `synchronized<T>` (mutex) | 11.7 M reads/s, writer at 0.43 M/s | 15.9 M reads/s, writer at 0.11 M/s |
+| `std::shared_mutex` | 24.5 M reads/s, writer at 0.01 M/s | 2.9 M reads/s, writer at 0.03 M/s |
+| `seqlock<T>` | **2,762 M reads/s, writer at 0.97 M/s** | **1,519 M reads/s, writer at 0.89 M/s** |
+
+Reads scale with the number of readers, and the writer keeps its pace — where a reader-writer lock nearly starves it, which is the failure that matters when the writer is the one publishing fresh prices. With the writer flat out (the worst case: every overlapping write is a retry) the seqlock still reads at least 20x faster than either lock at 8 readers, on both.
 
 ## circular_buffer
 

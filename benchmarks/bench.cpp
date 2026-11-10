@@ -29,6 +29,7 @@
 #include <iterator>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 
@@ -401,6 +402,118 @@ void bench_forkjoin()
     }
 }
 
+// ------------------------------------------------------------ latest value
+// One writer publishes a 32-byte quote; N readers each take consistent copies
+// as fast as they can for a fixed time. Total reads per second is the figure,
+// with the writes the writer managed alongside. Three ways to share it: a
+// mutex (synchronized<T>), a reader-writer lock (std::shared_mutex, readers
+// shared), and seqlock<T>. Run twice: the writer flat out - the worst case for
+// a seqlock, whose readers retry on every overlapping write - and paced to
+// about one write a microsecond, which is what a busy market-data feed is.
+
+struct bench_quote {
+    double bid, ask;
+    std::uint32_t bid_size, ask_size;
+    std::uint64_t seq;
+};
+
+constexpr auto latest_window = std::chrono::milliseconds(200);
+
+struct latest_result { double reads_per_s; double writes_per_s; };
+
+template <typename Read, typename Write>
+latest_result latest_run(int readers, bool paced, Read&& read, Write&& write)
+{
+    std::atomic<bool> go{false}, stop{false};
+    std::atomic<long long> reads{0};
+    long long writes = 0;
+    std::vector<std::thread> rs;
+    for (int r = 0; r < readers; ++r)
+        rs.emplace_back([&] {
+            while (!go.load(std::memory_order_acquire)) {}
+            long long n = 0;
+            std::uint64_t acc = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                acc += read().seq;
+                ++n;
+            }
+            sink = static_cast<std::int64_t>(acc);
+            reads.fetch_add(n, std::memory_order_relaxed);
+        });
+    go.store(true, std::memory_order_release);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto end = t0 + latest_window;
+    bench_quote q{100.0, 100.5, 10, 20, 0};
+    for (auto now = t0; now < end; now = std::chrono::steady_clock::now()) {
+        q.seq = static_cast<std::uint64_t>(++writes);
+        write(q);
+        if (paced) {
+            const auto next = now + std::chrono::microseconds(1);
+            while (std::chrono::steady_clock::now() < next) {}
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : rs)
+        t.join();
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return {static_cast<double>(reads.load()) / secs, static_cast<double>(writes) / secs};
+}
+
+template <typename Make>
+latest_result latest_best(int readers, bool paced, Make make)
+{
+    latest_result best{0, 0};
+    for (int r = 0; r < 3; ++r) {
+        auto runner = make();
+        const latest_result x = runner(readers, paced);
+        if (x.reads_per_s > best.reads_per_s)
+            best = x;
+    }
+    return best;
+}
+
+void report_latest(const char* name, int readers, latest_result r)
+{
+    if (markdown)
+        std::printf("| `%s` | %d | %.1f M reads/s | %.2f M writes/s |\n", name, readers,
+                    r.reads_per_s / 1e6, r.writes_per_s / 1e6);
+    else
+        std::printf("  %-34s %d readers %9.1f M reads/s %7.2f M writes/s\n", name, readers,
+                    r.reads_per_s / 1e6, r.writes_per_s / 1e6);
+}
+
+void bench_latest_value()
+{
+    for (const bool paced : {false, true}) {
+        if (!markdown)
+            std::printf("  %s\n", paced ? "writer paced to ~1 write/us:" : "writer flat out:");
+        for (const int readers : {1, 2, 4, 8}) {
+            report_latest("synchronized<T> (mutex)", readers, latest_best(readers, paced, [] {
+                return [s = std::make_shared<synchronized<bench_quote>>()](int n, bool p) {
+                    return latest_run(n, p,
+                        [&] { return s->with_lock([](const bench_quote& v) { return v; }); },
+                        [&](const bench_quote& v) { s->with_lock([&v](bench_quote& x) { x = v; }); });
+                };
+            }));
+            report_latest("std::shared_mutex", readers, latest_best(readers, paced, [] {
+                struct shared { std::shared_mutex m; bench_quote v{}; };
+                return [s = std::make_shared<shared>()](int n, bool p) {
+                    return latest_run(n, p,
+                        [&] { std::shared_lock<std::shared_mutex> g(s->m); return s->v; },
+                        [&](const bench_quote& v) { std::unique_lock<std::shared_mutex> g(s->m); s->v = v; });
+                };
+            }));
+            report_latest("seqlock<T>", readers, latest_best(readers, paced, [] {
+                return [s = std::make_shared<seqlock<bench_quote>>()](int n, bool p) {
+                    return latest_run(n, p,
+                        [&] { return s->read(); },
+                        [&](const bench_quote& v) { s->write(v); });
+                };
+            }));
+        }
+    }
+}
+
 void bench_disruptor_batch()
 {
     // static: not captured by the lambdas (MSVC C3493) yet still a constant
@@ -627,6 +740,14 @@ int main(int argc, char** argv)
     else
         std::printf("\nfork-join - %lld tasks spawned from inside workers:\n", fj_total);
     bench_forkjoin();
+
+    if (markdown)
+        std::printf("\n### latest value - one writer, N readers, %lld ms per case, best of 3\n\n"
+                    "| Sharing | Readers | Reads | Writes |\n|---|---|---|---|\n",
+                    static_cast<long long>(latest_window.count()));
+    else
+        std::printf("\nlatest value - one writer, N readers taking consistent copies:\n");
+    bench_latest_value();
 
 #if defined(TS_BENCH_COMPARE)
     if (markdown)

@@ -25,6 +25,7 @@
 #include "concurrent/intern_pool.hpp"                  // IWYU pragma: export
 #include "concurrent/mpmc_queue.hpp"                   // IWYU pragma: export
 #include "concurrent/disruptor.hpp"                    // IWYU pragma: export
+#include "concurrent/seqlock.hpp"                      // IWYU pragma: export
 #include "moveable/signal.hpp"              // IWYU pragma: export
 #include "logging/logger.hpp"                      // IWYU pragma: export
 #include "concurrent/thread_pool.hpp"                  // IWYU pragma: export

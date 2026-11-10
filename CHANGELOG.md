@@ -7,6 +7,19 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Added
+
+- **`seqlock<T>`** (`concurrent/seqlock.hpp`): one writer publishes a value, any number of readers take consistent
+  copies, nobody waits. `write`, `read` (retries while a write overlaps), `try_read` (one attempt), `read_versioned`
+  and `version` (change detection without comparing values). The value is held as atomic 64-bit words with
+  release/acquire orderings - no fences, no data race on the payload - so ThreadSanitizer checks the whole protocol.
+  `T` is trivially copyable and default constructible; one writer at a time. Moveable while quiescent. Five tests
+  (in the concurrency suite, so the TSan stress repeats them); `make bench` gains a latest-value table against
+  `synchronized<T>` and `std::shared_mutex`: at 8 readers with a paced writer, 2,762 M reads/s against 11.7 M
+  (mutex) and 24.5 M (`shared_mutex`) on Linux, and the writer holds its rate where `shared_mutex` starves it.
+
 ## [1.4.0] — 2026-11-10
 
 ### Changed
