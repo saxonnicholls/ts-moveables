@@ -7,7 +7,16 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
-## [Unreleased]
+## [1.5.1] — 2026-11-11
+
+### Fixed
+
+- **CI on v1.4.0 and v1.5.0 could never pass**, though the library in both is unaffected: `webhook_ws_hub_demo`
+  hung. Its fan-out scenario counted the first scenario's subscriber as still registered after it closed, but the
+  close-semantics erratum in 1.4.0 made the hub drop a closed subscriber promptly, so the count it waited for never
+  came - and the wait had no deadline, so every CI job sat at "Demos (self-verifying)" until GitHub killed it. Each
+  scenario now waits for the earlier subscribers to leave and then for exactly its own, and every wait in the demo
+  fails after 10 s instead of spinning. Neither tag was published as a GitHub release; take 1.5.1.
 
 ### Changed
 
@@ -962,6 +971,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.5.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.5.1
 [1.5.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.5.0
 [1.4.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.4.0
 [1.3.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.3.1
