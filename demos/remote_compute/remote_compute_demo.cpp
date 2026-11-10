@@ -227,7 +227,9 @@ int selftest(bool lan)
             cancelled = true;
         }
         check(cancelled, "cancel() stops a running job and get() throws job_cancelled");
-        check(std::chrono::steady_clock::now() - t0 < 1s, "within one block of work, not at the end");
+        // The job would run ~100 s to the end; 5 s leaves a slow CI runner room
+        // and still fails if cancel waited for the end
+        check(std::chrono::steady_clock::now() - t0 < 5s, "within one block of work, not at the end");
     }
 
     // 13. Health: a worker with every thread busy still answers a ping at once
@@ -239,7 +241,9 @@ int selftest(bool lan)
         const auto t0 = std::chrono::steady_clock::now();
         const auto h = c.ping("mac-studio");
         const auto took = std::chrono::steady_clock::now() - t0;
-        check(h.has_value() && took < 100ms, "a ping is answered at once while every worker thread is busy");
+        // The jobs hold every thread for ~650 ms more; a ping that waited for
+        // them would take that long. 400 ms is slack for a slow CI runner.
+        check(h.has_value() && took < 400ms, "a ping is answered at once while every worker thread is busy");
         check(h && h->first.running == 4 && h->first.cores == 4, "and reports 4 of 4 threads running jobs");
         for (auto& f : busy)
             f.get();
@@ -284,7 +288,10 @@ int selftest(bool lan)
         const auto e = error_of([&] { f.get(); });
         check(contains(e, "unresponsive") && contains(e, "did not come back"),
               "a worker that stops answering pings fails its jobs as unresponsive, after the resume window");
-        check(std::chrono::steady_clock::now() - t0 < 2500ms, "after the configured silence, not minutes later");
+        // Configured: ~1 s (600 ms silence + 400 ms resume window). The
+        // defaults would be 10 s + 60 s. 10 s tells the two apart even on a
+        // slow CI runner, where 2.5 s did not.
+        check(std::chrono::steady_clock::now() - t0 < 10s, "after the configured silence, not minutes later");
         fake.join();
     }
 
