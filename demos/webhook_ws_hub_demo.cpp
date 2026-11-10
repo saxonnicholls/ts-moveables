@@ -216,11 +216,18 @@ bool contains(const std::string& hay, const std::string& needle)
     return hay.find(needle) != std::string::npos;
 }
 
+// Every wait has a deadline. A self-verifying demo that waits forever is worse
+// than one that fails: it hung every CI job for six hours when the hub's close
+// handling changed under it. Ten seconds is far beyond any real wait here.
 template <typename Pred>
-void spin_until(Pred pred)
+void spin_until(Pred pred, const char* what)
 {
-    while (!pred())
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() > deadline)
+            check(false, what);
         std::this_thread::yield();
+    }
 }
 
 } // namespace
@@ -252,7 +259,7 @@ int main(int argc, char** argv)
     {
         ws_client c;
         check(c.connect_to(port, "/ws?topic=prices"), "subscriber connected to /ws?topic=prices");
-        spin_until([&] { return hub.subscribers() == 1; });
+        spin_until([&] { return hub.subscribers() == 1; }, "the subscriber registered within 10 s");
 
         check(http_post(port, "/ingest/prices", "{\"BTC\":64000}") == 202, "webhook POST accepted (202)");
 
@@ -263,6 +270,9 @@ int main(int argc, char** argv)
         check(contains(got, "\"seq\":"), "frame carries a sequence number");
         row("webhook POST -> live WebSocket delivery", "one payload framed and delivered");
     }
+    // The subscriber above closed as it left scope, and the hub drops a closed
+    // subscriber promptly - so the count returns to zero rather than lingering
+    spin_until([&] { return hub.subscribers() == 0; }, "a closed subscriber left the hub within 10 s");
 
     // -------------------------------------------------- 2. fan-out to many readers
     {
@@ -270,7 +280,7 @@ int main(int argc, char** argv)
         std::vector<ws_client> clients(n);
         for (int i = 0; i < n; ++i)
             check(clients[i].connect_to(port, "/ws?topic=room"), "fan-out subscriber connected");
-        spin_until([&] { return hub.subscribers() == std::size_t(n + 1); });   // +1: the prices sub above
+        spin_until([&] { return hub.subscribers() == std::size_t(n); }, "every fan-out subscriber registered within 10 s");
 
         const std::size_t fanned = hub.publish("room", "everyone-sees-this");
         check(fanned == std::size_t(n), "publish() reports the fan-out count");
@@ -308,9 +318,10 @@ int main(int argc, char** argv)
 
     // --------------------------------------------------- 4. wildcard firehose
     {
+        spin_until([&] { return hub.subscribers() == 0; }, "earlier subscribers left the hub within 10 s");
         ws_client fire;
         check(fire.connect_to(port, "/ws?topic=*"), "wildcard subscriber connected");
-        spin_until([&] { return hub.subscribers() >= 1; });
+        spin_until([&] { return hub.subscribers() == 1; }, "the wildcard subscriber registered within 10 s");
 
         // A wildcard client first replays the recent history of every topic (all
         // prior scenarios flowed through the wildcard ring), then sees new ones
@@ -326,9 +337,10 @@ int main(int argc, char** argv)
 
     // ------------------------------------------------------------ 5. throughput
     {
+        spin_until([&] { return hub.subscribers() == 0; }, "the wildcard subscriber left the hub within 10 s");
         ws_client c;
         check(c.connect_to(port, "/ws?topic=bench"), "throughput subscriber connected");
-        spin_until([&] { return hub.subscribers() >= 1; });
+        spin_until([&] { return hub.subscribers() == 1; }, "the throughput subscriber registered within 10 s");
 
         const int messages = 20000;
         std::atomic<int> received{0};
@@ -344,7 +356,7 @@ int main(int argc, char** argv)
         const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < messages; ++i)
             hub.publish("bench", "x");
-        spin_until([&] { return received.load() >= messages; });
+        spin_until([&] { return received.load() >= messages; }, "every throughput message arrived within 10 s");
         const double secs = seconds_since(t0);
         reader.join();
 
