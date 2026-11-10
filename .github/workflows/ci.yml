@@ -118,6 +118,14 @@ jobs:
             ./build/bwt_dna_demo --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Remote execution, both halves on this runner: the self-test starts the
+      # workers in its own process and calls them over 127.0.0.1, so a remote
+      # std::async, invoke, long jobs, cancel, health, authentication and
+      # reconnection are all exercised with no second machine. C++20 and POSIX,
+      # so not on the MSVC job.
+      - name: Remote execution demo (loopback self-test)
+        run: make demo-remote CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
+
       # Autobahn|Testsuite: the external RFC 6455 grader. x86-64 Linux only -
       # it needs Docker with --network host to reach the echo server, and the
       # official image is published for amd64 only. Protocol conformance does
@@ -314,6 +322,10 @@ jobs:
       - name: ThreadSanitizer
         if: ${{ matrix.tsan }}
         run: make tsan CXX=${{ matrix.cxx }} STD=c++20
+
+      - name: ThreadSanitizer, remote execution demo
+        if: ${{ matrix.tsan }}
+        run: make tsan-remote CXX=${{ matrix.cxx }}
 
       - name: Address + UB Sanitizers
         if: ${{ matrix.asan }}

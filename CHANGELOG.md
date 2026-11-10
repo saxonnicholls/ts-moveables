@@ -19,6 +19,15 @@ git tag, and `make check-version` fails if those three ever disagree.
   (in the concurrency suite, so the TSan stress repeats them); `make bench` gains a latest-value table against
   `synchronized<T>` and `std::shared_mutex`: at 8 readers with a paced writer, 2,762 M reads/s against 11.7 M
   (mutex) and 24.5 M (`shared_mutex`) on Linux, and the writer holds its rate where `shared_mutex` starves it.
+- **Remote execution demo** (`demos/remote_compute`, `make demo-remote`): remote `std::async`, `std::invoke` and
+  long jobs on named machines, over `net::tcp_stream` / `tcp_listener` and `mutex_task_pool`. Kernels are dispatched
+  by a compile-time perfect hash; arguments travel field by field, little-endian, and a call whose signature hash
+  differs between the two builds is refused. Mutual HMAC-SHA256 authentication, progress and cancel, health pings,
+  sessions that survive a reconnect, UDP multicast discovery. The self-test runs the client and every worker in one
+  process over 127.0.0.1, so CI exercises the whole protocol on one runner (Linux and macOS, plus ThreadSanitizer on
+  Linux); CMake adds it as the `remote_compute_selftest` CTest. C++20 and POSIX, so not on MSVC; the library itself
+  stays C++17. Aggregate reflection and callable traits come from snicholls-core (`reflect/struct_tuple.hpp`,
+  `meta/callable_traits.hpp`). A demo, not library API: authenticated, not encrypted.
 
 ## [1.4.0] — 2026-11-10
 

@@ -1,6 +1,7 @@
 -xc++
 -std=c++20
 -Ithird_party/core/include
+-ITSMoveables
 -pthread
 -Wall
 -Wextra

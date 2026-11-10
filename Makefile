@@ -7,6 +7,7 @@
 #   make tsan    build and run the unit tests under ThreadSanitizer
 #   make asan    build and run the unit tests under Address+UB Sanitizers
 #   make demo    build and run the demo (same code as the Xcode target)
+#   make demo-remote  remote execution: client and workers over loopback (C++20, POSIX)
 #   make clean
 #
 #   make test STD=c++17    any target can be built against a different standard
@@ -267,6 +268,40 @@ demo-bwt: build/bwt_dna_demo
 demo-webhook: build/webhook_ws_hub_demo
 	./build/webhook_ws_hub_demo
 
+# Remote execution (demos/remote_compute): remote std::async / std::invoke over
+# this library's TCP and thread pools. C++20 whatever STD says (it uses class-
+# type template parameters; the library itself stays C++17) and POSIX sockets.
+# `make demo-remote` is its self-test: the client and every worker in one
+# process, talking over 127.0.0.1 - which is how CI runs it on one machine.
+REMOTE_DIR  := demos/remote_compute
+REMOTE_STD  ?= c++20
+REMOTE_HDRS := $(wildcard $(REMOTE_DIR)/*.hpp $(REMOTE_DIR)/remote/*.hpp)
+REMOTE_INC  := $(CORE_INC) -I$(REMOTE_DIR) -ITSMoveables
+
+build/remote_compute_demo: $(REMOTE_DIR)/remote_compute_demo.cpp $(REMOTE_HDRS) $(HEADERS) | build
+	$(CXX) $(REMOTE_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) -pthread \
+	    $(REMOTE_DIR)/remote_compute_demo.cpp -o $@ $(LDLIBS)
+
+build/remote_compute_demo_tsan: $(REMOTE_DIR)/remote_compute_demo.cpp $(REMOTE_HDRS) $(HEADERS) | build
+	$(CXX) $(REMOTE_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O1 -g -fsanitize=thread -pthread \
+	    $(REMOTE_DIR)/remote_compute_demo.cpp -o $@ $(LDLIBS)
+
+build/remote_compute_bench: $(REMOTE_DIR)/remote_compute_bench.cpp $(REMOTE_HDRS) $(HEADERS) | build
+	$(CXX) $(REMOTE_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -DNDEBUG $(EXTRA_FLAGS) -pthread \
+	    $(REMOTE_DIR)/remote_compute_bench.cpp -o $@ $(LDLIBS)
+
+# --no-lan: skip the multicast discovery check, which needs a network that
+# carries multicast (CI runners and containers often do not)
+demo-remote: build/remote_compute_demo
+	./build/remote_compute_demo selftest --no-lan
+
+tsan-remote: build/remote_compute_demo_tsan
+	TSAN_OPTIONS="halt_on_error=1" ./build/remote_compute_demo_tsan selftest --no-lan
+
+# Where the time in a remote call goes, layer by layer, on loopback
+bench-remote: build/remote_compute_bench
+	./build/remote_compute_bench
+
 build/ws_hub_broadcast: benchmarks/ws_hub_broadcast.cpp $(HEADERS) | build
 	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/ws_hub_broadcast.cpp -o $@ $(LDLIBS)
@@ -356,4 +391,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
