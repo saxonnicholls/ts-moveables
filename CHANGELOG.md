@@ -7,6 +7,17 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Changed
+
+- **`seqlock<T>` moves fail loudly where they can**, as `circular_buffer`'s do: a move samples the sequence number
+  and throws `std::runtime_error`, leaving both sides untouched, if a write to the source - or, for move
+  assignment, to the target - is in flight. Nothing on the read or write path pays; the cost is only at a move. The
+  moves are therefore no longer `noexcept`. A reader in flight still cannot be detected without slowing every read,
+  and the documentation says so. `quiescent()` exposes the check. `seqlock<int>` joins the moveability registry in
+  `tests_moveability.cpp`.
+
 ## [1.5.0] — 2026-11-10
 
 ### Changed

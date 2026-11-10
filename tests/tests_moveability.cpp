@@ -90,6 +90,7 @@ MOVEABLE(synchronized_type_map);
 MOVEABLE(circular_buffer<int>);
 MOVEABLE(mpmc_queue<int>);
 MOVEABLE(disruptor<int>);
+MOVEABLE(seqlock<int>);
 MOVEABLE(intern_pool<std::string>);
 
 // ------------------------------------------------------------- the pools

@@ -2776,8 +2776,15 @@ namespace snicholls
 //      is one attempt, for a reader that must not spin.
 //
 //  Moveable: the state lives behind a heap core, as everywhere in this
-//  library, so a quiescent handle moves; moving it while threads use it is
-//  the caller's bug, as for every type here.
+//  library, so a quiescent handle moves, and lives in a std::vector. Moving it
+//  while threads use it is the caller's bug, as for every type here - and
+//  like circular_buffer, it says so where it can: a move samples the sequence
+//  number over a short window and throws std::runtime_error if a write is in
+//  progress or completes meanwhile, on either side of a move assignment.
+//  Nothing on the read or write path pays for that; it costs only at a move.
+//  A reader in flight cannot be detected without making every read write a
+//  counter, which would undo the point, so that half of the rule stays the
+//  caller's. A moved-from seqlock may only be assigned to or destroyed.
 //
 
 #ifndef ts_moveables_concurrent_seqlock_hpp
@@ -2788,6 +2795,7 @@ namespace snicholls
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -2846,11 +2854,53 @@ namespace snicholls
             return true;
         }
 
+        // Best-effort: no write in progress, and none completed, while the
+        // sequence number is sampled 512 times. A writer doing real traffic is
+        // caught; a quiescent seqlock passes at once. A moved-from one (no
+        // core) is trivially quiescent.
+        static bool sample_quiescent(const core* c) noexcept {
+            if (c == nullptr)
+                return true;
+            const std::uint64_t s = c->seq.load(std::memory_order_acquire);
+            if (s & 1u)
+                return false;
+            for (int i = 0; i < 512; ++i)
+                if (c->seq.load(std::memory_order_acquire) != s)
+                    return false;
+            return true;
+        }
+
+        static void ensure_quiescent(const core* c, const char* message) {
+            if (!sample_quiescent(c))
+                throw std::runtime_error(message);
+        }
+
     public:
         explicit seqlock(const T& initial = T{}) : c_(std::make_unique<core>(initial)) {}
 
-        seqlock(seqlock&&) noexcept = default;
-        seqlock& operator=(seqlock&&) noexcept = default;
+        // Throws std::runtime_error, and leaves `other` untouched, if a write
+        // to it is in flight (see the file comment for what can be detected).
+        seqlock(seqlock&& other) {
+            ensure_quiescent(other.c_.get(), "snicholls::seqlock: moving from a seqlock while a write to it is in flight");
+            c_ = std::move(other.c_);
+        }
+        // Throws std::runtime_error, leaving both untouched, if a write to
+        // either is in flight: overwriting a seqlock its writer is still
+        // using is the same bug from the other side.
+        seqlock& operator=(seqlock&& other) {
+            if (this != &other) {
+                ensure_quiescent(other.c_.get(), "snicholls::seqlock: moving from a seqlock while a write to it is in flight");
+                ensure_quiescent(c_.get(), "snicholls::seqlock: moving into a seqlock while a write to it is in flight");
+                c_ = std::move(other.c_);
+            }
+            return *this;
+        }
+        seqlock(const seqlock&) = delete;
+        seqlock& operator=(const seqlock&) = delete;
+
+        // True if no write was in progress or completed over a short sampling
+        // window. Racy by nature: a diagnostic, and what a move checks.
+        bool quiescent() const noexcept { return sample_quiescent(c_.get()); }
 
         // The one writer. Never blocks, never fails.
         void write(const T& value) noexcept {

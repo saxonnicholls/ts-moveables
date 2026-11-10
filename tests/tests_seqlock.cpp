@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdint>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -171,6 +172,38 @@ void test_seqlock_concurrent()
     pass("seqlock: one writer flat out, four readers - no torn copy, never backwards");
 }
 
+// The move check's detector, tested directly. A failed move cannot be provoked
+// safely - if detection ever missed, the writer would be left writing into a
+// moved-from handle - so the test asserts what the move relies on instead:
+// quiet means quiescent, and a live writer is seen.
+void test_seqlock_quiescence()
+{
+    static_assert(!std::is_copy_constructible_v<seqlock<int>>, "a seqlock has one owner of its state");
+    static_assert(std::is_move_constructible_v<seqlock<int>> && std::is_move_assignable_v<seqlock<int>>,
+                  "a seqlock moves");
+
+    seqlock<stamped> s{stamp(0)};
+    assert(s.quiescent());                      // nobody writing
+
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        for (std::uint64_t k = 1; !stop.load(std::memory_order_relaxed); ++k)
+            s.write(stamp(k));
+    });
+    bool seen = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!seen && std::chrono::steady_clock::now() < deadline)
+        seen = !s.quiescent();
+    stop.store(true, std::memory_order_relaxed);
+    writer.join();
+    assert(seen);                               // a writer flat out is detected
+    assert(s.quiescent());                      // and once it stops, quiet again
+
+    seqlock<stamped> moved = std::move(s);      // quiescent: the move goes through
+    assert(moved.quiescent() && consistent(moved.read()));
+    pass("seqlock: quiescent() sees a live writer, and a quiet seqlock moves");
+}
+
 // version() is a cheap change test: it only grows, by one per write
 void test_seqlock_versions()
 {
@@ -203,5 +236,6 @@ void run_seqlock_tests()
     test_seqlock_odd_sizes();
     test_seqlock_move();
     test_seqlock_concurrent();
+    test_seqlock_quiescence();
     test_seqlock_versions();
 }
