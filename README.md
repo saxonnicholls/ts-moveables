@@ -390,7 +390,7 @@ The Xcode project builds the same demo (`main.cpp`).
 
 ### CMake
 
-The library exports the interface target `snicholls::ts_moveables`, which carries the C++17 requirement, Threads, (on Linux) libatomic, and snicholls-core's include directory. It takes only core's include directory, not the `snicholls::core` target, so a C++17 consumer stays C++17 (core itself is C++20, but the one header used here is kept C++17-clean). If your build adds snicholls-core first, ts-moveables uses that copy: one core per build. An installed ts-moveables carries that one core header in its own tree (`include/ts_moveables/core`), so `find_package(ts_moveables)` needs no separate core install. The easiest integration is FetchContent, which fetches the core submodule too:
+The library exports the interface target `snicholls::ts_moveables`, which carries the C++17 requirement, Threads, (on Linux) libatomic, and snicholls-core's include directory. It takes only core's include directory, not the `snicholls::core` target, so a C++17 consumer stays C++17 (core itself is C++20, but the one header used here is kept C++17-clean). If your build adds snicholls-core first, ts-moveables uses that copy: one core per build. An installed ts-moveables carries that one core header in its own tree (`include/ts_moveables/core`), so `find_package(ts_moveables)` needs no separate core install. A consumer that also installs snicholls-core should put core's include directory first, so a later core wins; the header's include guard makes the two copies one. The easiest integration is FetchContent, which fetches the core submodule too:
 
 ```cmake
 include(FetchContent)
