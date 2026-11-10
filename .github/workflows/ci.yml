@@ -53,6 +53,8 @@ jobs:
             tsan: true
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true   # third_party/core (snicholls-core): constexpr_for
 
       # MSVC C3493 has broken CI five times. It is a static property of the
       # source, so it is checked on every job rather than discovered on the one
@@ -362,6 +364,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true   # third_party/core (snicholls-core): constexpr_for
 
       - name: Configure
         run: cmake -B build-cmake -DCMAKE_BUILD_TYPE=Release
@@ -407,12 +411,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: true   # third_party/core (snicholls-core): constexpr_for
 
       - name: Unit tests (C++17 and C++20)
         shell: cmd
         run: |
           for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
-          cl /nologo /std:c++17 /EHsc /W4 /O2 tests\*.cpp /Fe:tests17.exe || exit /b 1
+          cl /nologo /std:c++17 /EHsc /W4 /O2 /Ithird_party\core\include tests\*.cpp /Fe:tests17.exe || exit /b 1
           tests17.exe || exit /b 1
-          cl /nologo /std:c++20 /EHsc /W4 /O2 tests\*.cpp /Fe:tests20.exe || exit /b 1
+          cl /nologo /std:c++20 /EHsc /W4 /O2 /Ithird_party\core\include tests\*.cpp /Fe:tests20.exe || exit /b 1
           tests20.exe || exit /b 1

@@ -19,7 +19,7 @@
 //       just doing the work. That crossover is the number a caller needs and
 //       is almost never published.
 //    3. Does grain size matter, and which way?
-//    4. Does hand unrolling help? utils/constexpr_for.hpp says probably not at
+//    4. Does hand unrolling help? snicholls-core's constexpr_for.hpp says probably not at
 //       -O2, and owes a measurement rather than an opinion.
 //
 //  Every row is the best of several timed runs (best, not mean: we are after
@@ -30,7 +30,7 @@
 #include "../TSMoveables/concurrent/parallel_for.hpp"
 #include "../TSMoveables/concurrent/task_group.hpp"
 #include "../TSMoveables/concurrent/thread_pool.hpp"
-#include "../TSMoveables/utils/constexpr_for.hpp"
+#include <snicholls/core/constexpr_for.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -230,7 +230,7 @@ int main(int argc, char** argv)
 
     // ------------------------------------------------------- unrolling
     //
-    // utils/constexpr_for.hpp claims hand unrolling is usually a wash at -O2.
+    // snicholls-core's constexpr_for.hpp claims hand unrolling is usually a wash at -O2.
     // This is where that claim gets to be wrong in public.
     {
         rule("hand unrolling vs letting the compiler do it (memory body, 16M)");

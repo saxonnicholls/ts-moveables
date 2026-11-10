@@ -29,6 +29,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "TSMoveables")
 
 LOCAL_INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
+# snicholls-core's headers (third_party/core) are inlined too, so the single header still needs nothing else.
+CORE_INCLUDE = re.compile(r'^\s*#\s*include\s+<(snicholls/core/[^>]+)>')
+CORE_ROOT = os.path.join(ROOT, "third_party", "core", "include")
 
 
 def find_header(name):
@@ -62,13 +65,40 @@ def expand(name, seen, out, stack):
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             m = LOCAL_INCLUDE.match(line)
+            c = CORE_INCLUDE.match(line)
             if m:
                 out.append("// (inlined) " + line.rstrip("\n"))
                 expand(m.group(1), seen, out, stack)
+            elif c:
+                out.append("// (inlined) " + line.rstrip("\n"))
+                expand_core(c.group(1), seen, out)
             else:
                 out.append(line.rstrip("\n"))
     out.append("// end {}".format(name))
     stack.pop()
+
+
+def expand_core(name, seen, out):
+    """A snicholls-core header, by its path under third_party/core/include, expanded once."""
+    key = "core:" + name
+    if key in seen:
+        return
+    path = os.path.join(CORE_ROOT, name)
+    if not os.path.isfile(path):
+        raise SystemExit("amalgamate: no such core header (is third_party/core checked out?): " + name)
+    seen.add(key)
+    out.append("// " + "-" * 70)
+    out.append("// begin snicholls-core {} (MIT, https://github.com/saxonnicholls/core)".format(name))
+    out.append("// " + "-" * 70)
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            c = CORE_INCLUDE.match(line)
+            if c:
+                out.append("// (inlined) " + line.rstrip("\n"))
+                expand_core(c.group(1), seen, out)
+            else:
+                out.append(line.rstrip("\n"))
+    out.append("// end snicholls-core {}".format(name))
 
 
 def main():

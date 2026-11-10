@@ -26,7 +26,7 @@ One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rul
 
 ## Quick start
 
-Header-only, zero dependencies, C++17 or later — **nothing to build**. Drop the headers on your include path (or use CMake [FetchContent / `find_package`](#cmake)), then include the umbrella — or just the one header you need:
+Header-only, C++17 or later — **nothing to build**. One header-only dependency, [snicholls-core](https://github.com/saxonnicholls/core) (`third_party/core`, for `constexpr_for`), which the single-header builds carry inline. Drop the headers and `third_party/core/include` on your include path (or use CMake [FetchContent / `find_package`](#cmake)), then include the umbrella — or just the one header you need:
 
 ```cpp
 #include "ts_moveables.hpp"        // everything, or just what you need:
@@ -80,7 +80,7 @@ No special member functions to write; the rule of zero is back. **Now reach for:
 | to **log or emit telemetry** from anywhere | [`logging`](#logging) — `SN_LOG_INFO() << ...`, any thread, sinks in isolated lanes |
 | the **fastest possible raw single-op queue** | honestly? [moodycamel](#which-should-you-use). We tell you when *not* to pick us. |
 
-Build and test locally: `make test` (or `cmake -B build && ctest --test-dir build --output-on-failure`). Pick the standard with `make test STD=c++17`. That's it.
+Build and test locally: clone with `git clone --recurse-submodules` (or run `git submodule update --init` in an existing clone, for `third_party/core`), then `make test` (or `cmake -B build && ctest --test-dir build --output-on-failure`). The library needs C++17; the Makefile builds the tests as C++20 by default, and `make test STD=c++17` picks the minimum. CI runs both. That's it.
 
 ## Why this library?
 
@@ -390,16 +390,19 @@ The Xcode project builds the same demo (`main.cpp`).
 
 ### CMake
 
-The library exports the interface target `snicholls::ts_moveables`, which carries the C++17 requirement, Threads, and (on Linux) libatomic. The easiest integration is FetchContent:
+The library exports the interface target `snicholls::ts_moveables`, which carries the C++17 requirement, Threads, (on Linux) libatomic, and snicholls-core's include directory. It takes only core's include directory, not the `snicholls::core` target, so a C++17 consumer stays C++17 (core itself is C++20, but the one header used here is kept C++17-clean). If your build adds snicholls-core first, ts-moveables uses that copy: one core per build. An installed ts-moveables carries that one core header in its own tree (`include/ts_moveables/core`), so `find_package(ts_moveables)` needs no separate core install. The easiest integration is FetchContent, which fetches the core submodule too:
 
 ```cmake
 include(FetchContent)
 FetchContent_Declare(ts_moveables
     GIT_REPOSITORY https://github.com/saxonnicholls/ts-moveables.git
-    GIT_TAG v1.0.0)
+    GIT_TAG v1.4.0)
 FetchContent_MakeAvailable(ts_moveables)
 
 target_link_libraries(my_app PRIVATE snicholls::ts_moveables)
+
+# Last line of your top-level CMakeLists.txt: fail configure if two versions of snicholls-core were reached
+snicholls_core_assert_single_version()
 ```
 
 ### Which version am I compiling against?
@@ -709,7 +712,7 @@ The last two columns are the honest part. A scan does two passes where the seria
 
 ## constexpr_for
 
-Compile-time unrolling, in `utils/constexpr_for.hpp`:
+Compile-time unrolling, from [snicholls-core](https://github.com/saxonnicholls/core): `#include <snicholls/core/constexpr_for.hpp>`. It moved there in 1.4.0 with the code unchanged; `utils/constexpr_for.hpp` still works, forwards to core's header, and is deprecated. The umbrella `ts_moveables.hpp` and the single headers include it for you.
 
 ```cpp
 constexpr_for<0, 4>      ([&](auto I) { use<I.value>(); });        // fully unrolled

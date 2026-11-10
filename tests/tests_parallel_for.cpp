@@ -22,6 +22,7 @@
 #include "../TSMoveables/concurrent/thread_pool.hpp"
 #include "../TSMoveables/moveable/mutex.hpp"
 #include "../TSMoveables/utils/constexpr_for.hpp"
+#include <snicholls/core/constexpr_for.hpp>   // both in one file: ts-moveables forwards to core, no second definition
 
 #include <algorithm>
 #include <atomic>

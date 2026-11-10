@@ -23,6 +23,16 @@ CXXFLAGS ?= -std=$(STD) -Wall -Wextra -pedantic -O2 -g
 EXTRA_FLAGS ?=
 CXXFLAGS += $(EXTRA_FLAGS)
 
+# snicholls-core (third_party/core, a submodule): constexpr_for lives there. Header-only, standard library only.
+# Every compile needs it, including the recipes below that spell out their own flags instead of using CXXFLAGS.
+CORE_INC := -Ithird_party/core/include
+CXXFLAGS += $(CORE_INC)
+ifneq ($(MAKECMDGOALS),clean)
+  ifeq ($(wildcard third_party/core/include/snicholls/core/constexpr_for.hpp),)
+    $(error third_party/core is empty: run `git submodule update --init` (or clone with --recurse-submodules))
+  endif
+endif
+
 # Some targets (notably Clang on AArch64 Linux) lower std::atomic operations
 # such as is_lock_free() to libatomic calls instead of inlining them
 UNAME_S  := $(shell uname -s)
@@ -48,13 +58,13 @@ build/tests_asan: $(TEST_SRC) $(HEADERS) | build
 	$(CXX) $(CXXFLAGS) -pthread -fsanitize=address,undefined $(TEST_SRC) -o $@ $(LDLIBS)
 
 build/tests_o0: $(TEST_SRC) $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O0 -g $(EXTRA_FLAGS) -pthread $(TEST_SRC) -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O0 -g $(EXTRA_FLAGS) -pthread $(TEST_SRC) -o $@ $(LDLIBS)
 
 build/demo: TSMoveables/main.cpp $(HEADERS) | build
 	$(CXX) $(CXXFLAGS) -pthread TSMoveables/main.cpp -o $@ $(LDLIBS)
 
 build/bench: benchmarks/bench.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread benchmarks/bench.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread benchmarks/bench.cpp -o $@ $(LDLIBS)
 
 # Head-to-head vs moodycamel. Fetches the third-party headers first (gitignored).
 # Warning flags relaxed here because the third-party headers are not ours to lint.
@@ -62,42 +72,42 @@ benchmarks/third_party/concurrentqueue.h:
 	bash scripts/fetch_bench_deps.sh
 
 build/bench_compare: benchmarks/bench.cpp $(HEADERS) benchmarks/third_party/concurrentqueue.h | build
-	$(CXX) -std=$(STD) -O3 -DNDEBUG -DTS_BENCH_COMPARE -Ibenchmarks/third_party -pthread benchmarks/bench.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -O3 -DNDEBUG -DTS_BENCH_COMPARE -Ibenchmarks/third_party -pthread benchmarks/bench.cpp -o $@ $(LDLIBS)
 
 build/signal_slot_demo: demos/signal_slot_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/signal_slot_demo.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/signal_slot_demo.cpp -o $@ $(LDLIBS)
 
 build/capture_replay_demo: demos/capture_replay_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/capture_replay_demo.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/capture_replay_demo.cpp -o $@ $(LDLIBS)
 
 build/pcap_replay_demo: demos/pcap_replay_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/pcap_replay_demo.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/pcap_replay_demo.cpp -o $@ $(LDLIBS)
 
 build/taskflow_style_demo: demos/taskflow_style_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/taskflow_style_demo.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/taskflow_style_demo.cpp -o $@ $(LDLIBS)
 
 build/time_master_demo: demos/time_master_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/time_master_demo.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/time_master_demo.cpp -o $@ $(LDLIBS)
 
 build/drone_fleet_demo: demos/drone_fleet_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    demos/drone_fleet_demo.cpp -o $@ $(LDLIBS)
 
 demo-drones: build/drone_fleet_demo
 	./build/drone_fleet_demo
 
 build/replay_loop_demo: demos/replay_loop_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    demos/replay_loop_demo.cpp -o $@ $(LDLIBS)
 
 demo-replay: build/replay_loop_demo
 	./build/replay_loop_demo
 
 build/http_server_demo: demos/http_server_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/http_server_demo.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/http_server_demo.cpp -o $@ $(LDLIBS)
 
 build/webhook_ws_hub_demo: demos/webhook_ws_hub_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/webhook_ws_hub_demo.cpp -o $@ $(LDLIBS)
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread demos/webhook_ws_hub_demo.cpp -o $@ $(LDLIBS)
 
 # A static check for the one MSVC rule this repository keeps tripping over
 check-msvc:
@@ -182,7 +192,7 @@ build/tests_tls: tests/tls/tests_tls.cpp $(HEADERS) | build
 # ws vs wss on the same path. Lives with the TLS binaries because it links
 # OpenSSL; the core benchmarks stay dependency-free.
 build/ws_tls_throughput: benchmarks/tls/ws_tls_throughput.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    -I$(OPENSSL_PREFIX)/include benchmarks/tls/ws_tls_throughput.cpp -o $@ \
 	    -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto $(LDLIBS)
 
@@ -198,7 +208,7 @@ test-tls: build/tests_tls
 # The echo server is built with permessage-deflate wired in (zlib), so the
 # Autobahn compression groups are graded rather than skipped
 build/ws_echo_server: tests/autobahn/ws_echo_server.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O2 -pthread -DSNICHOLLS_AUTOBAHN_DEFLATE \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O2 -pthread -DSNICHOLLS_AUTOBAHN_DEFLATE \
 	    tests/autobahn/ws_echo_server.cpp -o $@ -lz $(LDLIBS)
 
 autobahn: build/ws_echo_server
@@ -208,7 +218,7 @@ autobahn: build/ws_echo_server
 # the server under test is ours, the conformance client comes from the
 # official image, and the runner distinguishes "could not run" from "failed"
 build/h2_server: tests/h2spec/h2_server.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O2 -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O2 -pthread \
 	    tests/h2spec/h2_server.cpp -o $@ $(LDLIBS)
 
 h2spec: build/h2_server
@@ -248,7 +258,7 @@ demo-http: build/http_server_demo
 	./build/http_server_demo
 
 build/bwt_dna_demo: demos/bwt_dna_demo.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    demos/bwt_dna_demo.cpp -o $@ $(LDLIBS)
 
 demo-bwt: build/bwt_dna_demo
@@ -258,11 +268,11 @@ demo-webhook: build/webhook_ws_hub_demo
 	./build/webhook_ws_hub_demo
 
 build/ws_hub_broadcast: benchmarks/ws_hub_broadcast.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/ws_hub_broadcast.cpp -o $@ $(LDLIBS)
 
 build/parallel_scaling: benchmarks/parallel_scaling.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/parallel_scaling.cpp -o $@ $(LDLIBS)
 
 bench-parallel: build/parallel_scaling
@@ -272,7 +282,7 @@ bench-wshub: build/ws_hub_broadcast
 	./build/ws_hub_broadcast
 
 build/ws_relay_scaling: benchmarks/ws_relay_scaling.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/ws_relay_scaling.cpp -o $@ $(LDLIBS)
 
 bench-relay: build/ws_relay_scaling
@@ -285,7 +295,7 @@ bench-relay-memory: build/ws_relay_scaling
 	./build/ws_relay_scaling --memory 2000
 
 build/rpc_latency: benchmarks/rpc_latency.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/rpc_latency.cpp -o $@ $(LDLIBS)
 
 bench-rpc: build/rpc_latency
@@ -295,7 +305,7 @@ bench-rpc: build/rpc_latency
 # benchmarks/third_party/ (gitignored) - the library stays dependency-free.
 build/http_compare: benchmarks/http_compare.cpp $(HEADERS) | build
 	./scripts/fetch_bench_deps.sh
-	$(CXX) -std=$(STD) -Wall -Wextra -O3 -DNDEBUG -DCPPHTTPLIB_LISTEN_BACKLOG=1024 \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -O3 -DNDEBUG -DCPPHTTPLIB_LISTEN_BACKLOG=1024 \
 	    -Ibenchmarks/third_party -pthread benchmarks/http_compare.cpp -o $@ $(LDLIBS)
 
 bench-http: build/http_compare
@@ -303,7 +313,7 @@ bench-http: build/http_compare
 
 # Multi-reactor scaling: N loops, N threads, one shared port (SO_REUSEPORT)
 build/http_scale: benchmarks/http_scale.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/http_scale.cpp -o $@ $(LDLIBS)
 
 bench-scale: build/http_scale
@@ -312,7 +322,7 @@ bench-scale: build/http_scale
 
 # What one request costs in CPU alone - no sockets, no loop, no kernel
 build/http_request_path: benchmarks/http_request_path.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/http_request_path.cpp -o $@ $(LDLIBS)
 
 bench-request: build/http_request_path
@@ -320,7 +330,7 @@ bench-request: build/http_request_path
 
 # What typed signal dispatch costs against a raw epoll/kqueue loop
 build/loop_dispatch: benchmarks/loop_dispatch.cpp $(HEADERS) | build
-	$(CXX) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/loop_dispatch.cpp -o $@ $(LDLIBS)
 
 bench-dispatch: build/loop_dispatch
@@ -338,9 +348,9 @@ amalgamate:
 check-amalgamate: amalgamate | build
 	python3 scripts/check_amalgamation.py
 	printf '#include "ts_http_server.hpp"\nint main(){ snicholls::http::server s; s.get("/", [](const auto&, auto r){ r.send(200, "text/plain", "ok"); }); return s.listen("127.0.0.1", 0) ? 0 : 1; }\n' > build/amalgam_http_check.cpp
-	$(CXX) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include build/amalgam_http_check.cpp -o build/amalgam_http_check
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include build/amalgam_http_check.cpp -o build/amalgam_http_check
 	./build/amalgam_http_check && echo "single-header http drop-in: builds and runs"
-	$(CXX) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include tests/amalgamation/drop_in.cpp -o build/amalgam_check
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include tests/amalgamation/drop_in.cpp -o build/amalgam_check
 	./build/amalgam_check
 
 clean:

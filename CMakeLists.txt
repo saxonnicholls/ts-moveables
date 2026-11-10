@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ts_moveables
-    VERSION 1.3.1
+    VERSION 1.4.0
     DESCRIPTION "Thread Safe Moveable Objects - moveable wrappers for the immovable C++ synchronisation primitives"
     HOMEPAGE_URL "https://github.com/saxonnicholls/ts-moveables"
     LANGUAGES CXX)
@@ -30,6 +30,22 @@ target_include_directories(ts_moveables INTERFACE
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 target_link_libraries(ts_moveables INTERFACE Threads::Threads)
+
+# snicholls-core: constexpr_for lives there. One copy of core per build: a consumer that added core first keeps its
+# own (its pin is the version) and this one is skipped. Only core's include directory is taken, not the target, so
+# ts-moveables stays usable from C++17 (core's constexpr_for.hpp is kept C++17-clean; the rest of core is C++20).
+if(NOT TARGET snicholls::core)
+    add_subdirectory(third_party/core EXCLUDE_FROM_ALL)
+endif()
+snicholls_core_require(0.5.0)
+# In the build tree: the include directory of whichever copy of core won. Installed: ts-moveables ships the one core
+# header it uses (constexpr_for.hpp, standard library only) in its own tree, include/ts_moveables/core, so an
+# installed ts-moveables needs no installed core, and an installed core elsewhere is never overwritten. The header's
+# include guard makes the two copies one if a consumer has both.
+get_property(TS_MOVEABLES_CORE_DIR GLOBAL PROPERTY SNICHOLLS_CORE_SOURCE_DIR)
+target_include_directories(ts_moveables INTERFACE
+    $<BUILD_INTERFACE:${TS_MOVEABLES_CORE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ts_moveables/core>)
 
 # Some targets (notably Clang on AArch64 Linux) lower std::atomic operations
 # such as is_lock_free() to libatomic calls instead of inlining them
@@ -97,6 +113,8 @@ endif()
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/TSMoveables/"
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ts_moveables
     FILES_MATCHING PATTERN "*.hpp")
+install(FILES "${TS_MOVEABLES_CORE_DIR}/include/snicholls/core/constexpr_for.hpp"
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ts_moveables/core/snicholls/core)
 
 install(TARGETS ts_moveables EXPORT ts_moveablesTargets)
 
@@ -118,3 +136,9 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/ts_moveablesConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/ts_moveablesConfigVersion.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ts_moveables)
+
+# One copy of snicholls-core per build. Only the top-level project asserts it, last, after everything has been added;
+# a consumer that adds ts-moveables makes the same call at the end of its own CMakeLists.txt.
+if(TS_MOVEABLES_TOP_LEVEL)
+    snicholls_core_assert_single_version()
+endif()

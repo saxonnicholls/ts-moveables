@@ -69,8 +69,9 @@
 #include <type_traits>
 #include <utility>
 
+#include <snicholls/core/constexpr_for.hpp>   // unrolled_for (snicholls-core)
+
 #include "../interfaces/task_pool.hpp"
-#include "../utils/constexpr_for.hpp"
 #include "task_group.hpp"          // completion_gate, error_slot
 
 #include <algorithm>
@@ -204,7 +205,7 @@ namespace snicholls
     // the caller thinks is finished with.
     // Unroll is a compile-time chunk-inner unroll factor, default 1 (none).
     // parallel_for<8>(pool, 0, n, body) emits the body eight times per inner
-    // iteration; see utils/constexpr_for.hpp for why that is usually not the
+    // iteration; see snicholls-core's constexpr_for.hpp for why that is usually not the
     // win it sounds like, and `make bench-parallel` for the measurement.
     template <std::size_t Unroll = 1, typename Index, typename Body>
     void parallel_for(task_pool& pool, Index first, Index last, Body body,

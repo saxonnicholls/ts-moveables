@@ -7,10 +7,26 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
-## [Unreleased]
+## [1.4.0] — 2026-11-10
+
+### Changed
+
+- **snicholls-core is a dependency** (header-only, standard library only): submodule `third_party/core` at v0.5.0,
+  minimum 0.5.0. Clone with `--recurse-submodules`, or run `git submodule update --init`; the Makefile says so
+  if the submodule is missing, and CI checks it out.
+- `constexpr_for`, `constexpr_nest` and `unrolled_for` come from snicholls-core
+  (`<snicholls/core/constexpr_for.hpp>`). Both libraries used to define
+  `snicholls::constexpr_for`, so including both was a redefinition error; `utils/constexpr_for.hpp` now forwards to
+  core's header and is deprecated. The code is identical; C++17 still works, because core keeps that header
+  C++17-clean. The single-header builds inline core's header, so they still need nothing else. CMake takes core's
+  include directory, reusing a copy of core the consumer added first, and as the top-level project it asserts one
+  core version per build (`snicholls_core_assert_single_version`). An installed ts-moveables carries the one core
+  header in its own tree (`include/ts_moveables/core`), so `find_package(ts_moveables)` needs no separate core
+  install and never overwrites one. constexpr_for was the only definition the two libraries shared.
+- The minimum standard is unchanged: C++17. CI builds and tests C++17 and C++20.
 
 Five findings from an independent errata review by a downstream consumer
-(crtp2, pinned at v1.3.1), worked in its priority order. Each was measured or
+pinned at v1.3.1, worked in its priority order. Each was measured or
 worked around downstream; the workarounds can go when a pin includes this.
 
 ### Added
@@ -908,6 +924,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.4.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.4.0
 [1.3.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.3.1
 [1.3.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.3.0
 [1.2.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.2.1

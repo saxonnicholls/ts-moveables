@@ -32,7 +32,7 @@
 #include "concurrent/parallel_for.hpp"                 // IWYU pragma: export
 #include "concurrent/task_graph.hpp"                   // IWYU pragma: export
 #include "net/tcp.hpp"                                 // IWYU pragma: export
-#include "utils/constexpr_for.hpp"                    // IWYU pragma: export
+#include "utils/constexpr_for.hpp"                    // IWYU pragma: export (forwards to snicholls-core)
 #include "event/loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 #include "event/time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
 #include "http/server.hpp"                  // IWYU pragma: export (follows the event loop)

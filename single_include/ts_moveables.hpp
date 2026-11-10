@@ -66,8 +66,8 @@
 #define ts_moveables_version_hpp
 
 #define SNICHOLLS_VERSION_MAJOR 1
-#define SNICHOLLS_VERSION_MINOR 3
-#define SNICHOLLS_VERSION_PATCH 1
+#define SNICHOLLS_VERSION_MINOR 4
+#define SNICHOLLS_VERSION_PATCH 0
 
 // Comparable in the preprocessor. Two decimal digits each for minor and patch,
 // which is plenty and keeps the number readable: 1.0.0 is 10000, 1.2.3 is
@@ -5630,18 +5630,61 @@ namespace snicholls
 #include <type_traits>
 #include <utility>
 
-// (inlined) #include "../interfaces/task_pool.hpp"
-// (inlined) #include "../utils/constexpr_for.hpp"
+// (inlined) #include <snicholls/core/constexpr_for.hpp>   // unrolled_for (snicholls-core)
 // ----------------------------------------------------------------------
-// begin constexpr_for.hpp
+// begin snicholls-core snicholls/core/constexpr_for.hpp (MIT, https://github.com/saxonnicholls/core)
 // ----------------------------------------------------------------------
 //
 //  constexpr_for.hpp
-//  TSMoveables
+//  snicholls-core
 //
 //  Copyright 2010-2026 Saxon Herschel Nicholls
 //
-//  Thread Safe Moveables - compile-time loop unrolling
+//  Moved from ts-moveables (TSMoveables/utils/constexpr_for.hpp at d7e0f10).
+//  The definitions are unchanged; the guard and documentation are core's.
+//
+
+/// \file
+/// \brief `constexpr_for`, `constexpr_nest`, `unrolled_for`: compile-time loop unrolling.
+/// \ingroup core
+///
+/// **Overview.** `constexpr_for<Start, End, Inc>` expands into exactly the calls it
+/// needs and leaves no loop at all: the bounds are template parameters, so there is
+/// no counter, no compare and no branch. The body is handed
+/// `std::integral_constant<T, I>`, not a bare `T`, so `I.value` is a constant
+/// expression inside the body and can index a tuple or be a template argument,
+/// while `I` still converts to its value for ordinary arithmetic:
+///
+/// \snippet constexpr_for_demo.cpp tuple
+///
+/// `constexpr_nest<E0, E1, ...>` unrolls nested loops to any depth, row-major, with
+/// a constant index per level. `unrolled_for<Unroll>(first, last, body)` walks a
+/// *run-time* range with the body emitted `Unroll` times per iteration and a tail.
+///
+/// **Relationships.** For iterating *values* (an index range, a tuple-like by
+/// index). To operate on a pack of *types*, use `type_list` (CLAUDE.md "Idioms").
+///
+/// **Guarantees.** Expansion is a fold over an `index_sequence`, depth 1 whatever
+/// the count, so there is no instantiation-depth cliff. The iteration count is
+/// computed in `long long`, so a negative step against unsigned bounds cannot wrap.
+/// A step of 0 is a compile error. Trailing arguments reach every call as lvalues,
+/// never forwarded, so a body cannot move from the same object twice.
+///
+/// **Performance.** At -O2 compilers already unroll simple counted loops, and doing
+/// it by hand can lose. Reach for `constexpr_for` when the body must be instantiated
+/// per index; reach for `unrolled_for` only with a benchmark in hand. Not
+/// benchmarked in core; ts-moveables' `make bench-parallel` compares them.
+///
+/// **Tests and demos.** `tests/constexpr_for_test.cpp`, `demos/constexpr_for_demo.cpp`.
+///
+/// **Dependencies.** `<cstddef>`, `<type_traits>`, `<utility>`.
+///
+/// **Known issues.** `constexpr_nest<8, 8, 8>` is 512 copies of the body: for small
+/// fixed extents, not whole arrays.
+///
+/// **Status.** Stable.
+
+// Implementation notes, as written in ts-moveables:
 //
 //      constexpr_for<0, 4>      ([&](auto I) { use<I.value>(); });   // fully unrolled
 //      constexpr_for<0, 10, 2>  ([&](auto I) { even(I); });          // with a step
@@ -5706,8 +5749,8 @@ namespace snicholls
 //  unrolled_for only with a benchmark in hand.
 //
 
-#ifndef constexpr_for_hpp
-#define constexpr_for_hpp
+#ifndef snicholls_core_constexpr_for_hpp
+#define snicholls_core_constexpr_for_hpp
 
 #include <cstddef>
 #include <type_traits>
@@ -5743,6 +5786,14 @@ namespace snicholls
         }
     } // namespace detail
 
+    /// \brief Call `f(I, args...)` for each `I` in [Start, End) stepping by `Inc`, fully unrolled.
+    /// \tparam Start The first index; its type is the index type.
+    /// \tparam End   The open end of the range.
+    /// \tparam Inc   The step; negative counts down; 0 is a compile error.
+    /// \tparam F     The body: callable with `std::integral_constant<decltype(Start), I>`, then `args...`.
+    /// \tparam Args  Trailing argument types.
+    /// \param f      The body.
+    /// \param args   Passed to every call as lvalues.
     // Invoke f(I, args...) for each I in [Start, End) stepping by Inc, fully
     // unrolled at compile time. Inc may be negative to count down. I is an
     // integral_constant<decltype(Start), ...>.
@@ -5757,6 +5808,12 @@ namespace snicholls
                                                std::make_index_sequence<n>{}, args...);
     }
 
+    /// \brief Call `f(I, args...)` for each `I` in [0, Count), fully unrolled.
+    /// \tparam Count The number of iterations; its type is the index type.
+    /// \tparam F     The body.
+    /// \tparam Args  Trailing argument types.
+    /// \param f      The body.
+    /// \param args   Passed to every call as lvalues.
     // Invoke f(I, args...) for each I in [0, Count) - the common case, shorter.
     // Disjoint from the overload above: that one cannot deduce End, this one
     // cannot take a second non-type argument.
@@ -5792,6 +5849,10 @@ namespace snicholls
         };
     } // namespace detail
 
+    /// \brief Nested loops, every level unrolled: `f(I, J, ...)` for every point, row-major.
+    /// \tparam Extents The extent of each level, outermost first.
+    /// \tparam F       The body: one `integral_constant<std::size_t, ...>` per level.
+    /// \param f        The body.
     // Nested loops, every level unrolled, to any depth:
     //
     //     constexpr_nest<2, 3>   ([&](auto I, auto J)         { m[I][J] += a[I]*b[J]; });
@@ -5811,6 +5872,15 @@ namespace snicholls
         detail::nest<Extents...>::run(f);
     }
 
+    /// \brief Walk a run-time range [first, last), calling `body(i, args...)`, unrolled `Unroll` times with a tail.
+    /// \tparam Unroll Copies of the body per iteration, at least 1.
+    /// \tparam Index  An integral index type.
+    /// \tparam Body   Callable with `(Index, Args&...)`.
+    /// \tparam Args   Trailing argument types.
+    /// \param first   The first index.
+    /// \param last    The open end; an inverted range does nothing.
+    /// \param body    The body.
+    /// \param args    Passed to every call as lvalues.
     // Walk a RUN-TIME range [first, last), calling body(i, args...) for each i,
     // with the body emitted Unroll times per iteration and a tail loop for the
     // remainder.
@@ -5840,8 +5910,10 @@ namespace snicholls
     }
 } // namespace snicholls
 
-#endif /* constexpr_for_hpp */
-// end constexpr_for.hpp
+#endif /* snicholls_core_constexpr_for_hpp */
+// end snicholls-core snicholls/core/constexpr_for.hpp
+
+// (inlined) #include "../interfaces/task_pool.hpp"
 // (inlined) #include "task_group.hpp"          // completion_gate, error_slot
 
 #include <algorithm>
@@ -5975,7 +6047,7 @@ namespace snicholls
     // the caller thinks is finished with.
     // Unroll is a compile-time chunk-inner unroll factor, default 1 (none).
     // parallel_for<8>(pool, 0, n, body) emits the body eight times per inner
-    // iteration; see utils/constexpr_for.hpp for why that is usually not the
+    // iteration; see snicholls-core's constexpr_for.hpp for why that is usually not the
     // win it sounds like, and `make bench-parallel` for the measurement.
     template <std::size_t Unroll = 1, typename Index, typename Body>
     void parallel_for(task_pool& pool, Index first, Index last, Body body,
@@ -8871,7 +8943,93 @@ private:
 #endif // SNICHOLLS_HAS_TCP
 #endif /* net_tcp_hpp */
 // end tcp.hpp
-// (inlined) #include "utils/constexpr_for.hpp"                    // IWYU pragma: export
+// (inlined) #include "utils/constexpr_for.hpp"                    // IWYU pragma: export (forwards to snicholls-core)
+// ----------------------------------------------------------------------
+// begin constexpr_for.hpp
+// ----------------------------------------------------------------------
+//
+//  constexpr_for.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - compile-time loop unrolling
+//
+//  DEPRECATED here: constexpr_for, constexpr_nest and unrolled_for live in snicholls-core,
+//  <snicholls/core/constexpr_for.hpp>, and this header only forwards to it, so the two can be included together
+//  (both used to define snicholls::constexpr_for). Include core's header in new code. Core keeps that header
+//  C++17-clean for ts-moveables; the amalgamated single headers carry it inline.
+//
+//      constexpr_for<0, 4>      ([&](auto I) { use<I.value>(); });   // fully unrolled
+//      constexpr_for<0, 10, 2>  ([&](auto I) { even(I); });          // with a step
+//      constexpr_for<10, 0, -1> ([&](auto I) { down(I); });          // and backwards
+//      constexpr_for<0, 3>      (f, a, b);                           // f(I, a, b)
+//      unrolled_for<4>(0, n, [&](std::size_t i) { out[i] = g(in[i]); });
+//
+//  constexpr_for<Start, End, Inc> expands into exactly the calls it needs and
+//  leaves no loop at all - the bounds are template parameters, so there is no
+//  counter, no compare and no branch. unrolled_for takes a RUN-TIME range and
+//  emits the body Unroll times per iteration, with a tail for the remainder.
+//
+//  ------------------------------------------------------ the index is a type
+//
+//  The body is handed std::integral_constant<T, I>, not a bare T, and that is
+//  the whole reason this is worth having over a plain loop.
+//
+//  A function parameter is never a constant expression, however constant the
+//  value passed in was - so a body taking `std::size_t i` cannot write
+//  std::get<i>(tuple) or use i as a template argument, which is usually the
+//  entire point of unrolling by hand. Handing it a type carrying the index
+//  fixes that: `I.value` is a constant expression inside the body, while `I`
+//  still converts implicitly to its underlying type, so the ordinary
+//  arithmetic spelling keeps working:
+//
+//      constexpr_for<0, N>([&](auto I) { sum += v[I]; });                // fine
+//      constexpr_for<0, N>([&](auto I) { use(std::get<I.value>(tup)); }); // also fine
+//
+//  The index type is decltype(Start), so constexpr_for<0, 4> yields int and
+//  constexpr_for<std::size_t{0}, std::size_t{4}> yields std::size_t. Say which
+//  you want when it matters.
+//
+//  ------------------------------------------------------------ expansion, not
+//                                                                  recursion
+//  The obvious implementation recurses - body, then constexpr_for<Start+Inc,
+//  End, Inc> - and it is shorter. This expands an index_sequence through a fold
+//  instead, because the recursive form instantiates one template per iteration:
+//  template depth grows with the count, a few hundred iterations meets the
+//  compiler's instantiation-depth limit, and compile time grows superlinearly
+//  well before that. The fold is depth 1 whatever the count. Same unrolled
+//  output, no cliff to fall off.
+//
+//  ------------------------------------------------------------ extra arguments
+//
+//  Trailing arguments are passed through to every call as LVALUES, never
+//  forwarded. Forwarding would move the same object once per iteration, which
+//  is a use-after-move that compiles quietly; if a body needs to consume
+//  something it should capture it instead.
+//
+//  ------------------------------------------------------------- when to reach
+//
+//  Be sceptical of unrolled_for as a speed tool. At -O2 the compiler already
+//  unrolls simple counted loops, and doing it by hand can lose: more code in
+//  the instruction cache, more live registers, and a tail that confuses the
+//  vectoriser. `make bench-parallel` prints unrolled against not so the claim
+//  stays falsifiable rather than folkloric.
+//
+//  Where it does earn its place: when the body must be instantiated per index -
+//  a tuple element, a template argument, a fixed-size matrix row - which no
+//  compiler unroll can do for you, because that is a language requirement
+//  rather than an optimisation. Reach for constexpr_for for that; reach for
+//  unrolled_for only with a benchmark in hand.
+//
+
+#ifndef constexpr_for_hpp
+#define constexpr_for_hpp
+
+// (inlined) #include <snicholls/core/constexpr_for.hpp>
+
+#endif /* constexpr_for_hpp */
+// end constexpr_for.hpp
 // (inlined) #include "event/loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 // (inlined) #include "event/time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
 // ----------------------------------------------------------------------
