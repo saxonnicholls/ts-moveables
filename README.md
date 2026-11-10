@@ -425,7 +425,7 @@ The library exports the interface target `snicholls::ts_moveables`, which carrie
 include(FetchContent)
 FetchContent_Declare(ts_moveables
     GIT_REPOSITORY https://github.com/saxonnicholls/ts-moveables.git
-    GIT_TAG v1.4.0)
+    GIT_TAG v1.5.0)
 FetchContent_MakeAvailable(ts_moveables)
 
 target_link_libraries(my_app PRIVATE snicholls::ts_moveables)

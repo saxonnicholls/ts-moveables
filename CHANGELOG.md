@@ -7,7 +7,12 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
-## [Unreleased]
+## [1.5.0] — 2026-11-10
+
+### Changed
+
+- snicholls-core v0.5.1 (`third_party/core` at `bf529db`), a fix release with no API changes; the minimum stays
+  0.5.0. `constexpr_for.hpp` is still C++17-clean, and core's CI checks that.
 
 ### Added
 
@@ -946,6 +951,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.5.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.5.0
 [1.4.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.4.0
 [1.3.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.3.1
 [1.3.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.3.0
