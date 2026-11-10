@@ -106,6 +106,24 @@ if(TS_MOVEABLES_BUILD_TESTS)
         target_link_libraries(ts_moveables_${demo} PRIVATE snicholls::ts_moveables)
         target_compile_definitions(ts_moveables_${demo} PRIVATE NDEBUG)
     endforeach()
+
+    # Remote execution (demos/remote_compute): C++20 whatever the rest of the
+    # build uses (class-type template parameters; the library stays C++17), and
+    # POSIX sockets, so not on Windows. Its self-test runs the client and every
+    # worker in one process over 127.0.0.1 - a CTest like any other.
+    if(NOT WIN32)
+        foreach(remote remote_compute_demo remote_compute_bench)
+            add_executable(ts_moveables_${remote} demos/remote_compute/${remote}.cpp)
+            target_link_libraries(ts_moveables_${remote} PRIVATE snicholls::ts_moveables)
+            target_include_directories(ts_moveables_${remote} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/demos/remote_compute)
+            target_compile_features(ts_moveables_${remote} PRIVATE cxx_std_20)
+            set_target_properties(ts_moveables_${remote} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+        endforeach()
+        target_compile_definitions(ts_moveables_remote_compute_bench PRIVATE NDEBUG)
+        add_test(NAME remote_compute_selftest COMMAND ts_moveables_remote_compute_demo selftest --no-lan)
+        set_tests_properties(remote_compute_selftest PROPERTIES TIMEOUT 180)
+    endif()
 endif()
 
 # Install and export - headers live in subdirectories, so the tree is
