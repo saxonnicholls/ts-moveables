@@ -302,6 +302,30 @@ tsan-remote: build/remote_compute_demo_tsan
 bench-remote: build/remote_compute_bench
 	./build/remote_compute_bench
 
+# Byte-level BPE (demos/tokenizer): C++20, like the remote demo. Needs a data
+# directory from scripts/tokenizer/prepare.py (Python, with tiktoken and
+# rustbpe), so it is not in the self-verifying set CI runs:
+#     python scripts/tokenizer/prepare.py build/tokdata
+#     make bench-tokenizer TOKDATA=build/tokdata
+TOK_DIR  := demos/tokenizer
+TOK_HDRS := $(wildcard $(TOK_DIR)/tok/*.hpp)
+TOK_INC  := $(CORE_INC) -I$(TOK_DIR) -ITSMoveables
+TOKDATA  ?= build/tokdata
+
+build/tokenizer_bench: $(TOK_DIR)/tokenizer_bench.cpp $(TOK_HDRS) $(HEADERS) | build
+	$(CXX) $(TOK_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O3 -DNDEBUG $(EXTRA_FLAGS) -pthread \
+	    $(TOK_DIR)/tokenizer_bench.cpp -o $@ $(LDLIBS)
+
+build/long_merge_check: $(TOK_DIR)/long_merge_check.cpp $(TOK_HDRS) $(HEADERS) | build
+	$(CXX) $(TOK_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O3 -DNDEBUG $(EXTRA_FLAGS) -pthread \
+	    $(TOK_DIR)/long_merge_check.cpp -o $@ $(LDLIBS)
+
+# Every document checked against tiktoken's tokens, then timed, for both vocabularies
+bench-tokenizer: build/tokenizer_bench build/long_merge_check
+	./build/tokenizer_bench $(TOKDATA) cl100k
+	./build/tokenizer_bench $(TOKDATA) rust32k
+	./build/long_merge_check $(TOKDATA) cl100k
+
 build/ws_hub_broadcast: benchmarks/ws_hub_broadcast.cpp $(HEADERS) | build
 	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    benchmarks/ws_hub_broadcast.cpp -o $@ $(LDLIBS)
@@ -391,4 +415,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean

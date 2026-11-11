@@ -2,6 +2,9 @@
 build/
 build-cmake/
 
+# Cargo output of the tokenizer's Rust baselines (its Cargo.lock is committed)
+scripts/tokenizer/rust_baselines/target/
+
 # Fetched benchmark-only comparison headers (moodycamel) - not committed;
 # `make bench-compare` fetches them. The library itself is dependency-free.
 benchmarks/third_party/

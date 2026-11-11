@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Parallel BPE Throughput</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column; a log-scale bar chart per vocabulary, then the full tables, then method and limits. */
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --fg: #17202b;
+  --muted: #5b6676;
+  --rule: #dde1e7;
+  --ours: #1f5fd6;
+  --rival: #9aa4b2;
+  --rival-strong: #6b7686;
+  --good: #1d7a4a;
+  --display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f141b; --surface: #161d27; --fg: #e6eaf0; --muted: #9aa5b5; --rule: #2a3340;
+    --ours: #6c9dff; --rival: #4f5b6b; --rival-strong: #8893a3; --good: #5cc48a; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f141b; --surface: #161d27; --fg: #e6eaf0; --muted: #9aa5b5; --rule: #2a3340;
+  --ours: #6c9dff; --rival: #4f5b6b; --rival-strong: #8893a3; --good: #5cc48a; color-scheme: dark;
+}
+body {
+  margin: 0;
+  background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 16px; line-height: 1.55;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 64px;
+}
+main { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 44px; }
+h1, h2, h3 { font-family: var(--display); font-weight: 600; text-wrap: balance; margin: 0; line-height: 1.15; }
+h1 { font-size: clamp(30px, 5vw, 42px); letter-spacing: -0.01em; }
+h2 { font-size: 24px; }
+h3 { font-size: 18px; }
+p { margin: 0; max-width: 68ch; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+header { display: flex; flex-direction: column; gap: 14px; }
+.lede { font-size: 18px; color: var(--fg); }
+.meta { font-family: var(--mono); font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 18px; }
+section { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+.headline { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.stat { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 16px; display: flex; flex-direction: column; gap: 4px; }
+.stat .x { font-family: var(--display); font-size: 34px; font-weight: 600; color: var(--ours); font-variant-numeric: tabular-nums; }
+.stat .what { font-size: 14px; font-weight: 600; }
+.stat .vs { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+@media (max-width: 640px) { .headline { grid-template-columns: 1fr; } }
+
+.chart { background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; padding: 16px 16px 8px; overflow-x: auto; }
+.chart svg { display: block; width: 100%; min-width: 560px; height: auto; }
+.chart text { font-family: var(--mono); font-size: 11px; fill: var(--muted); }
+.chart .lbl { font-family: var(--body); font-size: 12.5px; fill: var(--fg); }
+.chart .grp { font-family: var(--body); font-size: 13px; font-weight: 600; fill: var(--fg); }
+.chart .val { fill: var(--fg); }
+.chart .val.ours { font-weight: 600; fill: var(--ours); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 13px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+
+.tablewrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 600px; }
+th, td { padding: 9px 14px; text-align: right; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+thead th { font-family: var(--mono); font-size: 11.5px; font-weight: 500; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+td { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td:first-child { font-family: var(--body); }
+tr:last-child td { border-bottom: 0; }
+tr.ours td { color: var(--ours); font-weight: 600; }
+.note { font-size: 12.5px; color: var(--muted); font-family: var(--body); font-weight: 400; }
+
+ul { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; max-width: 70ch; }
+code { font-family: var(--mono); font-size: 0.9em; }
+.check { color: var(--good); font-weight: 600; }
+footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule); padding-top: 16px; }
+</style>
+</head>
+<body>
+
+<main>
+  <header>
+    <div class="eyebrow">ts-moveables · byte-level BPE · experimental</div>
+    <h1>Parallel BPE throughput</h1>
+    <p class="lede">A byte-level BPE encoder built on snicholls-core's merge and ts-moveables' work-claiming <code>parallel_for</code>. Token for token it gives what tiktoken gives. It is 4.7 to 6.1 times faster than the fastest single-threaded encoder we measured, and with 32 threads it encodes 1.3 to 1.6 GB/s.</p>
+    <div class="meta">
+      <span>Intel Xeon W-3245, 16 cores / 32 threads, macOS</span>
+      <span>Corpus: Python 3.12 stdlib, 778 files, 12.3 MB</span>
+      <span>Best of 5–7 runs</span>
+    </div>
+  </header>
+
+  <section aria-label="Headline">
+    <div class="headline">
+      <div class="stat"><span class="x">4.7×</span><span class="what">One thread, cl100k</span><span class="vs">73 MB/s vs bpe-openai's 15.5</span></div>
+      <div class="stat"><span class="x">6.8×</span><span class="what">32 threads across documents</span><span class="vs">1,287 MB/s vs bpe-openai's 188</span></div>
+      <div class="stat"><span class="x">74×</span><span class="what">One 12 MB text</span><span class="vs">1,164 MB/s vs 15.8; the others use one thread</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>cl100k_base (GPT-4's vocabulary, 100,256 tokens)</h2>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--ours)"></i>this encoder</span>
+      <span><i class="sw" style="background:var(--rival-strong)"></i>native Rust</span>
+      <span><i class="sw" style="background:var(--rival)"></i>through Python</span>
+    </div>
+    <div class="chart" id="chart-cl100k" role="img" aria-label="Throughput in MB/s on cl100k, log scale"></div>
+  </section>
+
+  <section>
+    <h2>rust32k (32,768 tokens trained by rustbpe on the corpus)</h2>
+    <div class="chart" id="chart-rust32k" role="img" aria-label="Throughput in MB/s on rust32k, log scale"></div>
+    <p class="note">bpe-openai ships fixed vocabularies only, so it is absent here.</p>
+  </section>
+
+  <section>
+    <h2>All figures</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>cl100k</th><th>1 thread MB/s</th><th>32 threads, batch MB/s</th><th>one text MB/s</th><th>tokens match</th></tr></thead>
+        <tbody id="t-cl100k"></tbody>
+      </table>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>rust32k</th><th>1 thread MB/s</th><th>32 threads, batch MB/s</th><th>one text MB/s</th><th>tokens match</th></tr></thead>
+        <tbody id="t-rust32k"></tbody>
+      </table>
+    </div>
+    <p class="note">"Batch" encodes the 778 files as separate documents across all threads: rayon for the Rust crates, <code>encode_ordinary_batch(num_threads=32)</code> for tiktoken (its best of 8, 16 and 32 threads is shown), <code>batch_encode</code> for rustbpe. "One text" is the whole corpus as one string. Our 32 threads are 31 pool workers plus the calling thread, which <code>parallel_for</code> also puts to work.</p>
+  </section>
+
+  <section>
+    <h2>Correctness</h2>
+    <ul>
+      <li><span class="check">778 of 778</span> documents give exactly tiktoken's tokens, for both vocabularies, serially and in parallel, with chunks from 4 KB up to the default size.</li>
+      <li>The whole corpus as one text, cut across the pool, gives exactly its serial tokens. Every document decodes back to its bytes.</li>
+      <li>tiktoken-rs and bpe-openai also match tiktoken on every document, so all the rows above are doing the same work.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Where the speed comes from</h2>
+    <ul>
+      <li><b>The split pattern as code.</b> tiktoken spends most of its time in fancy-regex. Here the cl100k and GPT-4 patterns are written out by hand, alternative by alternative, with an ASCII fast path for letter runs. The split runs at 182 MB/s on one thread.</li>
+      <li><b>Lookups in flight together.</b> The split cuts 32 pieces at a time and hashes and prefetches each one's slot in the vocabulary before looking any of them up. The cache misses on a 4 MB table then overlap instead of queueing.</li>
+      <li><b>A per-thread piece cache.</b> 93% of pieces are a single token. The other 7% need a merge, and they recur: 195K of them, but only 41K distinct. A 256 KB direct-mapped cache per thread remembers them.</li>
+      <li><b>Cutting one text safely.</b> A long text is cut at positions the whole-text split is proved to start a piece at: an ASCII letter followed by an ASCII non-letter, or a newline followed by non-whitespace. Workers claim the chunks from a shared cursor, so one text uses every core and still gives its serial tokens. The others parallelise only across documents.</li>
+      <li><b>The merge.</b> snicholls-core's <code>bpe_encode_piece</code> is tiktoken's <code>byte_pair_merge</code> step for step. It allocates nothing and is <code>constexpr</code>.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Limits of these numbers</h2>
+    <ul>
+      <li>One corpus, mostly source code. Prose, other languages and other scripts will shift every row; the piece cache helps most where words repeat.</li>
+      <li>One machine. Linux and ARM are still to be measured.</li>
+      <li>Pieces of 1 KB or more take an O(n log n) heap merge with the same tokens. It is about 100 times faster than tiktoken's quadratic merge on a 128 KB piece. Shorter pieces keep the rescanning merge, which is faster at those lengths. bpe-openai is linear in the worst case.</li>
+      <li>The Unicode classes come from the regex module's tables and are checked through tiktoken's tokens on this corpus. Code points assigned in a newer Unicode version than tiktoken's could split differently.</li>
+      <li>Only the cl100k and GPT-4 split patterns are supported. o200k's pattern is not yet supported, and neither are special tokens.</li>
+      <li>The Python rows include building Python lists. The native Rust rows are the fair comparison for the encoders themselves.</li>
+    </ul>
+  </section>
+
+  <footer>Copyright 2010-2026 Saxon Herschel Nicholls. ts-moveables and snicholls-core are open source. This encoder is an experimental demo, not yet released; it builds on core's <code>ml/bpe.hpp</code>, planned for core 0.6.0. Versions measured: tiktoken 0.14.0, tiktoken-rs 0.12.1, bpe-openai 0.3.2, rustbpe 0.1.0.</footer>
+</main>
+
+<script>
+(function () {
+  // MB/s; null where the encoder has no such mode for that vocabulary
+  const data = {
+    cl100k: [
+      { name: "this encoder", kind: "ours", one: 73.4, batch: 1286.5, text: 1164.1, match: "778/778" },
+      { name: "bpe-openai (Rust)", kind: "rust", one: 15.5, batch: 188.3, text: 15.8, match: "778/778" },
+      { name: "tiktoken-rs (Rust)", kind: "rust", one: 9.8, batch: 46.7, text: 10.6, match: "778/778" },
+      { name: "tiktoken (Python)", kind: "py", one: 9.4, batch: 37.7, text: 9.5, match: "reference" }
+    ],
+    rust32k: [
+      { name: "this encoder", kind: "ours", one: 84.7, batch: 1566.7, text: 1328.3, match: "778/778" },
+      { name: "tiktoken-rs (Rust)", kind: "rust", one: 13.8, batch: 58.1, text: 13.6, match: "778/778" },
+      { name: "tiktoken (Python)", kind: "py", one: 11.4, batch: 39.9, text: 11.8, match: "reference" },
+      { name: "rustbpe (Python)", kind: "py", one: 4.1, batch: 17.0, text: 4.2, match: "778/778" }
+    ]
+  };
+  const groups = [["one", "One thread"], ["batch", "32 threads, across documents"], ["text", "One 12 MB text, 32 threads available"]];
+  const fill = { ours: "var(--ours)", rust: "var(--rival-strong)", py: "var(--rival)" };
+  const fmt = v => v >= 100 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1);
+  const NS = "http://www.w3.org/2000/svg";
+  function el(tag, attrs, text) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function chart(id, rows) {
+    const W = 820, left = 150, right = 70, barH = 16, gap = 6, groupGap = 30, top = 26;
+    const plotW = W - left - right;
+    const lo = Math.log10(1), hi = Math.log10(3000);
+    const x = v => left + (Math.log10(v) - lo) / (hi - lo) * plotW;
+    const groupH = rows.length * (barH + gap);
+    const H = top + groups.length * (groupH + groupGap) + 4;
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "xMinYMin meet" });
+    for (const t of [1, 10, 100, 1000]) {
+      svg.appendChild(el("line", { x1: x(t), x2: x(t), y1: top - 6, y2: H - 8, stroke: "var(--rule)", "stroke-width": 1 }));
+      svg.appendChild(el("text", { x: x(t), y: 12, "text-anchor": "middle" }, t.toLocaleString("en-US") + " MB/s"));
+    }
+    let y = top;
+    for (const [key, title] of groups) {
+      svg.appendChild(el("text", { x: 0, y: y + 4, class: "grp" }, title));
+      y += 12;
+      for (const r of rows) {
+        const v = r[key];
+        svg.appendChild(el("text", { x: left - 10, y: y + barH - 4, "text-anchor": "end", class: "lbl" }, r.name));
+        svg.appendChild(el("rect", { x: left, y: y, width: Math.max(1, x(v) - left), height: barH, rx: 2, fill: fill[r.kind] }));
+        svg.appendChild(el("text", { x: x(v) + 6, y: y + barH - 4, class: "val" + (r.kind === "ours" ? " ours" : "") }, fmt(v)));
+        y += barH + gap;
+      }
+      y += groupGap - 12;
+    }
+    document.getElementById(id).appendChild(svg);
+  }
+  function table(id, rows) {
+    const tb = document.getElementById(id);
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      if (r.kind === "ours") tr.className = "ours";
+      for (const c of [r.name, fmt(r.one), fmt(r.batch), fmt(r.text), r.match]) {
+        const td = document.createElement("td");
+        td.textContent = c;
+        tr.appendChild(td);
+      }
+      tb.appendChild(tr);
+    }
+  }
+  for (const k of Object.keys(data)) { chart("chart-" + k, data[k]); table("t-" + k, data[k]); }
+})();
+</script>
+</body>
+</html>
