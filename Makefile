@@ -320,8 +320,14 @@ build/long_merge_check: $(TOK_DIR)/long_merge_check.cpp $(TOK_HDRS) $(HEADERS) |
 	$(CXX) $(TOK_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O3 -DNDEBUG $(EXTRA_FLAGS) -pthread \
 	    $(TOK_DIR)/long_merge_check.cpp -o $@ $(LDLIBS)
 
-# Every document checked against tiktoken's tokens, then timed, for both vocabularies
-bench-tokenizer: build/tokenizer_bench build/long_merge_check
+build/split_check: $(TOK_DIR)/split_check.cpp $(TOK_HDRS) | build
+	$(CXX) -I$(TOK_DIR) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 $(EXTRA_FLAGS) \
+	    $(TOK_DIR)/split_check.cpp -o $@
+
+# The splitter's fast path against its reference, then every document checked
+# against tiktoken's tokens and timed, for both vocabularies
+bench-tokenizer: build/split_check build/tokenizer_bench build/long_merge_check
+	./build/split_check $(TOKDATA)/docs.bin
 	./build/tokenizer_bench $(TOKDATA) cl100k
 	./build/tokenizer_bench $(TOKDATA) rust32k
 	./build/long_merge_check $(TOKDATA) cl100k
@@ -336,6 +342,13 @@ build/parallel_scaling: benchmarks/parallel_scaling.cpp $(HEADERS) | build
 
 bench-parallel: build/parallel_scaling
 	./build/parallel_scaling
+
+build/pool_dispatch: benchmarks/pool_dispatch.cpp $(HEADERS) | build
+	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
+	    benchmarks/pool_dispatch.cpp -o $@ $(LDLIBS)
+
+bench-pool-dispatch: build/pool_dispatch
+	./build/pool_dispatch
 
 bench-wshub: build/ws_hub_broadcast
 	./build/ws_hub_broadcast
@@ -415,4 +428,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean

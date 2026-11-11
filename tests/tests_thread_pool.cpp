@@ -18,6 +18,8 @@
 #include <vector>
 
 #include "../TSMoveables/concurrent/thread_pool.hpp"
+#include "../TSMoveables/concurrent/parallel_for.hpp"
+#include "../TSMoveables/concepts/task_pool.hpp"
 
 using namespace snicholls;
 
@@ -210,6 +212,98 @@ void test_reentrant_submit()
 
 } // namespace
 
+// Every pool, and the interface itself, has task_pool's members; other types
+// do not. Checked as the C++17 trait always and as the concept under C++20.
+struct worker_count_may_throw {
+    void submit(task_pool::task) {}
+    void wait_idle() {}
+    std::size_t worker_count() const { return 1; }   // not noexcept: not a task_pool
+};
+static_assert(is_task_pool_like_v<task_pool>);
+static_assert(is_task_pool_like_v<mutex_task_pool> && is_task_pool_like_v<sharded_task_pool> &&
+              is_task_pool_like_v<dispatch_task_pool> && is_task_pool_like_v<mpmc_task_pool> &&
+              is_task_pool_like_v<work_stealing_task_pool> && is_task_pool_like_v<inline_task_pool>);
+static_assert(is_task_pool_like_v<task_pool_adapter<inline_task_pool>>);
+static_assert(!is_task_pool_like_v<int> && !is_task_pool_like_v<worker_count_may_throw>);
+#if TS_MOVEABLES_HAS_CONCEPTS
+static_assert(task_pool_like<task_pool> && task_pool_like<work_stealing_task_pool> && task_pool_like<inline_task_pool>);
+static_assert(!task_pool_like<int> && !task_pool_like<worker_count_may_throw>);
+#endif
+
+// A model that is task_pool_like without deriving from task_pool: it runs
+// every task inline and counts them, so the forwarding is visible.
+struct counting_pool {
+    int submitted = 0;
+    int waits = 0;
+    void submit(task_pool::task t) { ++submitted; t(); }
+    void wait_idle() { ++waits; }
+    std::size_t worker_count() const noexcept { return 1; }
+};
+static_assert(is_task_pool_like_v<counting_pool> && !std::is_base_of_v<task_pool, counting_pool>);
+
+void test_task_pool_concept()
+{
+    // The adapter puts a model behind the interface: by value, and as a view
+    task_pool_adapter<counting_pool> owned;
+    task_pool& as_iface = owned;
+    as_iface.submit([] {});
+    as_iface.wait_idle();
+    assert(owned.implementation().submitted == 1 && owned.implementation().waits == 1);
+    assert(as_iface.worker_count() == 1);
+
+    counting_pool model;
+    task_pool_adapter<counting_pool&> view(model);
+    static_cast<task_pool&>(view).submit([] {});
+    assert(model.submitted == 1);
+
+    // The same algorithm over a concrete pool (direct calls), the interface
+    // (virtual calls) and a model that only satisfies the concept
+    constexpr int n = 50000;
+    work_stealing_task_pool pool{4};
+    std::vector<int> a(n), b(n), c(n);
+    parallel_for(pool, 0, n, [&](int i) { a[i] = i * 3; });
+    parallel_for(static_cast<task_pool&>(pool), 0, n, [&](int i) { b[i] = i * 3; });
+    parallel_for(model, 0, n, [&](int i) { c[i] = i * 3; });   // one worker: the serial path
+    assert(a == b && b == c);
+    const long long want = static_cast<long long>(n) * (n - 1) / 2 * 3;
+    auto map = [&](int i) { return static_cast<long long>(a[i]); };
+    auto add = [](long long x, long long y) { return x + y; };
+    assert(parallel_reduce(pool, 0, n, 0LL, map, add) == want);
+    assert(parallel_reduce(static_cast<task_pool&>(pool), 0, n, 0LL, map, add) == want);
+    assert(parallel_reduce(model, 0, n, 0LL, map, add) == want);
+
+    // async over a concrete pool and over a model
+    auto f = async(pool, [] { return 6 * 7; });
+    assert(f.get() == 42);
+    auto g = async(model, [] { return std::string("model"); });
+    assert(g.get() == "model");
+
+    pass("thread pool: task_pool_like - concrete, interface and adapted pools run the same algorithms");
+
+    // On the concrete pools that have it, submit(F&&) takes the callable as it
+    // is: a move-only one, which no std::function can hold, proves the
+    // template was chosen and not the submit(task) override
+    {
+        auto owned_value = std::make_unique<int>(7);
+        std::atomic<int> seen{0};
+        work_stealing_task_pool ws{4};
+        ws.submit([p = std::move(owned_value), &seen] { seen.store(*p); });
+        ws.wait_idle();
+        assert(seen.load() == 7);
+
+        inline_task_pool in;
+        in.submit([p = std::make_unique<int>(9), &seen] { seen.store(*p); });
+        assert(seen.load() == 9);
+
+        // Through the interface the same pools still take std::function
+        static_cast<task_pool&>(ws).submit([&seen] { seen.store(11); });
+        ws.wait_idle();
+        assert(seen.load() == 11);
+    }
+    static_assert(is_pool_task_v<void (*)()> && !is_pool_task_v<int> && !is_pool_task_v<void (*)(int)>);
+    pass("thread pool: submit(F&&) on a concrete pool takes a move-only callable as it is");
+}
+
 void run_thread_pool_tests()
 {
     test_mutex_pool();
@@ -221,4 +315,5 @@ void run_thread_pool_tests()
     test_polymorphic_use();
     test_moveability();
     test_reentrant_submit();
+    test_task_pool_concept();
 }

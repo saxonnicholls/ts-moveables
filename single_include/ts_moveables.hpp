@@ -66,8 +66,8 @@
 #define ts_moveables_version_hpp
 
 #define SNICHOLLS_VERSION_MAJOR 1
-#define SNICHOLLS_VERSION_MINOR 5
-#define SNICHOLLS_VERSION_PATCH 1
+#define SNICHOLLS_VERSION_MINOR 6
+#define SNICHOLLS_VERSION_PATCH 0
 
 // Comparable in the preprocessor. Two decimal digits each for minor and patch,
 // which is plenty and keeps the number readable: 1.0.0 is 10000, 1.2.3 is
@@ -3079,6 +3079,14 @@ namespace snicholls
         struct shared {
             std::mutex m;
             std::shared_ptr<const slot_vector> slots = std::make_shared<slot_vector>();
+            // slots->size(), stored under m each time the list is replaced and
+            // read without it by emit: a signal nobody listens to then costs
+            // one load per emit rather than a lock and a shared_ptr copy. It
+            // can be high (a slot disconnected through its connection stays in
+            // the list until the next connect / disconnect_all) but never low
+            // for a connect that happened before the emit, so it only ever
+            // sends an emit the slow way, never skips a slot it must call.
+            std::atomic<std::size_t> size{0};
         };
 
         std::shared_ptr<shared> s_ = std::make_shared<shared>();
@@ -3100,7 +3108,9 @@ namespace snicholls
             std::lock_guard<std::mutex> lock(s_->m);
             slot_vector v = live_copy(*s_->slots);
             v.push_back(slot_entry{st, std::function<void(Args...)>(std::forward<F>(f))});
+            const std::size_t n = v.size();
             s_->slots = std::make_shared<const slot_vector>(std::move(v));
+            s_->size.store(n, std::memory_order_release);
             return connection(std::move(st));
         }
 
@@ -3138,9 +3148,11 @@ namespace snicholls
                            [raw, mf](Args... a) { (raw->*mf)(a...); });
         }
 
-        // Emit. Slots run on the emitting thread, in connection order.
+        // Emit. Slots run on the emitting thread, in connection order. With no
+        // slot connected it returns at once: no lock, no shared_ptr copy. A
+        // connect racing this emit may be missed, which the rules above allow.
         void operator()(Args... args) const {
-            if (!s_)
+            if (!s_ || s_->size.load(std::memory_order_acquire) == 0)
                 return;
             std::shared_ptr<const slot_vector> snap;
             {
@@ -3171,6 +3183,7 @@ namespace snicholls
             for (const slot_entry& e : *s_->slots)
                 e.state->alive.store(false, std::memory_order_release);
             s_->slots = std::make_shared<const slot_vector>();
+            s_->size.store(0, std::memory_order_release);
         }
 
         // Currently connected (live) slots - a snapshot
@@ -4788,40 +4801,191 @@ namespace snicholls
 // begin task_pool.hpp
 // ----------------------------------------------------------------------
 //
-//  interfaces/task_pool.hpp
+//  concepts/task_pool.hpp
 //  TSMoveables
 //
 //  Copyright 2010-2026 Saxon Herschel Nicholls
 //
-//  Somewhere to submit work - the interface the thread pools share.
+//  The concept twin of interfaces/task_pool.hpp: "somewhere to submit work" as
+//  a compile-time constraint instead of a vtable.
 //
-//  It is here on its own because the point of the pools was always
-//  *comparison*: one shared queue versus sharded versus work-stealing, weighed
-//  through a common surface. Code that only needs "somewhere to run this"
-//  should depend on that surface, not on five implementations.
+//  The interface stays, and stays the right tool whenever a pool is held by
+//  pointer and chosen at run time: task_group and task_graph keep a
+//  task_pool*, and a benchmark swaps pools behind one. What the concept adds is
+//  the other case, which is most calls: the caller has the concrete pool in
+//  hand, so the algorithm can be a template over it. parallel_for and friends
+//  take any `Pool&` that models `task_pool_like`; given a concrete pool they
+//  call it directly (every pool here is `final`, so those calls devirtualise
+//  and inline), given a `task_pool&` they go through the vtable as before. The
+//  call site picks the dispatch, and the same algorithm serves both.
+//
+//      work_stealing_task_pool pool;
+//      parallel_for(pool, 0, n, body);                          // static: direct calls
+//      parallel_for(static_cast<task_pool&>(pool), 0, n, body); // dynamic: virtual calls
+//
+//  The pieces, as in our other libraries' interface twins:
+//
+//    task_pool_like<P>       the members of task_pool as a concept, with their
+//                            exact types, const and noexcept. The interface
+//                            satisfies it (asserted at the bottom), so a member
+//                            changed on one side and not the other fails here.
+//    task_pool_adapter<Impl> task_pool implemented by forwarding to a model, for
+//                            when something that is only task_pool_like has to
+//                            be handed to code that holds a task_pool*. Holds the
+//                            model by value, or binds to one when Impl is a
+//                            reference (a non-owning view).
+//    is_task_pool_like_v<P>  the same test as a C++17 trait.
+//    TS_MOVEABLES_TASK_POOL  for writing one template that is concept-
+//                            constrained under C++20 and still compiles under
+//                            C++17: `template <TS_MOVEABLES_TASK_POOL Pool>`
+//                            is `template <task_pool_like Pool>` with concepts
+//                            and `template <typename Pool>` without, where the
+//                            algorithm checks is_task_pool_like_v in a
+//                            static_assert instead. ts-moveables still builds
+//                            as C++17, so nothing that compiled before stops
+//                            compiling.
+//
+//  The concept is syntactic only. The semantics - submit from any thread
+//  (except dispatch_task_pool's single-dispatcher contract), wait_idle blocks
+//  until everything submitted has run, worker_count is the parallelism the
+//  algorithms may assume - are the interface's contract.
 //
 
-#ifndef interfaces_task_pool_hpp
-#define interfaces_task_pool_hpp
+#ifndef concepts_task_pool_hpp
+#define concepts_task_pool_hpp
 
 #include <cstddef>
-#include <functional>
+#include <type_traits>
+#include <utility>
+
+// (inlined) #include "../interfaces/task_pool.hpp"
+
+// The language feature comes from the compiler, the library one from <version>
+#if defined(__has_include)
+#if __has_include(<version>)
+#include <version>
+#endif
+#endif
+#if defined(__cpp_concepts) && __cpp_concepts >= 201907L && defined(__cpp_lib_concepts) && __cpp_lib_concepts >= 202002L
+#define TS_MOVEABLES_HAS_CONCEPTS 1
+#else
+#define TS_MOVEABLES_HAS_CONCEPTS 0
+#endif
+
+#if TS_MOVEABLES_HAS_CONCEPTS
+#include <concepts>
+#endif
 
 namespace snicholls
 {
-    struct task_pool {
-        using task = std::function<void()>;
+    namespace detail
+    {
+        template <typename P, typename = void>
+        struct is_task_pool_like : std::false_type {};
 
-        virtual ~task_pool() = default;
+        template <typename P>
+        struct is_task_pool_like<P, std::void_t<
+            decltype(std::declval<P&>().submit(std::declval<task_pool::task>())),
+            decltype(std::declval<P&>().wait_idle()),
+            decltype(std::declval<const P&>().worker_count())>>
+            : std::bool_constant<
+                  std::is_same_v<decltype(std::declval<P&>().submit(std::declval<task_pool::task>())), void> &&
+                  std::is_same_v<decltype(std::declval<P&>().wait_idle()), void> &&
+                  std::is_same_v<decltype(std::declval<const P&>().worker_count()), std::size_t> &&
+                  noexcept(std::declval<const P&>().worker_count())> {};
+    } // namespace detail
 
-        virtual void submit(task t) = 0;                    // enqueue work
-        virtual void wait_idle() = 0;                       // block until all submitted work has run
-        virtual std::size_t worker_count() const noexcept = 0;
+    // Whether F can be submitted as a task: called with no arguments (any
+    // result is discarded, as std::function<void()> does), and movable into the
+    // pool. The C++17 spelling of pool_task.
+    template <typename F>
+    inline constexpr bool is_pool_task_v =
+        std::is_invocable_v<std::decay_t<F>&> && std::is_move_constructible_v<std::decay_t<F>> &&
+        std::is_constructible_v<std::decay_t<F>, F>;
+
+    // Whether P has task_pool's members: the C++17 spelling of task_pool_like.
+    template <typename P>
+    inline constexpr bool is_task_pool_like_v = detail::is_task_pool_like<std::remove_cv_t<P>>::value;
+
+#if TS_MOVEABLES_HAS_CONCEPTS
+    // The members of task_pool as a concept: submit a task (any std::function
+    // <void()>, so a lambda converts), wait until idle, report the worker
+    // count without throwing.
+    template <typename P>
+    concept task_pool_like =
+        requires(P& p, task_pool::task t) {
+            { p.submit(std::move(t)) } -> std::same_as<void>;
+        } &&
+        requires(P& p) {
+            { p.wait_idle() } -> std::same_as<void>;
+        } &&
+        requires(const P& p) {
+            { p.worker_count() } noexcept -> std::same_as<std::size_t>;
+        };
+
+#define TS_MOVEABLES_TASK_POOL ::snicholls::task_pool_like
+
+    // A callable a pool can take as it is, with no std::function around it.
+    // A concrete pool that can store one more cheaply than a std::function
+    // (inline_task_pool runs it; work_stealing_task_pool allocates one node
+    // holding it) has a `template <pool_task F> void submit(F&&)` beside its
+    // submit(task) override: called on the concrete pool, the template is
+    // chosen; called through task_pool&, the override is, as before.
+    template <typename F>
+    concept pool_task = std::invocable<std::decay_t<F>&> && std::move_constructible<std::decay_t<F>> &&
+                        std::constructible_from<std::decay_t<F>, F>;
+#define TS_MOVEABLES_POOL_TASK_TEMPLATE(F) template <::snicholls::pool_task F>
+#else
+#define TS_MOVEABLES_TASK_POOL typename
+#define TS_MOVEABLES_POOL_TASK_TEMPLATE(F) \
+    template <typename F, std::enable_if_t<::snicholls::is_pool_task_v<F>, int> = 0>
+#endif
+
+    // task_pool implemented by forwarding to a task_pool_like model. Impl is
+    // the model, held by value, or a reference to one (a view that binds to it).
+    template <typename Impl>
+    class task_pool_adapter final : public task_pool
+    {
+        static_assert(is_task_pool_like_v<std::remove_reference_t<Impl>>,
+                      "snicholls::task_pool_adapter: Impl does not have task_pool's members "
+                      "(submit(task), wait_idle(), worker_count() const noexcept)");
+
+    public:
+        using implementation_type = std::remove_reference_t<Impl>;
+
+        template <typename... Args,
+                  std::enable_if_t<std::is_constructible_v<Impl, Args...>, int> = 0>
+        explicit task_pool_adapter(Args&&... args) noexcept(std::is_nothrow_constructible_v<Impl, Args...>)
+            : impl_(std::forward<Args>(args)...)
+        {
+        }
+
+        implementation_type& implementation() noexcept { return impl_; }
+        const implementation_type& implementation() const noexcept { return impl_; }
+
+        void submit(task t) override { impl_.submit(std::move(t)); }
+        void wait_idle() override { impl_.wait_idle(); }
+        std::size_t worker_count() const noexcept override { return impl_.worker_count(); }
+
+    private:
+        Impl impl_;
     };
+
 } // namespace snicholls
 
-#endif /* interfaces_task_pool_hpp */
+// The interface satisfies its own concept: a member changed on one side only fails here.
+static_assert(snicholls::is_task_pool_like_v<snicholls::task_pool>,
+              "snicholls::task_pool no longer matches is_task_pool_like_v in concepts/task_pool.hpp");
+#if TS_MOVEABLES_HAS_CONCEPTS
+static_assert(snicholls::task_pool_like<snicholls::task_pool>,
+              "snicholls::task_pool no longer matches task_pool_like in concepts/task_pool.hpp");
+static_assert(snicholls::pool_task<snicholls::task_pool::task> && !snicholls::pool_task<int>);
+#endif
+static_assert(snicholls::is_pool_task_v<snicholls::task_pool::task> && !snicholls::is_pool_task_v<int>);
+
+#endif /* concepts_task_pool_hpp */
 // end task_pool.hpp
+// (inlined) #include "../concepts/task_pool.hpp"
 // (inlined) #include "work_stealing_deque.hpp"
 // ----------------------------------------------------------------------
 // begin work_stealing_deque.hpp
@@ -5015,9 +5179,10 @@ namespace snicholls
     // Result-returning submission over ANY implementation - non-virtual and
     // generic, like snicholls::call_once. Wraps a packaged_task, returns its
     // future; the shared_ptr keeps the task alive until the pool runs it.
-    template <typename F>
-    auto async(task_pool& pool, F&& f) -> std::future<std::invoke_result_t<std::decay_t<F>>>
+    template <TS_MOVEABLES_TASK_POOL Pool, typename F>
+    auto async(Pool& pool, F&& f) -> std::future<std::invoke_result_t<std::decay_t<F>>>
     {
+        static_assert(is_task_pool_like_v<Pool>, "snicholls::async: the pool must have task_pool's members (task_pool_like)");
         using result_type = std::invoke_result_t<std::decay_t<F>>;
         auto pt = std::make_shared<std::packaged_task<result_type()>>(std::forward<F>(f));
         std::future<result_type> fut = pt->get_future();
@@ -5357,9 +5522,25 @@ namespace snicholls
     // Tasks are heap-allocated nodes so the deque moves only pointers, keeping
     // the single-element steal race free of the pointee. Workers busy-poll (no
     // parking), same tradeoff as mpmc_task_pool.
+    //
+    // A node holds the callable itself: submit(F&&) on the concrete pool is one
+    // allocation and one virtual call to run, where a std::function in a node
+    // was two allocations for a capture past its small buffer and an indirect
+    // call inside an indirect call. submit(task) through the interface stores
+    // the std::function in a node the same way.
     class work_stealing_task_pool final : public task_pool {
 
-        using node = task;                          // heap-allocated std::function
+        struct node {
+            virtual void run() = 0;
+            virtual ~node() = default;
+        };
+        template <typename F>
+        struct typed_node final : node {
+            F f;
+            template <typename G>
+            explicit typed_node(G&& g) : f(std::forward<G>(g)) {}
+            void run() override { f(); }
+        };
 
         struct core {
             detail::completion comp;
@@ -5395,7 +5576,7 @@ namespace snicholls
                 // Blocking here would deadlock a fork-join: every worker could
                 // be stuck submitting while none is free to drain. Run it inline
                 // instead - deadlock-free backpressure (the "caller runs" policy).
-                (*p)();
+                p->run();
                 delete p;
                 comp.done();
             }
@@ -5429,7 +5610,7 @@ namespace snicholls
                 std::uint64_t rng = self * 0x9E3779B97F4A7C15ull + 1;
                 for (;;) {
                     if (node* p = find_work(self, rng)) {
-                        (*p)();
+                        p->run();
                         delete p;
                         comp.done();
                         continue;
@@ -5457,7 +5638,14 @@ namespace snicholls
 
         void submit(task t) override {
             c_->comp.add();
-            c_->enqueue(new node(std::move(t)));
+            c_->enqueue(new typed_node<task>(std::move(t)));
+        }
+
+        // The static path: the callable goes into the node as it is
+        TS_MOVEABLES_POOL_TASK_TEMPLATE(F)
+        void submit(F&& f) {
+            c_->comp.add();
+            c_->enqueue(new typed_node<std::decay_t<F>>(std::forward<F>(f)));
         }
         void wait_idle() override { c_->comp.wait(); }
         std::size_t worker_count() const noexcept override { return c_->n; }
@@ -5501,6 +5689,10 @@ namespace snicholls
             if (t)
                 t();
         }
+
+        // The static path: called as it is, with no std::function around it
+        TS_MOVEABLES_POOL_TASK_TEMPLATE(F)
+        void submit(F&& f) { f(); }
 
         // Nothing is ever outstanding: it all ran before submit() returned.
         void wait_idle() override {}
@@ -5811,9 +6003,12 @@ namespace snicholls
 //  question actually asked most of the time: "run this loop across the cores I
 //  have, and come back when it is done." It is a thin layer and deliberately
 //  so - it adds no threads, owns no scheduler, and holds no global state. It
-//  binds to the `task_pool` INTERFACE, so the same call runs on the shared-queue
-//  pool, the sharded one, the MPMC one or the work-stealing one, and a
-//  benchmark can swap between them without touching the loop.
+//  takes any pool with the `task_pool` members (the `task_pool_like` concept,
+//  concepts/task_pool.hpp), so the same call runs on the shared-queue pool, the
+//  sharded one, the MPMC one or the work-stealing one, and a benchmark can swap
+//  between them without touching the loop. Hand it the concrete pool and its
+//  calls are direct; hand it a `task_pool&` and they go through the vtable,
+//  for code that holds a pool chosen at run time.
 //
 //      snicholls::work_stealing_task_pool pool;
 //      snicholls::parallel_for(pool, 0, n, [&](int i) { out[i] = f(in[i]); });
@@ -6153,7 +6348,7 @@ namespace snicholls
 #endif /* snicholls_core_constexpr_for_hpp */
 // end snicholls-core snicholls/core/constexpr_for.hpp
 
-// (inlined) #include "../interfaces/task_pool.hpp"
+// (inlined) #include "../concepts/task_pool.hpp"   // task_pool_like, TS_MOVEABLES_TASK_POOL
 // (inlined) #include "task_group.hpp"          // completion_gate, error_slot
 
 #include <algorithm>
@@ -6245,9 +6440,10 @@ namespace snicholls
         // exhausted and touch nothing but the gate, but it must find the gate
         // alive to do so. That is also why fn may safely capture the caller's
         // frame by reference - a late task never calls it.
-        template <typename Fn>
-        void run_chunks(task_pool& pool, std::size_t count, std::size_t grain, Fn fn)
+        template <TS_MOVEABLES_TASK_POOL Pool, typename Fn>
+        void run_chunks(Pool& pool, std::size_t count, std::size_t grain, Fn fn)
         {
+            static_assert(is_task_pool_like_v<Pool>, "snicholls: the pool must have task_pool's members (task_pool_like)");
             const std::size_t chunks = (count + grain - 1) / grain;
             auto st = std::make_shared<chunk_run<Fn>>(grain, count, chunks, std::move(fn));
             st->gate.add(chunks);
@@ -6289,8 +6485,8 @@ namespace snicholls
     // parallel_for<8>(pool, 0, n, body) emits the body eight times per inner
     // iteration; see snicholls-core's constexpr_for.hpp for why that is usually not the
     // win it sounds like, and `make bench-parallel` for the measurement.
-    template <std::size_t Unroll = 1, typename Index, typename Body>
-    void parallel_for(task_pool& pool, Index first, Index last, Body body,
+    template <std::size_t Unroll = 1, TS_MOVEABLES_TASK_POOL Pool, typename Index, typename Body>
+    void parallel_for(Pool& pool, Index first, Index last, Body body,
                       std::size_t grain_size = 0)
     {
         static_assert(std::is_integral_v<Index>, "parallel_for needs an integral index");
@@ -6335,8 +6531,8 @@ namespace snicholls
     // more time seeking than working and would look like a performance bug in
     // the caller's code rather than in this decision. Copy into a vector first
     // and the cost is at least visible.
-    template <std::size_t Unroll = 1, typename Iter, typename Body>
-    void parallel_for_each(task_pool& pool, Iter first, Iter last, Body body,
+    template <std::size_t Unroll = 1, TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename Body>
+    void parallel_for_each(Pool& pool, Iter first, Iter last, Body body,
                            std::size_t grain_size = 0)
     {
         using category = typename std::iterator_traits<Iter>::iterator_category;
@@ -6380,9 +6576,9 @@ namespace snicholls
     // `identity` must be a real identity for `reduce`: every chunk seeds its
     // local accumulator with it, so a wrong seed is counted once per chunk
     // rather than once overall.
-    template <std::size_t Unroll = 1, typename Index, typename T,
+    template <std::size_t Unroll = 1, TS_MOVEABLES_TASK_POOL Pool, typename Index, typename T,
               typename Map, typename Reduce>
-    T parallel_reduce(task_pool& pool, Index first, Index last, T identity,
+    T parallel_reduce(Pool& pool, Index first, Index last, T identity,
                       Map map, Reduce reduce, std::size_t grain_size = 0)
     {
         static_assert(std::is_integral_v<Index>, "parallel_reduce needs an integral index");
@@ -6428,9 +6624,9 @@ namespace snicholls
     }
 
     // The iterator form: map sees the element, not the index.
-    template <std::size_t Unroll = 1, typename Iter, typename T,
+    template <std::size_t Unroll = 1, TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename T,
               typename Map, typename Reduce>
-    T parallel_reduce_each(task_pool& pool, Iter first, Iter last, T identity,
+    T parallel_reduce_each(Pool& pool, Iter first, Iter last, T identity,
                            Map map, Reduce reduce, std::size_t grain_size = 0)
     {
         using category = typename std::iterator_traits<Iter>::iterator_category;
@@ -6468,8 +6664,8 @@ namespace snicholls
     // be commutative.
     namespace detail
     {
-        template <bool Inclusive, typename Iter, typename OutIter, typename T, typename Combine>
-        T scan_impl(task_pool& pool, Iter first, Iter last, OutIter out,
+        template <bool Inclusive, TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename OutIter, typename T, typename Combine>
+        T scan_impl(Pool& pool, Iter first, Iter last, OutIter out,
                     T identity, Combine combine, std::size_t grain_size)
         {
             using category = typename std::iterator_traits<Iter>::iterator_category;
@@ -6535,15 +6731,15 @@ namespace snicholls
         }
     } // namespace detail
 
-    template <typename Iter, typename OutIter, typename T, typename Combine>
-    T parallel_inclusive_scan(task_pool& pool, Iter first, Iter last, OutIter out,
+    template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename OutIter, typename T, typename Combine>
+    T parallel_inclusive_scan(Pool& pool, Iter first, Iter last, OutIter out,
                               T identity, Combine combine, std::size_t grain_size = 0)
     {
         return detail::scan_impl<true>(pool, first, last, out, identity, combine, grain_size);
     }
 
-    template <typename Iter, typename OutIter, typename T, typename Combine>
-    T parallel_exclusive_scan(task_pool& pool, Iter first, Iter last, OutIter out,
+    template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename OutIter, typename T, typename Combine>
+    T parallel_exclusive_scan(Pool& pool, Iter first, Iter last, OutIter out,
                               T identity, Combine combine, std::size_t grain_size = 0)
     {
         return detail::scan_impl<false>(pool, first, last, out, identity, combine, grain_size);
@@ -6574,8 +6770,8 @@ namespace snicholls
         // Runs shorter than this are not worth a thread of their own.
         inline constexpr std::size_t parallel_sort_min_run = 1u << 12;
 
-        template <typename Iter, typename Compare, typename RunSort>
-        void sort_impl(task_pool& pool, Iter first, Iter last, Compare comp, RunSort run_sort)
+        template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename Compare, typename RunSort>
+        void sort_impl(Pool& pool, Iter first, Iter last, Compare comp, RunSort run_sort)
         {
             using category = typename std::iterator_traits<Iter>::iterator_category;
             static_assert(std::is_base_of_v<std::random_access_iterator_tag, category>,
@@ -6622,15 +6818,15 @@ namespace snicholls
         }
     } // namespace detail
 
-    template <typename Iter, typename Compare = std::less<>>
-    void parallel_sort(task_pool& pool, Iter first, Iter last, Compare comp = Compare{})
+    template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename Compare = std::less<>>
+    void parallel_sort(Pool& pool, Iter first, Iter last, Compare comp = Compare{})
     {
         detail::sort_impl(pool, first, last, comp,
                           [](auto b, auto e, auto c) { std::sort(b, e, c); });
     }
 
-    template <typename Iter, typename Compare = std::less<>>
-    void parallel_stable_sort(task_pool& pool, Iter first, Iter last, Compare comp = Compare{})
+    template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename Compare = std::less<>>
+    void parallel_stable_sort(Pool& pool, Iter first, Iter last, Compare comp = Compare{})
     {
         detail::sort_impl(pool, first, last, comp,
                           [](auto b, auto e, auto c) { std::stable_sort(b, e, c); });
@@ -7498,8 +7694,10 @@ namespace snicholls
     //     std::logic_error instead of racing. post() is the one door in from
     //     other threads; timer::cancel() is safe from any thread; destroying
     //     an fd_watch on a foreign thread marshals itself through post().
-    //   - lost wakeups: post() enqueues to a bounded mpmc_queue and writes a
-    //     self-pipe byte; the pipe is non-blocking and fully drained.
+    //   - lost wakeups: post() enqueues to a bounded mpmc_queue and, unless a
+    //     wake is already pending, writes a self-pipe byte; the pipe is
+    //     non-blocking and fully drained before the pending flag is cleared
+    //     (see enqueue_task for why that order is the whole argument).
     //   - reentrancy corruption: per-event state lookup is fresh, emission is
     //     snapshot-based - handlers may create and destroy watches freely.
     //   - timer drift and post-stall bursts: periodic timers reschedule
@@ -7558,6 +7756,9 @@ namespace snicholls
             mpmc_queue<std::function<void()>> posted;
             std::atomic<bool> running{false};
             std::atomic<bool> stop_flag{false};
+            // True from the post that wrote a wake byte until the loop has
+            // drained the pipe: posts in between skip the write() syscall.
+            std::atomic<bool> wake_pending{false};
             std::atomic<std::thread::id> loop_thread{};
             moveable_signal<const dispatch_info&> tap;
             std::vector<detail::el_event> results;
@@ -7604,10 +7805,28 @@ namespace snicholls
                 [[maybe_unused]] ssize_t r = ::write(wake_write, &b, 1);   // EAGAIN: already signalled
             }
 
+            // A post writes the wake byte only on the edge from "no wake
+            // pending" to "wake pending", so a burst of N posts costs one
+            // write() instead of N. Why no post can be lost:
+            //
+            //   post:  push the task, then wake_pending.exchange(true)
+            //   loop:  drain the pipe, then wake_pending.exchange(false), then
+            //          (next iteration) pop the queue before polling again
+            //
+            // Both are read-modify-writes on one atomic, so they are ordered.
+            // If the post's exchange comes after the loop's, it reads false and
+            // writes a fresh byte: the loop wakes. If it comes before, it reads
+            // true and skips the write, and the loop's exchange reads the true
+            // it wrote - acq_rel on both, so the push happens-before the loop's
+            // next look at the queue, which then finds the task. The loop must
+            // drain BEFORE clearing: cleared first, a post could see false,
+            // write, and have its byte swallowed by the drain, leaving the flag
+            // set, the pipe empty and the loop asleep with work queued.
             void enqueue_task(std::function<void()> t) {
                 while (!posted.push(std::move(t)))          // bounded: backpressure when full
                     std::this_thread::yield();
-                wake();
+                if (!wake_pending.exchange(true, std::memory_order_acq_rel))
+                    wake();
             }
 
             void remove_watch_if(int fd, const std::shared_ptr<fd_state>& st) noexcept {
@@ -7687,6 +7906,8 @@ namespace snicholls
                         char buf[256];
                         while (::read(wake_read, buf, sizeof buf) > 0) {
                         }
+                        // After the drain, never before: see enqueue_task
+                        wake_pending.exchange(false, std::memory_order_acq_rel);
                         continue;
                     }
                     auto it = fds.find(ev.fd);              // fresh lookup: a handler may have removed it

@@ -85,7 +85,8 @@ double ms_since(clk::time_point t0)
 // ------------------------------------------------------------- suffix array
 //
 // Prefix doubling. `s` already carries its sentinel.
-std::vector<std::int32_t> suffix_array(task_pool& pool, const std::string& s)
+template <TS_MOVEABLES_TASK_POOL Pool>
+std::vector<std::int32_t> suffix_array(Pool& pool, const std::string& s)
 {
     const std::size_t n = s.size();
     std::vector<std::int32_t> sa(n), rank(n), tmp(n);
@@ -132,7 +133,8 @@ std::vector<std::int32_t> suffix_array(task_pool& pool, const std::string& s)
     return sa;
 }
 
-std::string bwt_forward(task_pool& pool, const std::string& with_sentinel)
+template <TS_MOVEABLES_TASK_POOL Pool>
+std::string bwt_forward(Pool& pool, const std::string& with_sentinel)
 {
     const std::size_t n = with_sentinel.size();
     const std::vector<std::int32_t> sa = suffix_array(pool, with_sentinel);
@@ -238,12 +240,15 @@ int main(int argc, char** argv)
 {
     bool quick = false, markdown = false;
     std::size_t bases = 0;                  // 0 = use the built-in size
+    bool dispatch = false;                  // also time the concrete pool against task_pool&
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--quick")
             quick = true;
         else if (a == "--markdown")         // CI: fence the output, and keep it short
             markdown = quick = true;
+        else if (a == "--dispatch")
+            dispatch = true;
         else if (a == "--bases" && i + 1 < argc)
             bases = static_cast<std::size_t>(std::stoull(argv[++i]));
     }
@@ -318,6 +323,28 @@ int main(int argc, char** argv)
         std::printf("    log2(n) rounds, each one a parallel_sort plus a scan and a\n");
         std::printf("    synchronisation - so this tracks parallel_sort's ceiling rather\n");
         std::printf("    than parallel_reduce's, and that is the honest expectation.\n\n");
+    }
+
+    // ------------------------------------------------ concrete pool vs task_pool&
+    // --dispatch: the same forward transform with the concrete pool (direct
+    // calls) and with it as a task_pool& the compiler cannot see through
+    // (virtual calls), interleaved rep by rep so neither always runs second.
+    if (dispatch) {
+        const std::size_t n = bases ? bases : 400000;
+        const std::string dna = make_dna(n, 11u) + sentinel;
+        static task_pool& (*volatile erase)(task_pool&) = [](task_pool& q) -> task_pool& { return q; };
+        task_pool& dyn = erase(pool);
+        double concrete = 1e300, dynamic = 1e300;
+        std::string a, b;
+        for (int r = 0; r < 10; ++r) {
+            const auto t_concrete = [&] { const auto t0 = clk::now(); a = bwt_forward(pool, dna); concrete = std::min(concrete, ms_since(t0)); };
+            const auto t_dynamic = [&] { const auto t0 = clk::now(); b = bwt_forward(dyn, dna); dynamic = std::min(dynamic, ms_since(t0)); };
+            if (r % 2 != 0) { t_dynamic(); t_concrete(); } else { t_concrete(); t_dynamic(); }
+        }
+        check(a == b, "concrete and task_pool& agree");
+        std::printf("  concrete pool vs task_pool& (%zu bases, best of 10 each, interleaved)\n", n);
+        std::printf("    concrete                 %8.1f ms\n", concrete);
+        std::printf("    task_pool&               %8.1f ms   %+.1f%%\n\n", dynamic, 100 * (dynamic - concrete) / concrete);
     }
 
     std::printf("all BWT/DNA demo checks passed\n");

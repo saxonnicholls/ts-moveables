@@ -40,6 +40,11 @@
 #include <cstdint>
 #include <string_view>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+
 namespace snicholls::tokenizer
 {
 
@@ -110,11 +115,14 @@ inline constexpr bool is_ascii_letter(unsigned c) noexcept { return ((c | 0x20u)
 
 } // namespace detail
 
-/// \brief The end of the piece that starts at `i` (< text.size()): the next match of the split pattern.
-/// Lookahead may read past `i` to the end of `text`, never before `i`.
-inline std::size_t next_piece(std::string_view text, std::size_t i, split_pattern pattern) noexcept
+namespace detail
 {
-    using namespace detail;
+
+/// \brief The end of the piece that starts at `i`, character by character through the Unicode classes: the
+/// pattern's alternatives written out in order. It is the reference the fast path below is tested against,
+/// and where the fast path hands over whenever a decision depends on a non-ASCII character.
+inline std::size_t next_piece_general(std::string_view text, std::size_t i, split_pattern pattern) noexcept
+{
     const auto* s = reinterpret_cast<const unsigned char*>(text.data());
     const std::size_t n = text.size();
     const unsigned c = s[i];
@@ -213,6 +221,238 @@ inline std::size_t next_piece(std::string_view text, std::size_t i, split_patter
     if (last > i)   // \s+(?!\S): all but the last
         return last;
     return i + len0;   // \s (or \s+): the one character
+}
+
+// ------------------------------------------------------------------------------------ the ASCII fast path
+//
+// Most text is ASCII, and on ASCII every decision the pattern makes is a function of one byte's kind. So the
+// first byte is classified once, through a 256-entry table, and runs are measured 16 bytes at a time: a
+// letter run, a whitespace run (with its last newline), a punctuation run. The moment a decision depends on
+// a byte of 0x80 or above - a run that stops at one, a prefix whose next character is one - the piece is
+// finished by next_piece_general from its start, which handles every character the same way it always has.
+// The fast path never decides anything on a non-ASCII byte, so it cannot disagree with the reference.
+
+enum kind : std::uint8_t
+{
+    k_letter,     // A-Z a-z
+    k_digit,      // 0-9
+    k_sp,         // ' '
+    k_nl,         // \r \n
+    k_ws,         // the other ASCII White_Space: \t \v \f
+    k_quote,      // '
+    k_punct,      // any other ASCII byte: [^\s\p{L}\p{N}]
+    k_high,       // 0x80 and above: not decided here
+};
+
+inline constexpr auto byte_kinds = [] {
+    struct table {
+        std::uint8_t v[256];
+    } t{};
+    for (unsigned c = 0; c < 256; ++c) {
+        std::uint8_t k = k_high;
+        if (c < 0x80) {
+            switch (unicode_class(c)) {
+            case letter: k = k_letter; break;
+            case number: k = k_digit; break;
+            case space: k = c == ' ' ? k_sp : (c == '\r' || c == '\n') ? k_nl : k_ws; break;
+            default: k = c == '\'' ? k_quote : k_punct; break;
+            }
+        }
+        t.v[c] = k;
+    }
+    return t;
+}();
+
+inline constexpr bool is_ascii_space(unsigned c) noexcept { return c < 0x80 && ascii_classes.v[c] == space; }
+inline constexpr bool is_ascii_punct(unsigned c) noexcept { return c < 0x80 && ascii_classes.v[c] == other; }
+
+// The first position at or after j that is not an ASCII letter
+inline std::size_t ascii_letters_end(const unsigned char* s, std::size_t n, std::size_t j) noexcept
+{
+#if defined(__SSE2__)
+    const __m128i fold = _mm_set1_epi8(0x20), a = _mm_set1_epi8('a'), bias = _mm_set1_epi8(static_cast<char>(0x80)),
+                  limit = _mm_set1_epi8(static_cast<char>(26 ^ 0x80));
+    while (j + 16 <= n) {
+        // (b | 0x20) - 'a' < 26, unsigned, as a signed compare after flipping the top bit; a byte of 0x80 or
+        // more lands at 0x3f or above and is never a letter
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + j));
+        const __m128i off = _mm_xor_si128(_mm_sub_epi8(_mm_or_si128(v, fold), a), bias);
+        const unsigned m = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmplt_epi8(off, limit)));
+        if (m != 0xFFFF)
+            return j + static_cast<std::size_t>(__builtin_ctz(~m));
+        j += 16;
+    }
+#endif
+    while (j < n && is_ascii_letter(s[j]))
+        ++j;
+    return j;
+}
+
+// The first position at or after j that is not ASCII whitespace, and just past the last \r or \n before it
+// (0 if none)
+inline std::size_t ascii_spaces_end(const unsigned char* s, std::size_t n, std::size_t j, std::size_t& nl) noexcept
+{
+#if defined(__SSE2__)
+    const __m128i sp = _mm_set1_epi8(' '), cr = _mm_set1_epi8('\r'), lf = _mm_set1_epi8('\n'),
+                  nine = _mm_set1_epi8(9), bias = _mm_set1_epi8(static_cast<char>(0x80)),
+                  five = _mm_set1_epi8(static_cast<char>(5 ^ 0x80));
+    while (j + 16 <= n) {
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s + j));
+        // ' ', or 9..13 (\t \n \v \f \r): b - 9 < 5 unsigned
+        const __m128i ws = _mm_or_si128(_mm_cmpeq_epi8(v, sp),
+                                        _mm_cmplt_epi8(_mm_xor_si128(_mm_sub_epi8(v, nine), bias), five));
+        const unsigned m = static_cast<unsigned>(_mm_movemask_epi8(ws));
+        const unsigned lines = static_cast<unsigned>(_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(v, cr), _mm_cmpeq_epi8(v, lf))));
+        const unsigned run = m == 0xFFFF ? 0xFFFFu : ((1u << __builtin_ctz(~m)) - 1);   // the bytes still in the run
+        if (const unsigned in = lines & run)
+            nl = j + 32 - static_cast<std::size_t>(__builtin_clz(in));   // just past the highest
+        if (m != 0xFFFF)
+            return j + static_cast<std::size_t>(__builtin_ctz(~m));
+        j += 16;
+    }
+#endif
+    while (j < n && is_ascii_space(s[j])) {
+        if (s[j] == '\r' || s[j] == '\n')
+            nl = j + 1;
+        ++j;
+    }
+    return j;
+}
+
+// The first position at or after j that is not ASCII punctuation
+inline std::size_t ascii_punct_end(const unsigned char* s, std::size_t n, std::size_t j) noexcept
+{
+    while (j < n && is_ascii_punct(s[j]))
+        ++j;
+    return j;
+}
+
+} // namespace detail
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TOK_INLINE inline __attribute__((always_inline))
+#else
+#define TOK_INLINE inline
+#endif
+#ifndef TOK_SPLIT_INLINE
+#define TOK_SPLIT_INLINE 1
+#endif
+
+/// \brief The end of the piece that starts at `i` (< text.size()): the next match of the split pattern.
+/// Lookahead may read past `i` to the end of `text`, never before `i`. Forced inline: it is the body of every
+/// encode loop, and as an out-of-line call its locals and the caller's live values go through memory.
+#if TOK_SPLIT_INLINE
+TOK_INLINE
+#else
+inline
+#endif
+std::size_t next_piece(std::string_view text, std::size_t i, split_pattern pattern) noexcept
+{
+    using namespace detail;
+    const auto* s = reinterpret_cast<const unsigned char*>(text.data());
+    const std::size_t n = text.size();
+    const unsigned c = s[i];
+    const unsigned k = byte_kinds.v[c];
+    // The next byte's kind. Past the end it reads as punctuation, and every branch below then ends the piece at
+    // n, as the reference does for a last character
+    const unsigned next = i + 1 < n ? byte_kinds.v[s[i + 1]] : k_punct;
+
+    // \p{L}+ from j, j already a letter: ASCII 16 at a time, then on through any non-ASCII letters
+    const auto letters = [&](std::size_t j) {
+        j = ascii_letters_end(s, n, j);
+        if (j < n && s[j] >= 0x80) {
+            std::size_t len;
+            while (j < n && class_at(s, n, j, len) == letter)
+                j += len;
+        }
+        return j;
+    };
+    // [^\s\p{L}\p{N}]++[\r\n]* from j, j already punctuation
+    const auto punct = [&](std::size_t j) {
+        j = ascii_punct_end(s, n, j);
+        if (j < n && s[j] >= 0x80) {
+            std::size_t len;
+            while (j < n && class_at(s, n, j, len) == other)
+                j += len;
+        }
+        while (j < n && (s[j] == '\r' || s[j] == '\n'))
+            ++j;
+        return j;
+    };
+
+    switch (k) {
+    case k_letter:
+        return letters(i + 1);
+
+    case k_digit: {   // \p{N}{1,3}: a non-ASCII byte inside the three may be a number, so the reference decides
+        std::size_t j = i + 1;
+        while (j < n && j < i + 3 && byte_kinds.v[s[j]] == k_digit)
+            ++j;
+        if (j < n && j < i + 3 && s[j] >= 0x80)
+            return next_piece_general(text, i, pattern);
+        return j;
+    }
+
+    case k_quote:
+        if (next == k_letter) {   // '(?i:[sdmt]|ll|ve|re), else the letter alternative with ' as its prefix
+            const unsigned a = s[i + 1] | 0x20u;
+            if (a == 's' || a == 'd' || a == 'm' || a == 't')
+                return i + 2;
+            if (i + 2 < n && is_ascii_letter(s[i + 2])) {
+                const unsigned b = s[i + 2] | 0x20u;
+                if ((a == 'l' && b == 'l') || (a == 'v' && b == 'e') || (a == 'r' && b == 'e'))
+                    return i + 3;
+            }
+            return letters(i + 2);
+        }
+        if (next == k_high)   // U+017F folds to s, and a non-ASCII letter may follow: the reference's
+            return next_piece_general(text, i, pattern);
+        [[fallthrough]];
+    case k_punct:
+        if (next == k_letter)   // [^\r\n\p{L}\p{N}]?+\p{L}+
+            return letters(i + 2);
+        if (next == k_high)
+            return next_piece_general(text, i, pattern);
+        return punct(i + 1);
+
+    case k_sp:
+        if (next == k_letter)
+            return letters(i + 2);
+        if (next == k_high)
+            return next_piece_general(text, i, pattern);
+        if (next == k_punct || next == k_quote)   // ' ?[^\s\p{L}\p{N}]++
+            return punct(i + 1);
+        break;
+
+    case k_ws:
+        if (next == k_letter)
+            return letters(i + 2);
+        if (next == k_high)
+            return next_piece_general(text, i, pattern);
+        break;
+
+    case k_nl:
+        break;
+
+    default:   // k_high
+        return next_piece_general(text, i, pattern);
+    }
+
+    // A whitespace run: as the reference's tail, on a run that is all ASCII. A run that stops at a byte of 0x80
+    // or above might go on (U+00A0 and friends are \s), so the reference takes it.
+    std::size_t nl = 0;
+    const std::size_t j = ascii_spaces_end(s, n, i, nl);
+    if (j < n && s[j] >= 0x80)
+        return next_piece_general(text, i, pattern);
+    if (pattern == split_pattern::cl100k && j == n)   // \s++$
+        return n;
+    if (nl != 0)   // \s*[\r\n]
+        return nl;
+    if (j == n)   // \s+(?!\S) at the end
+        return n;
+    if (j - 1 > i)   // \s+(?!\S): all but the last
+        return j - 1;
+    return i + 1;   // \s: the one character
 }
 
 /// \brief Calls `each(piece)` for every piece of `text` that starts in [begin, end), in order. `begin` must be

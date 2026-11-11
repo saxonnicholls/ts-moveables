@@ -7,6 +7,53 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [1.6.0] — 2026-11-11
+
+### Added
+
+- **`task_pool_like`, the concept twin of the `task_pool` interface** (`concepts/task_pool.hpp`, a new
+  `concepts/` directory mirroring `interfaces/`). The interface stays, and stays the way to hold a pool chosen at
+  run time by pointer or reference; the concept sits beside it, with `task_pool_adapter<Impl>` (the interface
+  implemented by forwarding to any `task_pool_like` model, by value or as a view) and a `static_assert` that the
+  interface satisfies its own twin. Under C++17 the same constraint is the `is_task_pool_like_v` trait, through the
+  `TS_MOVEABLES_TASK_POOL` macro; `TS_MOVEABLES_HAS_CONCEPTS` says which.
+- **`submit(F&&)` on `work_stealing_task_pool` and `inline_task_pool`**, constrained by a second concept,
+  `pool_task`, beside their `submit(task)` override. Called on the concrete pool, the callable goes in as it is:
+  the work-stealing pool allocates one node holding it (it was a node holding a `std::function`, two allocations
+  once a capture outgrew the small buffer) and the inline pool just calls it. Move-only callables are accepted.
+  Calls through `task_pool&` are unchanged.
+- **`make bench-pool-dispatch`** (`benchmarks/pool_dispatch.cpp`): each pool called as itself and as `task_pool&`,
+  interleaved rep by rep. On an 8-core Intel iMac the virtual call is within a few percent everywhere; with a
+  48-byte capture the template path is 1.7x faster on the work-stealing pool and 8x on the inline pool.
+
+### Changed
+
+- **`parallel_for`, `parallel_for_each`, `parallel_reduce(_each)`, the scans, the sorts and `async` are templates
+  over any `task_pool_like` pool** instead of taking `task_pool&`. Every existing call compiles unchanged: passing
+  a `task_pool&` deduces the interface (virtual calls, as before), passing a concrete pool deduces it (direct
+  calls). Code that took the address of one of these functions, or named its template arguments past the leading
+  `Unroll`, needs updating.
+- **`event_loop::post` writes the wake byte only when no wake is already pending**, so a burst of N posts from
+  other threads costs one `write()` instead of N. The loop drains the pipe *before* clearing the flag, which is the
+  whole argument for why no post can be lost; it is written out beside `enqueue_task`, and a new test drives 20,000
+  ping-pong rounds (every post landing as the loop goes back to sleep) plus nested bursts.
+- **Emitting a `moveable_signal` with no slots connected returns at once**, with no lock and no `shared_ptr` copy:
+  an atomic slot count, written under the lock whenever the list is replaced, is checked first. The event loop
+  emits its dispatch tap on every task, timer and fd event, usually with nobody listening; `make bench-dispatch`
+  shows the loop's cost over raw kqueue falling from about 114 ns to about 88 ns per event.
+
+### Tokenizer demo (not library API)
+
+- **About 2x faster on one thread and on 8**, still token for token tiktoken's on every document of both
+  vocabularies. An ASCII fast path for the split, classifying each byte once and measuring runs 16 bytes at a time
+  with SSE2, handing anything non-ASCII to the original code, which stays as the reference
+  (`make bench-tokenizer` now runs `split_check` first: every position of the corpus and of 300,000 adversarial
+  texts must agree); a per-thread memo of pieces of up to 15 bytes; tables for one- and two-byte pieces built from
+  the vocabulary; a 32,768-entry two-way merge cache; the split and the memo path forced inline. The benchmark
+  reports a cold first pass beside the best-of-N, for us and for every library compared. The encoder is a template
+  over the pool, and `tokenizer_bench --dispatch` times it both ways. See the README's BPE tokenizer section for
+  the comparison with toktok, splintr, quicktok, HF tokenizers and the rest.
+
 ## [1.5.1] — 2026-11-11
 
 ### Fixed

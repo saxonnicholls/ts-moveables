@@ -30,6 +30,7 @@
 #include "circular_buffer.hpp"
 #include "mpmc_queue.hpp"
 #include "../interfaces/task_pool.hpp"
+#include "../concepts/task_pool.hpp"
 #include "work_stealing_deque.hpp"
 
 namespace snicholls
@@ -54,9 +55,10 @@ namespace snicholls
     // Result-returning submission over ANY implementation - non-virtual and
     // generic, like snicholls::call_once. Wraps a packaged_task, returns its
     // future; the shared_ptr keeps the task alive until the pool runs it.
-    template <typename F>
-    auto async(task_pool& pool, F&& f) -> std::future<std::invoke_result_t<std::decay_t<F>>>
+    template <TS_MOVEABLES_TASK_POOL Pool, typename F>
+    auto async(Pool& pool, F&& f) -> std::future<std::invoke_result_t<std::decay_t<F>>>
     {
+        static_assert(is_task_pool_like_v<Pool>, "snicholls::async: the pool must have task_pool's members (task_pool_like)");
         using result_type = std::invoke_result_t<std::decay_t<F>>;
         auto pt = std::make_shared<std::packaged_task<result_type()>>(std::forward<F>(f));
         std::future<result_type> fut = pt->get_future();
@@ -396,9 +398,25 @@ namespace snicholls
     // Tasks are heap-allocated nodes so the deque moves only pointers, keeping
     // the single-element steal race free of the pointee. Workers busy-poll (no
     // parking), same tradeoff as mpmc_task_pool.
+    //
+    // A node holds the callable itself: submit(F&&) on the concrete pool is one
+    // allocation and one virtual call to run, where a std::function in a node
+    // was two allocations for a capture past its small buffer and an indirect
+    // call inside an indirect call. submit(task) through the interface stores
+    // the std::function in a node the same way.
     class work_stealing_task_pool final : public task_pool {
 
-        using node = task;                          // heap-allocated std::function
+        struct node {
+            virtual void run() = 0;
+            virtual ~node() = default;
+        };
+        template <typename F>
+        struct typed_node final : node {
+            F f;
+            template <typename G>
+            explicit typed_node(G&& g) : f(std::forward<G>(g)) {}
+            void run() override { f(); }
+        };
 
         struct core {
             detail::completion comp;
@@ -434,7 +452,7 @@ namespace snicholls
                 // Blocking here would deadlock a fork-join: every worker could
                 // be stuck submitting while none is free to drain. Run it inline
                 // instead - deadlock-free backpressure (the "caller runs" policy).
-                (*p)();
+                p->run();
                 delete p;
                 comp.done();
             }
@@ -468,7 +486,7 @@ namespace snicholls
                 std::uint64_t rng = self * 0x9E3779B97F4A7C15ull + 1;
                 for (;;) {
                     if (node* p = find_work(self, rng)) {
-                        (*p)();
+                        p->run();
                         delete p;
                         comp.done();
                         continue;
@@ -496,7 +514,14 @@ namespace snicholls
 
         void submit(task t) override {
             c_->comp.add();
-            c_->enqueue(new node(std::move(t)));
+            c_->enqueue(new typed_node<task>(std::move(t)));
+        }
+
+        // The static path: the callable goes into the node as it is
+        TS_MOVEABLES_POOL_TASK_TEMPLATE(F)
+        void submit(F&& f) {
+            c_->comp.add();
+            c_->enqueue(new typed_node<std::decay_t<F>>(std::forward<F>(f)));
         }
         void wait_idle() override { c_->comp.wait(); }
         std::size_t worker_count() const noexcept override { return c_->n; }
@@ -540,6 +565,10 @@ namespace snicholls
             if (t)
                 t();
         }
+
+        // The static path: called as it is, with no std::function around it
+        TS_MOVEABLES_POOL_TASK_TEMPLATE(F)
+        void submit(F&& f) { f(); }
 
         // Nothing is ever outstanding: it all ran before submit() returned.
         void wait_idle() override {}

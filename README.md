@@ -20,7 +20,7 @@ We often need to move, so called "immovable" objects in C++ such as atomics, mut
 - **[`ws_broadcast_hub`](#ws_broadcast_hub)** — webhook → WebSocket fan-out on the reactor: any number of POST endpoints in, a crowd of topic-subscribed browsers out, per-topic replay history. One immutable frame is shared across every subscriber, so publish cost is flat in payload size
 - **[How much traffic can it carry?](#how-much-traffic-can-it-carry)** — the relay measured against a model: **~100 k deliveries/s** or **~0.9 GB/s** on one thread, **~10 KB per subscriber**, cost linear in M and flat in N
 - **[`websocket_client`](#websocket_client)** — the outbound half: connect *out* to N upstream feeds and stay connected. Exponential backoff with full jitter, the accept key verified rather than assumed, and client frames masked as RFC 6455 requires
-- **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs, and **[one of the fastest BPE tokenizers there is](#bpe-tokenizer-demo)**: token for token tiktoken's, faster than tiktoken, tiktoken-rs, GitHub's bpe-openai and rustbpe on every measure we ran, and **1.3–1.6 GB/s** on 32 threads
+- **[working demos](#demos)** — event capture and bit-exact replay over multi-hop topologies, real pcap decode and replay, Taskflow-style dependency graphs, and **[one of the fastest BPE tokenizers there is](#bpe-tokenizer-demo)**: token for token tiktoken's, level with the fastest of eleven open-source encoders we raced it against at 32 threads and on new text, **1.9–2.2 GB/s** on 32 threads, and the only one that spreads a single text across every core
 
 One theme unifies all of it: **simplicity, one rule, nominal overhead**. The rule: every type keeps the **integrity of its state** across a move — a move happens on a quiescent object or fails loudly — which hands classes composed from these types the [rule of zero](https://en.cppreference.com/cpp/language/rule_of_three) back: write no special member functions, and the compiler generates correct moves. The overhead: composition wrappers are the same size as what they wrap (the tests `static_assert` it), the safety checks are a `try_lock` probe or a relaxed flag, and everything is header-only, C++17 and later, dependency-free, `cassert`-tested, and ThreadSanitizer-verified across the CI matrix.
 
@@ -148,7 +148,7 @@ Moved-from objects are always left valid and usable.
 | `concurrent/work_stealing_deque.hpp` | `work_stealing_deque<T>` (bounded Chase-Lev) | Chase-Lev / Taskflow internals | — | — (internal, stable) |
 | `concurrent/disruptor.hpp` | `disruptor<T, WaitStrategy>` + `multi_producer_disruptor<T>` | the LMAX Disruptor pattern | — | handle transfer, always safe |
 | `concurrent/thread_pool.hpp` | `task_pool` interface + `mutex_` / `sharded_` / `dispatch_` / `mpmc_` / `work_stealing_task_pool` | Taskflow / TBB / `std::async` | — | moveable handle (heap core) |
-| `concurrent/parallel_for.hpp` | `parallel_for` / `parallel_for_each` over any `task_pool` | `tbb::parallel_for` / `std::for_each(par)` | — | free functions (stateless) |
+| `concurrent/parallel_for.hpp` | `parallel_for` / `parallel_for_each` over any `task_pool_like` pool | `tbb::parallel_for` / `std::for_each(par)` | — | free functions (stateless) |
 | `net/tcp.hpp` | `tcp_stream` / `tcp_listener` — blocking byte stream with deadlines (POSIX) | Asio's blocking sockets / hand-rolled POSIX | — | moveable, owns one fd |
 | `event/loop.hpp` | `event_loop` + `fd_watch` / `timer` (POSIX; self-disables on Windows) | Asio / libuv / libevent | — | moveable handles, loop handle moves mid-run |
 | `event/time_master.hpp` | `time_master` — named, cancellable, repeating timers on the loop | Boost.Asio timer wrappers | — | moveable handle (heap core) |
@@ -160,6 +160,7 @@ Moved-from objects are always left valid and usable.
 | `tls/openssl.hpp`, `tls/mbedtls.hpp` | memory-BIO transport delegates (**opt-in** — these link a library) | Asio SSL streams | — | owned by the connection |
 | `logging/logger.hpp` | `logger` + `lane`, `record`, console / JSON / file sinks, `journal` / `replayer` | spdlog | — | moveable handle (heap core) |
 | `interfaces/*.hpp` | `transport_delegate`, `protocol_delegate`, `task_pool`, `ws_extension` — the extension points | — | — | — (pure interfaces) |
+| `concepts/task_pool.hpp` | `task_pool_like` and `pool_task` — the [concept twin](#concrete-pool-or-task_pool-the-concept-and-the-interface) of `task_pool`, with `task_pool_adapter` | — | — | — (compile-time only) |
 | `ts_moveables.hpp` | umbrella header — includes everything | | | |
 
 Two implementation strategies are used:
@@ -425,7 +426,7 @@ The library exports the interface target `snicholls::ts_moveables`, which carrie
 include(FetchContent)
 FetchContent_Declare(ts_moveables
     GIT_REPOSITORY https://github.com/saxonnicholls/ts-moveables.git
-    GIT_TAG v1.5.1)
+    GIT_TAG v1.6.0)
 FetchContent_MakeAvailable(ts_moveables)
 
 target_link_libraries(my_app PRIVATE snicholls::ts_moveables)
@@ -597,7 +598,7 @@ Working programs, not snippets. Each builds and runs with one make target, and m
 | [replay_loop_demo](demos/replay_loop_demo.cpp) | `make demo-replay` | determinism: a scripted session over sockets, timers and cross-thread posts is journalled through the loop's dispatch tap, replayed into a *fresh* handler graph with no sockets, timers, threads or clock, and the digests match bit for bit — with a negative control that drops one event and asserts they then diverge |
 | [bwt_dna_demo](demos/bwt_dna_demo.cpp) | `make demo-bwt` | the [parallel algorithms](#parallel-algorithms) composing into a real one: a Burrows-Wheeler transform over DNA, whose suffix array is prefix doubling — and each round is literally a `parallel_sort` followed by a prefix scan, where **the inclusive scan of the "these differ" flags *is* the new rank**. Round-trip verified exactly; the clustering BWT exists to create shows up as longest-run 8 → 9,790. Dependency-free, including of [base-encode-decode](https://github.com/saxonnicholls/base-encode-decode), whose 2-bit ACGT packing suggested the alphabet but is not linked |
 | [remote_compute_demo](demos/remote_compute/remote_compute_demo.cpp) | `make demo-remote` | remote `std::async` / `std::invoke` on named machines, over this library's TCP and thread pools: kernels dispatched by a compile-time perfect hash, a field-wise binary wire format refused on a signature mismatch, mutual HMAC-SHA256 authentication, long jobs with progress and cancel, health pings, sessions that survive a reconnect, and UDP discovery. The self-test puts the client and every worker in one process on 127.0.0.1, so CI runs the whole protocol on one runner. C++20 and POSIX (the library stays C++17); [details below](#remote-execution-demo) |
-| [tokenizer_bench](demos/tokenizer/tokenizer_bench.cpp) | `make bench-tokenizer` | byte-level BPE, the tokenizer of GPT-4 and its relatives, **token for token tiktoken's**, and on GPT-4's vocabulary **4.7× (one thread) to 6.8× (32 threads) faster than GitHub's bpe-openai**, the fastest of the encoders we compared it with: the split pattern written as code, vocabulary lookups batched with prefetch, a per-thread cache of merged pieces, and one long text cut at proved piece boundaries across [`parallel_for`](#parallel_for), on snicholls-core's merge. Checks every document against tiktoken before timing anything. C++20 (the library stays C++17); [details below](#bpe-tokenizer-demo) |
+| [tokenizer_bench](demos/tokenizer/tokenizer_bench.cpp) | `make bench-tokenizer` | byte-level BPE, the tokenizer of GPT-4 and its relatives, **token for token tiktoken's**: on GPT-4's vocabulary level with toktok, the fastest of the eleven encoders we raced, at 32 threads (1,922 MB/s) and on new text, second to it from 2 to 16 threads, and first on every measure with a vocabulary of your own. The split pattern written as code with an SSE2 fast path, a per-thread memo of short pieces, one long text cut at proved piece boundaries across [`parallel_for`](#parallel_for), on snicholls-core's merge. Checks every document against tiktoken before timing anything. C++20 (the library stays C++17); [details below](#bpe-tokenizer-demo) |
 | [time_master_demo](demos/time_master_demo.cpp) | `make demo-timemaster` | a production periodic-event scheduler (TimeMaster) rebuilt on [`event_loop`](#event_loop) in ~60 lines: closures at intervals, add-while-running from any thread, cancel by id, drift-free *and* burst-free cadence asserted, teardown measured in microseconds — and the whole scheduler is a moveable value, which its Boost.Asio ancestor never was |
 
 ### Remote execution demo
@@ -615,28 +616,41 @@ Only functions registered in a compile-time `kernel_set` can be called - never a
 
 ### BPE tokenizer demo
 
-A byte-level BPE encoder, the kind GPT-4, LLaMA 3 and nanochat tokenize with, that gives **exactly tiktoken's tokens** and is, in every measurement we have made, faster than every widely used implementation we compared it with. MB/s on 12.3 MB of Python source (778 files), Xeon W-3245 (16 cores, 32 threads), each encoder checked against tiktoken on every document:
+A byte-level BPE encoder, the kind GPT-4, LLaMA 3 and nanochat tokenize with, that gives **exactly tiktoken's tokens**. We raced it against eleven other open-source encoders on 12.3 MB of Python source (778 files), on a Xeon W-3245 (16 cores, 32 threads), 2026-11-11: every encoder's tokens checked against tiktoken's on every document, five full passes, each cell the best of the five (the machine was shared, and the slow passes are the ones something else interfered with), every timing itself the best of five repetitions. MB/s on GPT-4's vocabulary, cl100k_base:
 
-| cl100k_base (GPT-4) | 1 thread | 32 threads, 778 documents | one 12 MB text |
-|---|---:|---:|---:|
-| **this demo** | **73** | **1,287** | **1,164** |
-| [bpe-openai](https://github.com/github/rust-gems) 0.3.2 (Rust) | 15.5 | 188 | 15.8 |
-| [tiktoken-rs](https://github.com/zurawiki/tiktoken-rs) 0.12.1 (Rust) | 9.8 | 47 | 10.6 |
-| [tiktoken](https://github.com/openai/tiktoken) 0.14.0 (from Python) | 9.4 | 38 | 9.5 |
+| cl100k_base | 1 thread | 1 thread, cold | 2 threads | 8 | 16 | **32** |
+|---|---:|---:|---:|---:|---:|---:|
+| **this demo** | 181 | **116** | 169 | 891 | 1,281 | **1,922** |
+| [toktok-rs](https://docs.rs/toktok-rs) 0.3.0 (Rust) | **220** | **120** | **432** | **1,269** | **1,739** | **1,887** |
+| [splintr](https://crates.io/crates/splintr) 0.22.2 (Rust) | 112 | 71 | 215 | 809 | 1,432 | 1,315 |
+| [quicktok](https://github.com/dmatth1/quicktok) 0.4.0 (C++) | 90 | — | 182 | 704 | 1,037 | 1,151 |
+| [tiktoken](https://crates.io/crates/tiktoken) 4.1.2 (goliajp, Rust) | 76 | 72 | 134 | 419 | 669 | 734 |
+| [TokenDagger](https://github.com/M4THYOU/TokenDagger) 0.1.1 (C++) | 14.7 | — | 30 | 109 | 163 | 157 |
+| [bpe-openai](https://github.com/github/rust-gems) 0.3.2 (Rust) | 15.9 | 15.9 | 26 | 80 | 120 | 153 |
+| [tiktoken-rs](https://github.com/zurawiki/tiktoken-rs) 0.12.1 (Rust) | 11.1 | 11.1 | 12.6 | 36 | 44 | 51 |
+| [kitoken](https://github.com/Systemcluster/kitoken) 0.11.1 (Rust) | 5.2 | 5.1 | 8.1 | 26 | 41 | 46 |
+| [tiktoken](https://github.com/openai/tiktoken) 0.14.0 (from Python) | 9.4 | — | 11.5 | 35 | 38 | 41 |
+| [HF tokenizers](https://github.com/huggingface/tokenizers) 0.23.2 (Rust, `Xenova/gpt-4`) | 1.5 | 1.5 | 2.8 | 8.6 | 9.2 | 9.5 |
 
-On a 32,768-token vocabulary trained by [rustbpe](https://github.com/karpathy/rustbpe): 85 MB/s on one thread, **1,567 MB/s** on 32; tiktoken-rs 13.8 and 58, rustbpe's own `batch_encode` 17. The full table, method and limits are in [docs/bpe_throughput.html](docs/bpe_throughput.html).
+"1 thread" is each encoder's own single-text call over the documents, best of five; "cold" is the first of those five, before any cache an encoder keeps has seen the corpus, which is what one pass over new text costs. toktok keeps a large per-thread memo of pieces, and warm it is ahead on one thread; on new text the two are level. The thread columns are each encoder's own batch call (or rayon over documents for those without one). [tokie](https://crates.io/crates/tokie) 0.1.4 was also raced and is left out: its single-text call cuts any document of 64 KB or more across every core and gives wrong tokens on 38 of them.
+
+What this demo does that none of the others do is spread **one** text across every core: the 12.3 MB corpus as a single text runs at **1,697 MB/s** on 32 threads with exactly its serial tokens, where every other encoder here takes one text on one thread.
+
+With a vocabulary of your own - 32,768 tokens trained by [rustbpe](https://github.com/karpathy/rustbpe), loaded from its raw ranks with its own split pattern - it is first on every measure: 194 MB/s on one thread (128 cold) and **2,158 MB/s** on 32, against splintr's 39 and 487, TokenDagger's 21 and 221, and tiktoken-rs's 13.9 and 60. toktok, quicktok, bpe-openai and goliajp's tiktoken ship their vocabularies built in and cannot load one. The full tables are in [docs/bpe_throughput.html](docs/bpe_throughput.html).
 
 Where the speed comes from, in order of what it bought:
 
-- **The split pattern as code.** tiktoken spends most of its time in a regex engine. The cl100k and GPT-4 patterns are short and fixed, so [split.hpp](demos/tokenizer/tok/split.hpp) writes them out alternative by alternative, with an ASCII fast path: 182 MB/s on one thread.
-- **Lookups in flight together.** Pieces are split 32 at a time, and each is hashed and its vocabulary slot prefetched before any is looked up, so the cache misses on a 4 MB table overlap instead of queueing.
-- **A cache of merged pieces.** 93% of pieces are one token. The rest need a merge, and they recur (195K of them, 41K distinct), so each thread keeps a 256 KB direct-mapped cache of them.
-- **One text across every core.** A long text is cut where the whole-text split is *proved* to start a piece (an ASCII letter then an ASCII non-letter, or a newline then non-whitespace; the proof is beside `find_boundary`), and the chunks go to [`parallel_for`](#parallel_for) with a grain of one, claimed from a shared cursor. So one text uses every core and still gives its serial tokens exactly. tiktoken, bpe-openai and rustbpe parallelise only across documents.
-- **The merge** is snicholls-core's `bpe_encode_piece`, tiktoken's `byte_pair_merge` step for step, allocation-free and `constexpr`. Pieces of 1 KB or more take an O(n log n) heap merge with the same tokens instead, about 100× faster than the quadratic one on a 128 KB piece; it is proposed for core.
+- **The split pattern as code.** tiktoken spends most of its time in a regex engine. The cl100k and GPT-4 patterns are short and fixed, so [split.hpp](demos/tokenizer/tok/split.hpp) writes them out. On ASCII, every decision the pattern makes is a function of one byte's kind, so the first byte is classified once through a 256-entry table and runs of letters, spaces and punctuation are measured 16 bytes at a time with SSE2; the moment a decision would depend on a non-ASCII character, the piece is finished by the character-by-character code it replaced, which stays as the reference. `split_check` compares the two at every position of the corpus and of 300,000 adversarial texts; it runs first in `make bench-tokenizer`. The split runs at about 420 MB/s on one thread.
+- **A memo of short pieces.** 99% of pieces are 15 bytes or fewer, and this corpus has only 63,000 distinct ones. Each thread keeps a 4 MB table of them with their tokens - a key of two overlapping 8-byte words and the length, built without reading past the piece, so it is exact and clean under AddressSanitizer - and a piece seen before never touches the vocabulary. One- and two-byte pieces, a third of all, are answered from tables built from the vocabulary when the encoder is made. The idea is toktok's.
+- **Everything on the path inlined.** Forcing the splitter and the per-piece code inline into the encode loop bought more than any data structure: as calls, their live values went through memory.
+- **One text across every core.** A long text is cut where the whole-text split is *proved* to start a piece (an ASCII letter then an ASCII non-letter, or a newline then non-whitespace; the proof is beside `find_boundary`), and the chunks go to [`parallel_for`](#parallel_for) with a grain of one, claimed from a shared cursor on the work-stealing pool.
+- **The merge**, for the 7% of pieces that are not one token, is snicholls-core's `bpe_encode_piece`, tiktoken's `byte_pair_merge` step for step, allocation-free and `constexpr`, behind a 4 MB per-thread cache of merged pieces. Pieces of 1 KB or more take an O(n log n) heap merge with the same tokens (in core from 0.6.1), about 100× faster than the quadratic one at 128 KB.
 
-To reproduce: `python scripts/tokenizer/prepare.py build/tokdata` (needs `pip install tiktoken rustbpe`) writes the corpus, both vocabularies and tiktoken's tokens, then `make bench-tokenizer`. The comparison rows come from [scripts/tokenizer/compare_python.py](scripts/tokenizer/compare_python.py) and [scripts/tokenizer/rust_baselines](scripts/tokenizer/rust_baselines).
+Where it is still behind, and why: from 2 to 16 threads toktok is 1.4-2.6× faster. At 2 threads the gap is ours to close: "2 threads" is one worker plus the calling thread, and `parallel_for` treats a one-worker pool as serial (the rule that keeps `inline_task_pool` deterministic), so the worker sits idle. Warm on one thread toktok's memo, larger and keyed with a single masked load, is 1.2× ahead.
 
-What the numbers are not: one corpus, mostly code, on one machine, and the piece cache helps most where words repeat. Only the cl100k and GPT-4 split patterns are supported, not o200k's, and not special tokens. It is a demo, not library API.
+To reproduce: `python scripts/tokenizer/prepare.py build/tokdata` (needs `pip install tiktoken rustbpe`) writes the corpus, both vocabularies and tiktoken's tokens, then `make bench-tokenizer`. The comparison is [scripts/tokenizer/run_comparison.sh](scripts/tokenizer/run_comparison.sh), one pass over every encoder ([rust_baselines](scripts/tokenizer/rust_baselines), [cpp_baselines](scripts/tokenizer/cpp_baselines), [compare_python_libs.py](scripts/tokenizer/compare_python_libs.py)), and [best_of_passes.py](scripts/tokenizer/best_of_passes.py) for the table; this demo was built with `-march=native` like the Rust baselines (`-C target-cpu=native`).
+
+What the numbers are not: one corpus, mostly code, on one machine. Only the cl100k and GPT-4 split patterns are supported, not o200k's, and not special tokens. It is a demo, not library API.
 
 For the pcap demo, bring your own data — `./build/pcap_replay_demo capture.pcap` — or capture live traffic with [scripts/capture_pcap.sh](scripts/capture_pcap.sh), which auto-detects your default interface (`en0` on macOS, `eth0`-style on Linux), runs `sudo tcpdump -s 0 -w`, and prints the replay command. Public capture files to experiment with are indexed at [netresec.com/?page=PcapFiles](https://www.netresec.com/?page=PcapFiles) — note that many are pcapng or gzipped, and the reader takes classic pcap, so convert first: `tcpdump -r in.pcapng -w out.pcap`. Without any file, the demo synthesises a capture, so it always runs.
 
@@ -665,7 +679,7 @@ snicholls::mpmc_task_pool          pool{4};   // one shared lock-free MPMC queue
 snicholls::work_stealing_task_pool pool{4};   // per-worker Chase-Lev deques + stealing — best for fork-join
 
 pool.submit([] { /* work */ });
-auto fut = snicholls::async(pool, [] { return 42; });   // result-returning, over the interface
+auto fut = snicholls::async(pool, [] { return 42; });   // result-returning, over any pool
 pool.wait_idle();
 ```
 
@@ -674,6 +688,55 @@ Each is built visibly from the library's own parts. `dispatch_task_pool` is wher
 We do **not** claim to beat the work-stealing greats (Taskflow, TBB, Tokio) — they have years of hardening. What we add is narrow and real: pools composed from the toolkit, moveable handles, a bounded lock-free MPMC queue and a Chase-Lev deque as reusable components, dependency-free, and a level comparison harness. It also completes the [taskflow demo](#demos)'s story — *static* graphs need no pool; *dynamic* submission is where a pool earns its place.
 
 The two lock-free building blocks stand alone too: `mpmc_queue<T>` is a bounded Vyukov MPMC ring (moveable when quiescent), and `work_stealing_deque<T>` is a bounded Chase-Lev deque with the memory-model-verified orderings from Le et al. (2013).
+
+### Concrete pool or `task_pool&`: the concept and the interface
+
+Every pool can be used two ways, and the call site picks:
+
+```cpp
+snicholls::work_stealing_task_pool pool;
+
+snicholls::parallel_for(pool, 0, n, body);          // the concrete type: direct calls
+pool.submit([big_capture] { /* ... */ });           // the callable goes into the pool as it is
+
+snicholls::task_pool& any = pool;                   // a pool chosen at run time, held by pointer
+snicholls::parallel_for(any, 0, n, body);           // the same algorithm, virtual calls
+any.submit([big_capture] { /* ... */ });            // wrapped in a std::function, as before
+```
+
+**The interface stays.** Many uses need a pool that can be passed around by pointer or reference, behind one type, with the implementation chosen somewhere else; a template parameter cannot do that, and the concept below is an addition, not a replacement. `task_pool` (`interfaces/task_pool.hpp`) is still how a pool is held when the choice is made at run time: `task_group` and `task_graph` keep a `task_pool*`, a service can take a `std::unique_ptr<task_pool>` from configuration, and the comparison harness swaps implementations behind it. Nothing that took a `task_pool&` changed.
+
+**Its concept twin is new.** `concepts/task_pool.hpp` states the interface's members as a concept, `task_pool_like`: `submit(task)`, `wait_idle()`, and `worker_count() const noexcept`, with their exact types, `const` and `noexcept`. This is the pattern our other libraries use for an interface that has to serve both static and dynamic code: one header per interface under `concepts/`, mirroring `interfaces/`, holding
+
+- the concept (`task_pool_like<P>`);
+- an adapter (`task_pool_adapter<Impl>`) that implements the interface by forwarding to anything that satisfies the concept, held by value or, with `Impl` a reference, as a non-owning view, so a type that is only `task_pool_like` can still be handed to code that holds a `task_pool*`;
+- a `static_assert` that the interface satisfies its own concept, so a member changed on one side and not the other fails to compile instead of drifting.
+
+`parallel_for`, `parallel_for_each`, `parallel_reduce`, the scans, the sorts and `async` are now templates over any `task_pool_like` pool. Handed a concrete pool, they call it directly (every pool is `final`, so nothing is virtual); handed a `task_pool&`, they call through the vtable exactly as they did when they took one. One algorithm serves both, and the pool type is deduced, so no call site changed.
+
+**`submit(F&&)` where it pays.** A virtual function cannot be a template, so the interface's `submit` must take a `std::function<void()>`. That costs a type-erased call on every task, and a heap allocation whenever the capture outgrows `std::function`'s small buffer (16 to 24 bytes, depending on the standard library). A concrete pool can do better *if it can store the callable more cheaply than a `std::function`*, and two can: `inline_task_pool` just calls it, and `work_stealing_task_pool`, whose tasks were already heap nodes, now allocates one node that holds the callable itself and runs it with one virtual call. Both have a `submit(F&&)` beside their `submit(task)` override, constrained by a second concept, `pool_task` (callable with no arguments, movable into the pool). Called on the concrete pool, overload resolution picks the template; called through `task_pool&`, only the override is visible. A side effect: the concrete path accepts move-only callables, a lambda owning a `std::unique_ptr` for instance, which no `std::function` can hold.
+
+The other three pools keep only `submit(task)`, deliberately. Their queues (`synchronized_waitable<std::deque>`, `circular_buffer`, `mpmc_queue`) hold tasks *by value*, and a queue of values needs one type, so a template `submit` would build the very same `std::function` and gain nothing. Doing better there means changing what the queue stores (a small-buffer move-only task, or nodes as work-stealing does) and is a separate decision for each pool, not part of this one.
+
+**C++17 still builds.** ts-moveables' minimum is C++17, so the constraints are spelled through two macros. `template <TS_MOVEABLES_TASK_POOL Pool>` is `template <task_pool_like Pool>` under C++20 and `template <typename Pool>` under C++17, where the algorithm checks the C++17 trait `is_task_pool_like_v` in a `static_assert` instead; `TS_MOVEABLES_POOL_TASK_TEMPLATE(F)` is `template <pool_task F>` or the equivalent `enable_if`. `TS_MOVEABLES_HAS_CONCEPTS` is 1 when both the language feature (`__cpp_concepts`) and the library one (`__cpp_lib_concepts`, from `<version>`) are there. The tests check the trait under both standards and the concepts under C++20.
+
+**What it buys, measured.** `make bench-pool-dispatch` (`benchmarks/pool_dispatch.cpp`) runs the same pool and the same work both ways, its dynamic type hidden behind a volatile function pointer so the compiler cannot devirtualise the `task_pool&`. The two paths are interleaved rep by rep, alternating which goes first: measured one after the other on a loaded machine, whichever ran second looked up to 24% faster, which is an artefact, not dispatch. Best of 15, ns per call, an 8-core Intel iMac (macOS 13, Apple clang 14, `-O3`), 7 workers, 2026-11-11, two runs that agree:
+
+| pool | `parallel_for` over 4096 ints | submit, 8-byte capture | submit, 48-byte capture |
+|---|---|---|---|
+| `work_stealing_task_pool` | 7,693 vs 7,911 (1.03×) | 134 vs 140 (1.04×) | **143 vs 240 (1.68×)** |
+| `inline_task_pool` | 271 vs 274 (1.01×) | **4.1 vs 7.3 (1.78×)** | **5.7 vs 46.8 (8.2×)** |
+| `mpmc_task_pool` | 1.00× | 1.01× | 1.00× |
+| `sharded_task_pool` | 0.99× | 1.01× | 0.99× |
+| `mutex_task_pool` | 1.00× | 1.01× | 1.00× |
+
+Concrete first, `task_pool&` second; a ratio above 1 is what the interface costs. Three readings:
+
+- **The virtual call itself is close to free.** Where the two paths store the same `std::function` (the three by-value pools, and work-stealing with a capture that fits the small buffer) they are within a few percent. A task's cost is its allocation, its atomics and, for the condition-variable pools, the wakeup; one indirect call does not show next to those.
+- **Type erasure is what costs, and the template `submit` removes it.** Past the small buffer, `std::function` allocates, and the work-stealing pool used to allocate its node as well: two allocations per task where the template path makes one, hence 1.7×. The inline pool has no queue to hide anything, so there the wrapper is nearly all of it: 8× with the large capture.
+- **`parallel_for` barely notices either way.** It submits one task per worker, not one per element or per chunk, and spends the rest of its time claiming chunks from an atomic cursor, so its dispatch is paid a handful of times per call.
+
+So: take the concrete pool when you have it, and submit to it directly when tasks are small and many; hold a `task_pool&` when the choice belongs to configuration, and lose nothing measurable in the parallel algorithms for doing so.
 
 The roadmap and the reasoning behind every component — including the non-goals and what was deliberately *not* built — live in [FUTURE_DIRECTIONS.md](FUTURE_DIRECTIONS.md). Nearly all of it has shipped: disruptor phase 2 (multi-producer), the event loop, and §8 phases 1–4 of the HTTP server — TLS on two backends, WebSocket with `permessage-deflate`, and HTTP/2. What remains is **QUIC and HTTP/3** (§8 phase 5, and the plan there is explicitly to *wrap* a QUIC library rather than write one), the **event loop's phase 2 comforts** (POSIX signals as emissions, a Windows `WSAPoll` backend), and the **two-machine head-to-head** against nginx, which needs hardware rather than code.
 
@@ -688,7 +751,7 @@ snicholls::parallel_for(pool, 0, n, [&](int i) { out[i] = f(in[i]); });
 snicholls::parallel_for_each(pool, v.begin(), v.end(), [](auto& x) { x *= 2; });
 ```
 
-Both block until every element is done and rethrow the first exception a body threw once the rest have settled. It binds to the `task_pool` **interface**, so the same loop runs on any of the five pools and a benchmark can swap between them without touching the call.
+Both block until every element is done and rethrow the first exception a body threw once the rest have settled. They take any pool that models [`task_pool_like`](#concrete-pool-or-task_pool-the-concept-and-the-interface), so the same loop runs on any of the five pools, or on a `task_pool&` chosen at run time, and a benchmark can swap between them without touching the call.
 
 Two decisions carry it, and neither is the obvious one.
 
@@ -826,7 +889,7 @@ loop.run();                                                 // stop() from anywh
 
 And the library's signature applies where nobody else has it: watches, timers, and the loop handle are all moveable (heap-stable core — libuv handles are pinned, Asio objects are entangled with their `io_context`). An `fd_watch` can be a plain member of a session object that lives in a `std::vector`; the rule of zero holds.
 
-The economics are why elegance is affordable here, and `make bench-dispatch` measures it rather than asserting it: against a raw `epoll`/`kqueue` loop calling a plain function, typed signal dispatch costs about **100 ns per event on syscalls costing ~1.5 µs — roughly 6-11%**. Not free, which is what an earlier draft of this paragraph claimed; small. What that buys is the entire bug class in the list above — lifetime safety, ordered dispatch, reentrancy, RAII teardown, and a replayable journal — for a tenth of what the kernel already charges you. Contrast the [queue head-to-head](#head-to-head-vs-moodycamel), where there is no syscall to hide behind and every nanosecond showed.
+The economics are why elegance is affordable here, and `make bench-dispatch` measures it rather than asserting it: against a raw `epoll`/`kqueue` loop calling a plain function, typed signal dispatch costs about **90 ns per event on syscalls costing ~1.5 µs — roughly 6%** (an 8-core Intel iMac; it was ~114 ns before 1.6.0 made an emit with no slots return without taking the signal's lock). Not free, which is what an earlier draft of this paragraph claimed; small. What that buys is the entire bug class in the list above — lifetime safety, ordered dispatch, reentrancy, RAII teardown, and a replayable journal — for a tenth of what the kernel already charges you. Contrast the [queue head-to-head](#head-to-head-vs-moodycamel), where there is no syscall to hide behind and every nanosecond showed.
 
 The honest boundary: that ratio holds because the workload is syscall-dominated, which readiness-driven IO inherently is. A loop that batches many events per syscall would see the abstraction take a larger share.
 

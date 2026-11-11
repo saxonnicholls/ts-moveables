@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-/* Layout: one reading column; a log-scale bar chart per vocabulary, then the full tables, then method and limits. */
+/* Layout: one reading column; headline tiles, a log-scale bar chart per vocabulary, the full tables, then method and limits. */
 :root {
   --bg: #f6f7f9;
   --surface: #ffffff;
@@ -90,21 +90,21 @@ footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule)
 
 <main>
   <header>
-    <div class="eyebrow">ts-moveables · byte-level BPE · experimental</div>
+    <div class="eyebrow">ts-moveables · byte-level BPE · demo</div>
     <h1>Parallel BPE throughput</h1>
-    <p class="lede">A byte-level BPE encoder built on snicholls-core's merge and ts-moveables' work-claiming <code>parallel_for</code>. Token for token it gives what tiktoken gives. It is 4.7 to 6.1 times faster than the fastest single-threaded encoder we measured, and with 32 threads it encodes 1.3 to 1.6 GB/s.</p>
+    <p class="lede">A byte-level BPE encoder built on snicholls-core's merge and ts-moveables' work-claiming <code>parallel_for</code>, token for token what tiktoken gives, raced against eleven other open-source encoders. On GPT-4's vocabulary it is level with the fastest, toktok, at 32 threads and on new text, and second to it from 2 to 16 threads; with a vocabulary of your own it is first on every measure; and it is the only one that spreads a single text across every core.</p>
     <div class="meta">
-      <span>Intel Xeon W-3245, 16 cores / 32 threads, macOS</span>
+      <span>Intel Xeon W-3245, 16 cores / 32 threads, macOS, 2026-11-11</span>
       <span>Corpus: Python 3.12 stdlib, 778 files, 12.3 MB</span>
-      <span>Best of 5–7 runs</span>
+      <span>Best of 5 passes, each the best of 5 repetitions</span>
     </div>
   </header>
 
   <section aria-label="Headline">
     <div class="headline">
-      <div class="stat"><span class="x">4.7×</span><span class="what">One thread, cl100k</span><span class="vs">73 MB/s vs bpe-openai's 15.5</span></div>
-      <div class="stat"><span class="x">6.8×</span><span class="what">32 threads across documents</span><span class="vs">1,287 MB/s vs bpe-openai's 188</span></div>
-      <div class="stat"><span class="x">74×</span><span class="what">One 12 MB text</span><span class="vs">1,164 MB/s vs 15.8; the others use one thread</span></div>
+      <div class="stat"><span class="x">1,922</span><span class="what">MB/s, 32 threads, cl100k</span><span class="vs">toktok 1,887 · splintr 1,315 · quicktok 1,151</span></div>
+      <div class="stat"><span class="x">116</span><span class="what">MB/s on new text, one thread</span><span class="vs">toktok 120 · goliajp tiktoken 72 · splintr 71</span></div>
+      <div class="stat"><span class="x">1,697</span><span class="what">MB/s, one 12 MB text, 32 threads</span><span class="vs">every other encoder takes one text on one thread</span></div>
     </div>
   </section>
 
@@ -112,90 +112,120 @@ footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule)
     <h2>cl100k_base (GPT-4's vocabulary, 100,256 tokens)</h2>
     <div class="legend">
       <span><i class="sw" style="background:var(--ours)"></i>this encoder</span>
-      <span><i class="sw" style="background:var(--rival-strong)"></i>native Rust</span>
+      <span><i class="sw" style="background:var(--rival-strong)"></i>native (Rust, C++)</span>
       <span><i class="sw" style="background:var(--rival)"></i>through Python</span>
     </div>
     <div class="chart" id="chart-cl100k" role="img" aria-label="Throughput in MB/s on cl100k, log scale"></div>
+    <p class="note">"Cold" is the first of the five repetitions of each encoder's single-text loop, before any cache it keeps has seen the corpus: what one pass over new text costs. An encoder with no cold row is one whose harness we did not instrument for it.</p>
   </section>
 
   <section>
     <h2>rust32k (32,768 tokens trained by rustbpe on the corpus)</h2>
     <div class="chart" id="chart-rust32k" role="img" aria-label="Throughput in MB/s on rust32k, log scale"></div>
-    <p class="note">bpe-openai ships fixed vocabularies only, so it is absent here.</p>
+    <p class="note">Loaded from raw ranks with its own split pattern. toktok, quicktok, bpe-openai, goliajp's tiktoken and HF tokenizers ship their vocabularies built in (or need a tokenizer.json), so they are absent here.</p>
+  </section>
+
+  <section>
+    <h2>Scaling, cl100k</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>MB/s, batch of 778 documents</th><th>2 threads</th><th>4</th><th>8</th><th>16</th><th>32</th></tr></thead>
+        <tbody id="t-scale"></tbody>
+      </table>
+    </div>
+    <p class="note">Each encoder's own batch call, or rayon over the documents where it has none, with <code>RAYON_NUM_THREADS</code> set per column. Our N threads are N&minus;1 pool workers plus the calling thread, which <code>parallel_for</code> also puts to work. At 2 threads that is one worker, and <code>parallel_for</code> runs a one-worker pool serially (the rule that keeps <code>inline_task_pool</code> deterministic), so the worker idles: a gap that is ours to close.</p>
   </section>
 
   <section>
     <h2>All figures</h2>
     <div class="tablewrap">
       <table>
-        <thead><tr><th>cl100k</th><th>1 thread MB/s</th><th>32 threads, batch MB/s</th><th>one text MB/s</th><th>tokens match</th></tr></thead>
+        <thead><tr><th>cl100k</th><th>1 thread</th><th>cold</th><th>32 threads</th><th>one text, 32</th><th>tokens match</th></tr></thead>
         <tbody id="t-cl100k"></tbody>
       </table>
     </div>
     <div class="tablewrap">
       <table>
-        <thead><tr><th>rust32k</th><th>1 thread MB/s</th><th>32 threads, batch MB/s</th><th>one text MB/s</th><th>tokens match</th></tr></thead>
+        <thead><tr><th>rust32k</th><th>1 thread</th><th>cold</th><th>32 threads</th><th>one text, 32</th><th>tokens match</th></tr></thead>
         <tbody id="t-rust32k"></tbody>
       </table>
     </div>
-    <p class="note">"Batch" encodes the 778 files as separate documents across all threads: rayon for the Rust crates, <code>encode_ordinary_batch(num_threads=32)</code> for tiktoken (its best of 8, 16 and 32 threads is shown), <code>batch_encode</code> for rustbpe. "One text" is the whole corpus as one string. Our 32 threads are 31 pool workers plus the calling thread, which <code>parallel_for</code> also puts to work.</p>
+    <p class="note">MB/s. <a href="https://crates.io/crates/tokie">tokie</a> 0.1.4 was raced too and is not shown: its single-text call cuts documents of 64 KB or more across every core and gives wrong tokens on 38 of them. TokenDagger is timed through its C++ core and through Python.</p>
   </section>
 
   <section>
     <h2>Correctness</h2>
     <ul>
-      <li><span class="check">778 of 778</span> documents give exactly tiktoken's tokens, for both vocabularies, serially and in parallel, with chunks from 4 KB up to the default size.</li>
+      <li><span class="check">778 of 778</span> documents give exactly tiktoken's tokens, for both vocabularies, serially and in parallel, with chunks from 4 KB up to the default size, with the memo cold and warm. The benchmark refuses to time anything until every check passes.</li>
       <li>The whole corpus as one text, cut across the pool, gives exactly its serial tokens. Every document decodes back to its bytes.</li>
-      <li>tiktoken-rs and bpe-openai also match tiktoken on every document, so all the rows above are doing the same work.</li>
+      <li>The splitter's ASCII fast path agrees with the character-by-character code it hands over to at every position of the corpus and of 300,000 adversarial texts (47 million positions, both patterns); two bugs planted on purpose are both caught.</li>
+      <li>Every other encoder shown also gives tiktoken's tokens on every document, on every path timed, so all the rows are doing the same work.</li>
     </ul>
   </section>
 
   <section>
     <h2>Where the speed comes from</h2>
     <ul>
-      <li><b>The split pattern as code.</b> tiktoken spends most of its time in fancy-regex. Here the cl100k and GPT-4 patterns are written out by hand, alternative by alternative, with an ASCII fast path for letter runs. The split runs at 182 MB/s on one thread.</li>
-      <li><b>Lookups in flight together.</b> The split cuts 32 pieces at a time and hashes and prefetches each one's slot in the vocabulary before looking any of them up. The cache misses on a 4 MB table then overlap instead of queueing.</li>
-      <li><b>A per-thread piece cache.</b> 93% of pieces are a single token. The other 7% need a merge, and they recur: 195K of them, but only 41K distinct. A 256 KB direct-mapped cache per thread remembers them.</li>
-      <li><b>Cutting one text safely.</b> A long text is cut at positions the whole-text split is proved to start a piece at: an ASCII letter followed by an ASCII non-letter, or a newline followed by non-whitespace. Workers claim the chunks from a shared cursor, so one text uses every core and still gives its serial tokens. The others parallelise only across documents.</li>
-      <li><b>The merge.</b> snicholls-core's <code>bpe_encode_piece</code> is tiktoken's <code>byte_pair_merge</code> step for step. It allocates nothing and is <code>constexpr</code>.</li>
+      <li><b>The split pattern as code, ASCII 16 bytes at a time.</b> tiktoken spends most of its time in fancy-regex. Here the patterns are written out; on ASCII each decision depends on one byte's kind, read once from a 256-entry table, and letter, space and punctuation runs are measured with SSE2. Anything non-ASCII goes to the original code, which stays as the reference. About 420 MB/s on one thread.</li>
+      <li><b>A memo of short pieces.</b> 99% of pieces are 15 bytes or fewer, 63,000 distinct in this corpus. Each thread keeps a 4 MB table of them with their tokens, keyed without reading past the piece (exact, and clean under AddressSanitizer); one- and two-byte pieces come from tables built with the encoder. The idea is toktok's.</li>
+      <li><b>Inlined.</b> Forcing the splitter and the per-piece code into the encode loop bought more than any table: as calls, their live values went through memory.</li>
+      <li><b>Cutting one text safely.</b> A long text is cut where the whole-text split is proved to start a piece, and workers claim the chunks from a shared cursor on the work-stealing pool, so one text uses every core and still gives its serial tokens.</li>
+      <li><b>The merge.</b> For the 7% of pieces that are not one token: snicholls-core's <code>bpe_encode_piece</code>, tiktoken's <code>byte_pair_merge</code> step for step, allocation-free and <code>constexpr</code>, behind a 4 MB per-thread cache. Pieces of 1 KB or more take core's O(n log n) heap merge, about 100 times faster at 128 KB.</li>
     </ul>
   </section>
 
   <section>
     <h2>Limits of these numbers</h2>
     <ul>
-      <li>One corpus, mostly source code. Prose, other languages and other scripts will shift every row; the piece cache helps most where words repeat.</li>
-      <li>One machine. Linux and ARM are still to be measured.</li>
-      <li>Pieces of 1 KB or more take an O(n log n) heap merge with the same tokens. It is about 100 times faster than tiktoken's quadratic merge on a 128 KB piece. Shorter pieces keep the rescanning merge, which is faster at those lengths. bpe-openai is linear in the worst case.</li>
+      <li>One corpus, mostly source code. Prose, other languages and other scripts will shift every row; memos help most where pieces repeat, which is why the cold column is there.</li>
+      <li>One machine, shared with other work while it ran; each cell is the best of five full passes for that reason. Linux and ARM are still to be measured.</li>
+      <li>Ours was built with <code>-march=native</code>, as the Rust crates were with <code>-C target-cpu=native</code>. The Python rows include building Python lists; the native rows are the fair comparison for the encoders themselves.</li>
       <li>The Unicode classes come from the regex module's tables and are checked through tiktoken's tokens on this corpus. Code points assigned in a newer Unicode version than tiktoken's could split differently.</li>
-      <li>Only the cl100k and GPT-4 split patterns are supported. o200k's pattern is not yet supported, and neither are special tokens.</li>
-      <li>The Python rows include building Python lists. The native Rust rows are the fair comparison for the encoders themselves.</li>
+      <li>Only the cl100k and GPT-4 split patterns are supported; o200k's is not yet, and neither are special tokens.</li>
     </ul>
   </section>
 
-  <footer>Copyright 2010-2026 Saxon Herschel Nicholls. ts-moveables and snicholls-core are open source. This encoder is an experimental demo, not yet released; it builds on core's <code>ml/bpe.hpp</code>, planned for core 0.6.0. Versions measured: tiktoken 0.14.0, tiktoken-rs 0.12.1, bpe-openai 0.3.2, rustbpe 0.1.0.</footer>
+  <footer>Copyright 2010-2026 Saxon Herschel Nicholls. ts-moveables and snicholls-core are open source. This encoder is a demo, not library API: ts-moveables 1.6.0 on snicholls-core 0.6.0. Versions raced: toktok-rs 0.3.0, splintr 0.22.2, quicktok 0.4.0, tiktoken (goliajp) 4.1.2, TokenDagger 0.1.1, bpe-openai 0.3.2, tiktoken-rs 0.12.1, kitoken 0.11.1, tiktoken 0.14.0, HF tokenizers 0.23.2, tokie 0.1.4. Reproduce with <code>scripts/tokenizer/run_comparison.sh</code> and <code>best_of_passes.py</code>.</footer>
 </main>
 
 <script>
 (function () {
-  // MB/s; null where the encoder has no such mode for that vocabulary
+  // MB/s, best of 5 passes; null where the encoder has no such mode or was not measured in it
   const data = {
     cl100k: [
-      { name: "this encoder", kind: "ours", one: 73.4, batch: 1286.5, text: 1164.1, match: "778/778" },
-      { name: "bpe-openai (Rust)", kind: "rust", one: 15.5, batch: 188.3, text: 15.8, match: "778/778" },
-      { name: "tiktoken-rs (Rust)", kind: "rust", one: 9.8, batch: 46.7, text: 10.6, match: "778/778" },
-      { name: "tiktoken (Python)", kind: "py", one: 9.4, batch: 37.7, text: 9.5, match: "reference" }
+      { name: "this encoder", kind: "ours", one: 181, cold: 116, batch: 1922, text: 1697, match: "778/778" },
+      { name: "toktok-rs (Rust)", kind: "native", one: 220, cold: 120, batch: 1887, text: null, match: "778/778" },
+      { name: "splintr (Rust)", kind: "native", one: 112, cold: 71, batch: 1315, text: null, match: "778/778" },
+      { name: "quicktok (C++)", kind: "native", one: 90, cold: null, batch: 1151, text: null, match: "778/778" },
+      { name: "tiktoken, goliajp (Rust)", kind: "native", one: 76, cold: 72, batch: 734, text: null, match: "778/778" },
+      { name: "TokenDagger (C++)", kind: "native", one: 14.7, cold: null, batch: 157, text: null, match: "778/778" },
+      { name: "bpe-openai (Rust)", kind: "native", one: 15.9, cold: 15.9, batch: 153, text: null, match: "778/778" },
+      { name: "tiktoken-rs (Rust)", kind: "native", one: 11.1, cold: 11.1, batch: 51, text: null, match: "778/778" },
+      { name: "kitoken (Rust)", kind: "native", one: 5.2, cold: 5.1, batch: 46, text: null, match: "778/778" },
+      { name: "tiktoken (Python)", kind: "py", one: 9.4, cold: null, batch: 41, text: null, match: "reference" },
+      { name: "HF tokenizers (Rust)", kind: "native", one: 1.5, cold: 1.5, batch: 9.5, text: null, match: "778/778" }
     ],
     rust32k: [
-      { name: "this encoder", kind: "ours", one: 84.7, batch: 1566.7, text: 1328.3, match: "778/778" },
-      { name: "tiktoken-rs (Rust)", kind: "rust", one: 13.8, batch: 58.1, text: 13.6, match: "778/778" },
-      { name: "tiktoken (Python)", kind: "py", one: 11.4, batch: 39.9, text: 11.8, match: "reference" },
-      { name: "rustbpe (Python)", kind: "py", one: 4.1, batch: 17.0, text: 4.2, match: "778/778" }
+      { name: "this encoder", kind: "ours", one: 194, cold: 128, batch: 2158, text: 1831, match: "778/778" },
+      { name: "splintr (Rust)", kind: "native", one: 39, cold: 35, batch: 487, text: null, match: "778/778" },
+      { name: "TokenDagger (C++)", kind: "native", one: 21, cold: null, batch: 221, text: null, match: "778/778" },
+      { name: "tiktoken-rs (Rust)", kind: "native", one: 13.9, cold: 13.8, batch: 60, text: null, match: "778/778" },
+      { name: "kitoken (Rust)", kind: "native", one: 5.4, cold: 5.2, batch: 46, text: null, match: "778/778" },
+      { name: "tiktoken (Python)", kind: "py", one: 11.6, cold: null, batch: 44, text: null, match: "reference" }
     ]
   };
-  const groups = [["one", "One thread"], ["batch", "32 threads, across documents"], ["text", "One 12 MB text, 32 threads available"]];
-  const fill = { ours: "var(--ours)", rust: "var(--rival-strong)", py: "var(--rival)" };
-  const fmt = v => v >= 100 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1);
+  const scale = [
+    { name: "this encoder", kind: "ours", v: [169, 547, 891, 1281, 1922] },
+    { name: "toktok-rs", kind: "native", v: [432, 768, 1269, 1739, 1887] },
+    { name: "splintr", kind: "native", v: [215, 430, 809, 1432, 1315] },
+    { name: "quicktok", kind: "native", v: [182, 371, 704, 1037, 1151] },
+    { name: "tiktoken, goliajp", kind: "native", v: [134, 239, 419, 669, 734] },
+    { name: "bpe-openai", kind: "native", v: [26, 47, 80, 120, 153] },
+    { name: "tiktoken (Python)", kind: "py", v: [11.5, 22, 35, 38, 41] }
+  ];
+  const groups = [["one", "One thread"], ["cold", "One thread, cold (new text)"], ["batch", "32 threads, across documents"], ["text", "One 12 MB text, 32 threads"]];
+  const fill = { ours: "var(--ours)", native: "var(--rival-strong)", py: "var(--rival)" };
+  const fmt = v => v == null ? "—" : v >= 100 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1);
   const NS = "http://www.w3.org/2000/svg";
   function el(tag, attrs, text) {
     const e = document.createElementNS(NS, tag);
@@ -204,12 +234,13 @@ footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule)
     return e;
   }
   function chart(id, rows) {
-    const W = 820, left = 150, right = 70, barH = 16, gap = 6, groupGap = 30, top = 26;
+    const W = 820, left = 170, right = 70, barH = 15, gap = 5, groupGap = 30, top = 26;
     const plotW = W - left - right;
     const lo = Math.log10(1), hi = Math.log10(3000);
     const x = v => left + (Math.log10(v) - lo) / (hi - lo) * plotW;
-    const groupH = rows.length * (barH + gap);
-    const H = top + groups.length * (groupH + groupGap) + 4;
+    let H = top;
+    for (const [key] of groups) H += 12 + rows.filter(r => r[key] != null).length * (barH + gap) + groupGap - 12;
+    H += 4;
     const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "xMinYMin meet" });
     for (const t of [1, 10, 100, 1000]) {
       svg.appendChild(el("line", { x1: x(t), x2: x(t), y1: top - 6, y2: H - 8, stroke: "var(--rule)", "stroke-width": 1 }));
@@ -221,6 +252,7 @@ footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule)
       y += 12;
       for (const r of rows) {
         const v = r[key];
+        if (v == null) continue;
         svg.appendChild(el("text", { x: left - 10, y: y + barH - 4, "text-anchor": "end", class: "lbl" }, r.name));
         svg.appendChild(el("rect", { x: left, y: y, width: Math.max(1, x(v) - left), height: barH, rx: 2, fill: fill[r.kind] }));
         svg.appendChild(el("text", { x: x(v) + 6, y: y + barH - 4, class: "val" + (r.kind === "ours" ? " ours" : "") }, fmt(v)));
@@ -230,12 +262,12 @@ footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule)
     }
     document.getElementById(id).appendChild(svg);
   }
-  function table(id, rows) {
+  function rows(id, list, cells) {
     const tb = document.getElementById(id);
-    for (const r of rows) {
+    for (const r of list) {
       const tr = document.createElement("tr");
       if (r.kind === "ours") tr.className = "ours";
-      for (const c of [r.name, fmt(r.one), fmt(r.batch), fmt(r.text), r.match]) {
+      for (const c of cells(r)) {
         const td = document.createElement("td");
         td.textContent = c;
         tr.appendChild(td);
@@ -243,7 +275,11 @@ footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--rule)
       tb.appendChild(tr);
     }
   }
-  for (const k of Object.keys(data)) { chart("chart-" + k, data[k]); table("t-" + k, data[k]); }
+  for (const k of Object.keys(data)) {
+    chart("chart-" + k, data[k]);
+    rows("t-" + k, data[k], r => [r.name, fmt(r.one), fmt(r.cold), fmt(r.batch), fmt(r.text), r.match]);
+  }
+  rows("t-scale", scale, r => [r.name, ...r.v.map(fmt)]);
 })();
 </script>
 </body>

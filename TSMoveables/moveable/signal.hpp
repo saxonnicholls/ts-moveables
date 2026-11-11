@@ -122,6 +122,14 @@ namespace snicholls
         struct shared {
             std::mutex m;
             std::shared_ptr<const slot_vector> slots = std::make_shared<slot_vector>();
+            // slots->size(), stored under m each time the list is replaced and
+            // read without it by emit: a signal nobody listens to then costs
+            // one load per emit rather than a lock and a shared_ptr copy. It
+            // can be high (a slot disconnected through its connection stays in
+            // the list until the next connect / disconnect_all) but never low
+            // for a connect that happened before the emit, so it only ever
+            // sends an emit the slow way, never skips a slot it must call.
+            std::atomic<std::size_t> size{0};
         };
 
         std::shared_ptr<shared> s_ = std::make_shared<shared>();
@@ -143,7 +151,9 @@ namespace snicholls
             std::lock_guard<std::mutex> lock(s_->m);
             slot_vector v = live_copy(*s_->slots);
             v.push_back(slot_entry{st, std::function<void(Args...)>(std::forward<F>(f))});
+            const std::size_t n = v.size();
             s_->slots = std::make_shared<const slot_vector>(std::move(v));
+            s_->size.store(n, std::memory_order_release);
             return connection(std::move(st));
         }
 
@@ -181,9 +191,11 @@ namespace snicholls
                            [raw, mf](Args... a) { (raw->*mf)(a...); });
         }
 
-        // Emit. Slots run on the emitting thread, in connection order.
+        // Emit. Slots run on the emitting thread, in connection order. With no
+        // slot connected it returns at once: no lock, no shared_ptr copy. A
+        // connect racing this emit may be missed, which the rules above allow.
         void operator()(Args... args) const {
-            if (!s_)
+            if (!s_ || s_->size.load(std::memory_order_acquire) == 0)
                 return;
             std::shared_ptr<const slot_vector> snap;
             {
@@ -214,6 +226,7 @@ namespace snicholls
             for (const slot_entry& e : *s_->slots)
                 e.state->alive.store(false, std::memory_order_release);
             s_->slots = std::make_shared<const slot_vector>();
+            s_->size.store(0, std::memory_order_release);
         }
 
         // Currently connected (live) slots - a snapshot

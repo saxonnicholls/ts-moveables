@@ -6,7 +6,13 @@
 //
 //  Byte-level BPE across every core, checked token for token against tiktoken, and timed.
 //
-//      tokenizer_bench <data dir> <vocab> [--threads 1,2,4,...] [--markdown]
+//      tokenizer_bench <data dir> <vocab> [--threads 1,2,4,...] [--markdown] [--dispatch]
+//
+//  --dispatch adds the same parallel rows run two ways, interleaved rep by rep
+//  (alternating which goes first): with the concrete pool, whose calls are
+//  direct, and with the same pool as a task_pool& whose type the compiler
+//  cannot see, whose calls are virtual (benchmarks/pool_dispatch.cpp measures
+//  the same thing on synthetic work).
 //
 //  <data dir> is what scripts/tokenizer/prepare.py writes: docs.bin (the corpus), <vocab>.ranks (tiktoken's
 //  base64 format), <vocab>.pattern (the vocabulary's own split pattern) and <vocab>.tokens (tiktoken's tokens
@@ -30,6 +36,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace tk = snicholls::tokenizer;
@@ -108,17 +115,19 @@ double best_of(int reps, F&& fn)
 int main(int argc, char** argv)
 {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: tokenizer_bench <data dir> <vocab> [--threads 1,2,4] [--reps n] [--markdown]\n");
+        std::fprintf(stderr, "usage: tokenizer_bench <data dir> <vocab> [--threads 1,2,4] [--reps n] [--markdown] [--dispatch]\n");
         return 2;
     }
     const std::string dir = argv[1], name = argv[2];
     std::vector<std::size_t> thread_counts;
-    bool markdown = false;
+    bool markdown = false, dispatch = false;
     int reps = 5;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--markdown")
             markdown = true;
+        else if (a == "--dispatch")
+            dispatch = true;
         else if (a == "--reps" && i + 1 < argc)
             reps = std::atoi(argv[++i]);
         else if (a == "--threads" && i + 1 < argc) {
@@ -243,6 +252,16 @@ int main(int argc, char** argv)
         pieces = n;
     });
     std::vector<std::uint32_t> sink(bytes);
+    // Cold: one pass with this thread's merged-piece cache emptied first, as a library that memoises would see
+    // new text; the best-of rows below are warm
+    tk::encoder::clear_thread_cache();
+    const auto c0 = std::chrono::steady_clock::now();
+    {
+        std::uint32_t* at = sink.data();
+        for (const auto d : docs)
+            at += enc.encode_range(d, 0, d.size(), at);
+    }
+    const double t_cold = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
     const double t_serial = best_of(reps, [&] {
         std::uint32_t* at = sink.data();
         for (const auto d : docs)
@@ -262,6 +281,7 @@ int main(int argc, char** argv)
         std::printf("\n| | ms | M tokens/s | MB/s | vs serial |\n|---|---:|---:|---:|---:|\n");
     row("split only, 1 thread", t_split, t_serial);
     row("encode, 1 thread", t_serial, t_serial);
+    row("encode, 1 thread, cold cache", t_cold, t_serial);
     for (const std::size_t t : thread_counts) {
         snicholls::work_stealing_task_pool p(t);
         const double s = best_of(reps, [&] { (void)enc.encode_batch(docs, p); });
@@ -271,6 +291,44 @@ int main(int argc, char** argv)
         snicholls::work_stealing_task_pool p(t);
         const double s = best_of(reps, [&] { (void)enc.encode(all, p); });
         row("one text, " + std::to_string(t) + " workers + caller", s, t_serial);
+    }
+    if (dispatch) {
+        // A task_pool& the compiler cannot see through, so its calls stay virtual
+        static snicholls::task_pool& (*volatile erase)(snicholls::task_pool&) = [](snicholls::task_pool& q) -> snicholls::task_pool& { return q; };
+        const auto both = [&](auto concrete, auto dynamic, double& sc, double& sd) {
+            sc = sd = 1e300;
+            for (int r = 0; r < 2 * reps; ++r) {
+                const auto time = [](auto& f) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    f();
+                    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                };
+                if (r % 2 != 0) {
+                    sd = std::min(sd, time(dynamic));
+                    sc = std::min(sc, time(concrete));
+                } else {
+                    sc = std::min(sc, time(concrete));
+                    sd = std::min(sd, time(dynamic));
+                }
+            }
+        };
+        std::printf("\ndispatch: the concrete work_stealing_task_pool against the same pool as task_pool&, best of %d each, interleaved\n", 2 * reps);
+        if (markdown)
+            std::printf("\n| | concrete ms | task_pool& ms | task_pool& vs concrete |\n|---|---:|---:|---:|\n");
+        for (const std::size_t t : thread_counts) {
+            snicholls::work_stealing_task_pool p(t);
+            snicholls::task_pool& d = erase(p);
+            double sc, sd, oc, od;
+            both([&] { (void)enc.encode_batch(docs, p); }, [&] { (void)enc.encode_batch(docs, d); }, sc, sd);
+            both([&] { (void)enc.encode(all, p); }, [&] { (void)enc.encode(all, d); }, oc, od);
+            for (const auto& [what, c, v] : {std::tuple{"batch", sc, sd}, std::tuple{"one text", oc, od}}) {
+                const std::string label = std::string(what) + ", " + std::to_string(t) + " workers + caller";
+                if (markdown)
+                    std::printf("| %s | %.2f | %.2f | %+.1f%% |\n", label.c_str(), c * 1e3, v * 1e3, 100 * (v - c) / c);
+                else
+                    std::printf("  %-36s %9.2f ms %9.2f ms %+6.1f%%\n", label.c_str(), c * 1e3, v * 1e3, 100 * (v - c) / c);
+            }
+        }
     }
     return 0;
 }

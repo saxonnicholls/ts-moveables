@@ -10,9 +10,12 @@
 //  question actually asked most of the time: "run this loop across the cores I
 //  have, and come back when it is done." It is a thin layer and deliberately
 //  so - it adds no threads, owns no scheduler, and holds no global state. It
-//  binds to the `task_pool` INTERFACE, so the same call runs on the shared-queue
-//  pool, the sharded one, the MPMC one or the work-stealing one, and a
-//  benchmark can swap between them without touching the loop.
+//  takes any pool with the `task_pool` members (the `task_pool_like` concept,
+//  concepts/task_pool.hpp), so the same call runs on the shared-queue pool, the
+//  sharded one, the MPMC one or the work-stealing one, and a benchmark can swap
+//  between them without touching the loop. Hand it the concrete pool and its
+//  calls are direct; hand it a `task_pool&` and they go through the vtable,
+//  for code that holds a pool chosen at run time.
 //
 //      snicholls::work_stealing_task_pool pool;
 //      snicholls::parallel_for(pool, 0, n, [&](int i) { out[i] = f(in[i]); });
@@ -71,7 +74,7 @@
 
 #include <snicholls/core/constexpr_for.hpp>   // unrolled_for (snicholls-core)
 
-#include "../interfaces/task_pool.hpp"
+#include "../concepts/task_pool.hpp"   // task_pool_like, TS_MOVEABLES_TASK_POOL
 #include "task_group.hpp"          // completion_gate, error_slot
 
 #include <algorithm>
@@ -163,9 +166,10 @@ namespace snicholls
         // exhausted and touch nothing but the gate, but it must find the gate
         // alive to do so. That is also why fn may safely capture the caller's
         // frame by reference - a late task never calls it.
-        template <typename Fn>
-        void run_chunks(task_pool& pool, std::size_t count, std::size_t grain, Fn fn)
+        template <TS_MOVEABLES_TASK_POOL Pool, typename Fn>
+        void run_chunks(Pool& pool, std::size_t count, std::size_t grain, Fn fn)
         {
+            static_assert(is_task_pool_like_v<Pool>, "snicholls: the pool must have task_pool's members (task_pool_like)");
             const std::size_t chunks = (count + grain - 1) / grain;
             auto st = std::make_shared<chunk_run<Fn>>(grain, count, chunks, std::move(fn));
             st->gate.add(chunks);
@@ -207,8 +211,8 @@ namespace snicholls
     // parallel_for<8>(pool, 0, n, body) emits the body eight times per inner
     // iteration; see snicholls-core's constexpr_for.hpp for why that is usually not the
     // win it sounds like, and `make bench-parallel` for the measurement.
-    template <std::size_t Unroll = 1, typename Index, typename Body>
-    void parallel_for(task_pool& pool, Index first, Index last, Body body,
+    template <std::size_t Unroll = 1, TS_MOVEABLES_TASK_POOL Pool, typename Index, typename Body>
+    void parallel_for(Pool& pool, Index first, Index last, Body body,
                       std::size_t grain_size = 0)
     {
         static_assert(std::is_integral_v<Index>, "parallel_for needs an integral index");
@@ -253,8 +257,8 @@ namespace snicholls
     // more time seeking than working and would look like a performance bug in
     // the caller's code rather than in this decision. Copy into a vector first
     // and the cost is at least visible.
-    template <std::size_t Unroll = 1, typename Iter, typename Body>
-    void parallel_for_each(task_pool& pool, Iter first, Iter last, Body body,
+    template <std::size_t Unroll = 1, TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename Body>
+    void parallel_for_each(Pool& pool, Iter first, Iter last, Body body,
                            std::size_t grain_size = 0)
     {
         using category = typename std::iterator_traits<Iter>::iterator_category;
@@ -298,9 +302,9 @@ namespace snicholls
     // `identity` must be a real identity for `reduce`: every chunk seeds its
     // local accumulator with it, so a wrong seed is counted once per chunk
     // rather than once overall.
-    template <std::size_t Unroll = 1, typename Index, typename T,
+    template <std::size_t Unroll = 1, TS_MOVEABLES_TASK_POOL Pool, typename Index, typename T,
               typename Map, typename Reduce>
-    T parallel_reduce(task_pool& pool, Index first, Index last, T identity,
+    T parallel_reduce(Pool& pool, Index first, Index last, T identity,
                       Map map, Reduce reduce, std::size_t grain_size = 0)
     {
         static_assert(std::is_integral_v<Index>, "parallel_reduce needs an integral index");
@@ -346,9 +350,9 @@ namespace snicholls
     }
 
     // The iterator form: map sees the element, not the index.
-    template <std::size_t Unroll = 1, typename Iter, typename T,
+    template <std::size_t Unroll = 1, TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename T,
               typename Map, typename Reduce>
-    T parallel_reduce_each(task_pool& pool, Iter first, Iter last, T identity,
+    T parallel_reduce_each(Pool& pool, Iter first, Iter last, T identity,
                            Map map, Reduce reduce, std::size_t grain_size = 0)
     {
         using category = typename std::iterator_traits<Iter>::iterator_category;
@@ -386,8 +390,8 @@ namespace snicholls
     // be commutative.
     namespace detail
     {
-        template <bool Inclusive, typename Iter, typename OutIter, typename T, typename Combine>
-        T scan_impl(task_pool& pool, Iter first, Iter last, OutIter out,
+        template <bool Inclusive, TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename OutIter, typename T, typename Combine>
+        T scan_impl(Pool& pool, Iter first, Iter last, OutIter out,
                     T identity, Combine combine, std::size_t grain_size)
         {
             using category = typename std::iterator_traits<Iter>::iterator_category;
@@ -453,15 +457,15 @@ namespace snicholls
         }
     } // namespace detail
 
-    template <typename Iter, typename OutIter, typename T, typename Combine>
-    T parallel_inclusive_scan(task_pool& pool, Iter first, Iter last, OutIter out,
+    template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename OutIter, typename T, typename Combine>
+    T parallel_inclusive_scan(Pool& pool, Iter first, Iter last, OutIter out,
                               T identity, Combine combine, std::size_t grain_size = 0)
     {
         return detail::scan_impl<true>(pool, first, last, out, identity, combine, grain_size);
     }
 
-    template <typename Iter, typename OutIter, typename T, typename Combine>
-    T parallel_exclusive_scan(task_pool& pool, Iter first, Iter last, OutIter out,
+    template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename OutIter, typename T, typename Combine>
+    T parallel_exclusive_scan(Pool& pool, Iter first, Iter last, OutIter out,
                               T identity, Combine combine, std::size_t grain_size = 0)
     {
         return detail::scan_impl<false>(pool, first, last, out, identity, combine, grain_size);
@@ -492,8 +496,8 @@ namespace snicholls
         // Runs shorter than this are not worth a thread of their own.
         inline constexpr std::size_t parallel_sort_min_run = 1u << 12;
 
-        template <typename Iter, typename Compare, typename RunSort>
-        void sort_impl(task_pool& pool, Iter first, Iter last, Compare comp, RunSort run_sort)
+        template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename Compare, typename RunSort>
+        void sort_impl(Pool& pool, Iter first, Iter last, Compare comp, RunSort run_sort)
         {
             using category = typename std::iterator_traits<Iter>::iterator_category;
             static_assert(std::is_base_of_v<std::random_access_iterator_tag, category>,
@@ -540,15 +544,15 @@ namespace snicholls
         }
     } // namespace detail
 
-    template <typename Iter, typename Compare = std::less<>>
-    void parallel_sort(task_pool& pool, Iter first, Iter last, Compare comp = Compare{})
+    template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename Compare = std::less<>>
+    void parallel_sort(Pool& pool, Iter first, Iter last, Compare comp = Compare{})
     {
         detail::sort_impl(pool, first, last, comp,
                           [](auto b, auto e, auto c) { std::sort(b, e, c); });
     }
 
-    template <typename Iter, typename Compare = std::less<>>
-    void parallel_stable_sort(task_pool& pool, Iter first, Iter last, Compare comp = Compare{})
+    template <TS_MOVEABLES_TASK_POOL Pool, typename Iter, typename Compare = std::less<>>
+    void parallel_stable_sort(Pool& pool, Iter first, Iter last, Compare comp = Compare{})
     {
         detail::sort_impl(pool, first, last, comp,
                           [](auto b, auto e, auto c) { std::stable_sort(b, e, c); });

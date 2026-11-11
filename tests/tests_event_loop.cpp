@@ -197,6 +197,60 @@ void test_loop_post_from_threads()
     pass("event loop: cross-thread post (no lost wakeups)");
 }
 
+// The wake byte is written only when no wake is already pending, so the
+// window that matters is the loop going back to sleep just as a post lands.
+// Ping-pong puts every post in that window: each round waits until the loop
+// has run the previous task (and so has drained and is about to block), then
+// posts one more. A lost wakeup shows as a round that never completes; every
+// wait has a deadline so it fails instead of hanging. Then several threads
+// post bursts while tasks on the loop post follow-ups of their own, which
+// exercises the path where the flag is already set by a post from the loop
+// thread itself.
+void test_loop_coalesced_wakes_lose_nothing()
+{
+    // Capacity above the most this test ever queues (2 x 4 x 5000): a task on
+    // the loop thread that posts into a FULL queue waits for room only the
+    // loop thread can make, which is a separate, known limit of post(), not
+    // what this test is about
+    event_loop loop(1 << 16);
+    std::thread lt([&] { loop.run(); });
+    assert(spin_until_for([&] { return loop.running(); }, std::chrono::milliseconds(5000)));
+
+    std::atomic<int> done{0};
+    constexpr int rounds = 20000;
+    for (int r = 1; r <= rounds; ++r) {
+        loop.post([&done] { done.fetch_add(1, std::memory_order_release); });
+        const bool ok = spin_until_for([&] { return done.load(std::memory_order_acquire) == r; },
+                                       std::chrono::milliseconds(5000));
+        if (!ok) {
+            loop.stop();
+            lt.join();
+        }
+        assert(ok);   // a lost wakeup: the loop slept with this round's task queued
+    }
+
+    constexpr int n_threads = 4, per_thread = 5000;
+    std::atomic<long long> ran{0};
+    std::vector<std::thread> posters;
+    for (int t = 0; t < n_threads; ++t)
+        posters.emplace_back([&] {
+            for (int i = 0; i < per_thread; ++i)
+                loop.post([&] {
+                    ran.fetch_add(1, std::memory_order_relaxed);
+                    loop.post([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });   // from the loop thread
+                });
+        });
+    for (auto& p : posters)
+        p.join();
+    const bool all = spin_until_for([&] { return ran.load() == 2LL * n_threads * per_thread; },
+                                    std::chrono::milliseconds(30000));
+    loop.stop();
+    lt.join();
+    assert(all);
+
+    pass("event loop: coalesced wake writes - ping-pong and nested bursts, nothing lost");
+}
+
 void test_loop_thread_contract()
 {
     event_loop loop;
@@ -607,6 +661,7 @@ void run_event_loop_tests()
     test_loop_eof();
     test_loop_timers();
     test_loop_post_from_threads();
+    test_loop_coalesced_wakes_lose_nothing();
     test_loop_thread_contract();
     test_loop_reentrancy();
     test_loop_moveability();

@@ -240,8 +240,10 @@ namespace snicholls
     //     std::logic_error instead of racing. post() is the one door in from
     //     other threads; timer::cancel() is safe from any thread; destroying
     //     an fd_watch on a foreign thread marshals itself through post().
-    //   - lost wakeups: post() enqueues to a bounded mpmc_queue and writes a
-    //     self-pipe byte; the pipe is non-blocking and fully drained.
+    //   - lost wakeups: post() enqueues to a bounded mpmc_queue and, unless a
+    //     wake is already pending, writes a self-pipe byte; the pipe is
+    //     non-blocking and fully drained before the pending flag is cleared
+    //     (see enqueue_task for why that order is the whole argument).
     //   - reentrancy corruption: per-event state lookup is fresh, emission is
     //     snapshot-based - handlers may create and destroy watches freely.
     //   - timer drift and post-stall bursts: periodic timers reschedule
@@ -300,6 +302,9 @@ namespace snicholls
             mpmc_queue<std::function<void()>> posted;
             std::atomic<bool> running{false};
             std::atomic<bool> stop_flag{false};
+            // True from the post that wrote a wake byte until the loop has
+            // drained the pipe: posts in between skip the write() syscall.
+            std::atomic<bool> wake_pending{false};
             std::atomic<std::thread::id> loop_thread{};
             moveable_signal<const dispatch_info&> tap;
             std::vector<detail::el_event> results;
@@ -346,10 +351,28 @@ namespace snicholls
                 [[maybe_unused]] ssize_t r = ::write(wake_write, &b, 1);   // EAGAIN: already signalled
             }
 
+            // A post writes the wake byte only on the edge from "no wake
+            // pending" to "wake pending", so a burst of N posts costs one
+            // write() instead of N. Why no post can be lost:
+            //
+            //   post:  push the task, then wake_pending.exchange(true)
+            //   loop:  drain the pipe, then wake_pending.exchange(false), then
+            //          (next iteration) pop the queue before polling again
+            //
+            // Both are read-modify-writes on one atomic, so they are ordered.
+            // If the post's exchange comes after the loop's, it reads false and
+            // writes a fresh byte: the loop wakes. If it comes before, it reads
+            // true and skips the write, and the loop's exchange reads the true
+            // it wrote - acq_rel on both, so the push happens-before the loop's
+            // next look at the queue, which then finds the task. The loop must
+            // drain BEFORE clearing: cleared first, a post could see false,
+            // write, and have its byte swallowed by the drain, leaving the flag
+            // set, the pipe empty and the loop asleep with work queued.
             void enqueue_task(std::function<void()> t) {
                 while (!posted.push(std::move(t)))          // bounded: backpressure when full
                     std::this_thread::yield();
-                wake();
+                if (!wake_pending.exchange(true, std::memory_order_acq_rel))
+                    wake();
             }
 
             void remove_watch_if(int fd, const std::shared_ptr<fd_state>& st) noexcept {
@@ -429,6 +452,8 @@ namespace snicholls
                         char buf[256];
                         while (::read(wake_read, buf, sizeof buf) > 0) {
                         }
+                        // After the drain, never before: see enqueue_task
+                        wake_pending.exchange(false, std::memory_order_acq_rel);
                         continue;
                     }
                     auto it = fds.find(ev.fd);              // fresh lookup: a handler may have removed it
