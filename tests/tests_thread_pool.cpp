@@ -63,7 +63,7 @@ void exercise(Pool&& pool, const char* name)
     auto f3 = async(iface, []() -> int { throw std::runtime_error("boom"); });
     bool threw = false;
     try {
-        f3.get();
+        (void)f3.get();   // newer libc++ marks future::get [[nodiscard]]
     } catch (const std::runtime_error&) {
         threw = true;
     }

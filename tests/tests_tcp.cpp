@@ -395,7 +395,9 @@ void test_tcp_reactor_oversized_send_on_empty_queue()
     net::tcp_stream peer = net::tcp_stream::connect("127.0.0.1", port, 2s);
     assert(peer.valid());
     assert(read_exactly(peer, big.size(), 5s) == big);    // all of it arrived
-    assert(accepted.load());
+    // send() can write all of it before it returns, so the peer may finish
+    // reading before the loop thread stores the result: wait for the store.
+    assert(spin_until_for([&] { return accepted.load(); }));
 
     pass("tcp_connection: one send larger than the high water still goes on an empty queue");
 }
