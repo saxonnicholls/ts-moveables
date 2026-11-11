@@ -34,28 +34,32 @@ CORE_INCLUDE = re.compile(r'^\s*#\s*include\s+<(snicholls/core/[^>]+)>')
 CORE_ROOT = os.path.join(ROOT, "third_party", "core", "include")
 
 
-def find_header(name):
-    """Headers live in subdirectories now, and an include may be written
-    relative to the including file, so resolve on basename across the tree."""
+def find_header(name, from_dir):
+    """An include as the compiler resolves it: relative to the including file first, then from TSMoveables/.
+    Two headers may share a basename (concepts/task_pool.hpp is the twin of interfaces/task_pool.hpp), so a
+    header is known by its path; the basename search is a last resort, and refuses an ambiguous name."""
+    for base_dir in (from_dir, SRC):
+        if base_dir:
+            p = os.path.normpath(os.path.join(base_dir, name))
+            if os.path.isfile(p) and p.startswith(SRC + os.sep):
+                return p
     base = os.path.basename(name)
-    direct = os.path.join(SRC, name)
-    if os.path.isfile(direct):
-        return direct
-    for root, _dirs, files in os.walk(SRC):
-        if base in files:
-            return os.path.join(root, base)
-    return None
+    hits = [os.path.join(r, base) for r, _d, files in os.walk(SRC) if base in files]
+    if len(hits) > 1:
+        raise SystemExit("amalgamate: '{}' is ambiguous ({}); include it by its path".format(
+            name, ", ".join(os.path.relpath(h, SRC) for h in hits)))
+    return hits[0] if hits else None
 
 
-def expand(name, seen, out, stack):
-    name = os.path.basename(name)
+def expand(name, seen, out, stack, from_dir=None):
+    path = find_header(name, from_dir)
+    if not path:
+        raise SystemExit("amalgamate: no such header: " + name)
+    name = os.path.relpath(path, SRC)   # each header once, by its path under TSMoveables/
     if name in seen:
         return
     if name in stack:
         raise SystemExit("amalgamate: include cycle through " + name)
-    path = find_header(name)
-    if not path:
-        raise SystemExit("amalgamate: no such header: " + name)
 
     seen.add(name)
     stack.append(name)
@@ -68,7 +72,7 @@ def expand(name, seen, out, stack):
             c = CORE_INCLUDE.match(line)
             if m:
                 out.append("// (inlined) " + line.rstrip("\n"))
-                expand(m.group(1), seen, out, stack)
+                expand(m.group(1), seen, out, stack, os.path.dirname(path))
             elif c:
                 out.append("// (inlined) " + line.rstrip("\n"))
                 expand_core(c.group(1), seen, out)

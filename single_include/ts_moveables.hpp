@@ -103,7 +103,7 @@ constexpr const char* version_string() noexcept { return SNICHOLLS_VERSION_STRIN
 // end version.hpp
 // (inlined) #include "moveable/atomic.hpp"              // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin atomic.hpp
+// begin moveable/atomic.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_atomic.hpp
@@ -309,10 +309,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_atomic_hpp */
-// end atomic.hpp
+// end moveable/atomic.hpp
 // (inlined) #include "moveable/mutex.hpp"               // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin mutex.hpp
+// begin moveable/mutex.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_mutex.hpp
@@ -433,10 +433,10 @@ namespace snicholls
 
 
 #endif /* moveable_mutex_hpp */
-// end mutex.hpp
+// end moveable/mutex.hpp
 // (inlined) #include "moveable/spin_lock.hpp"           // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin spin_lock.hpp
+// begin moveable/spin_lock.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_spin_lock.hpp
@@ -454,7 +454,7 @@ namespace snicholls
 
 // (inlined) #include "../utils/cpu_relax.hpp"
 // ----------------------------------------------------------------------
-// begin cpu_relax.hpp
+// begin utils/cpu_relax.hpp
 // ----------------------------------------------------------------------
 //
 //  utils/cpu_relax.hpp
@@ -520,7 +520,7 @@ inline void cpu_relax() noexcept
 } // namespace snicholls
 
 #endif /* ts_moveables_utils_cpu_relax_hpp */
-// end cpu_relax.hpp
+// end utils/cpu_relax.hpp
 
 #include <atomic>
 #include <thread>
@@ -604,10 +604,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_spin_lock_hpp */
-// end spin_lock.hpp
+// end moveable/spin_lock.hpp
 // (inlined) #include "moveable/condition_variable.hpp"  // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin condition_variable.hpp
+// begin moveable/condition_variable.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_condition_variable.hpp
@@ -739,10 +739,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_condition_variable_hpp */
-// end condition_variable.hpp
+// end moveable/condition_variable.hpp
 // (inlined) #include "moveable/once_flag.hpp"           // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin once_flag.hpp
+// begin moveable/once_flag.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_once_flag.hpp
@@ -842,10 +842,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_once_flag_hpp */
-// end once_flag.hpp
+// end moveable/once_flag.hpp
 // (inlined) #include "moveable/semaphore.hpp"           // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin semaphore.hpp
+// begin moveable/semaphore.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_semaphore.hpp
@@ -979,10 +979,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_semaphore_hpp */
-// end semaphore.hpp
+// end moveable/semaphore.hpp
 // (inlined) #include "moveable/latch.hpp"               // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin latch.hpp
+// begin moveable/latch.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_latch.hpp
@@ -1105,10 +1105,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_latch_hpp */
-// end latch.hpp
+// end moveable/latch.hpp
 // (inlined) #include "moveable/barrier.hpp"             // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin barrier.hpp
+// begin moveable/barrier.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_barrier.hpp
@@ -1248,10 +1248,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_barrier_hpp */
-// end barrier.hpp
+// end moveable/barrier.hpp
 // (inlined) #include "concurrent/circular_buffer.hpp"              // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin circular_buffer.hpp
+// begin concurrent/circular_buffer.hpp
 // ----------------------------------------------------------------------
 //
 //  circular_buffer.hpp
@@ -1635,10 +1635,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* circular_buffer_hpp */
-// end circular_buffer.hpp
+// end concurrent/circular_buffer.hpp
 // (inlined) #include "concurrent/intern_pool.hpp"                  // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin intern_pool.hpp
+// begin concurrent/intern_pool.hpp
 // ----------------------------------------------------------------------
 //
 //  intern_pool.hpp
@@ -1846,10 +1846,10 @@ private:
 };
 
 } // namespace snicholls
-// end intern_pool.hpp
+// end concurrent/intern_pool.hpp
 // (inlined) #include "concurrent/mpmc_queue.hpp"                   // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin mpmc_queue.hpp
+// begin concurrent/mpmc_queue.hpp
 // ----------------------------------------------------------------------
 //
 //  mpmc_queue.hpp
@@ -2073,10 +2073,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* mpmc_queue_hpp */
-// end mpmc_queue.hpp
+// end concurrent/mpmc_queue.hpp
 // (inlined) #include "concurrent/disruptor.hpp"                    // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin disruptor.hpp
+// begin concurrent/disruptor.hpp
 // ----------------------------------------------------------------------
 //
 //  disruptor.hpp
@@ -2710,10 +2710,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* disruptor_hpp */
-// end disruptor.hpp
+// end concurrent/disruptor.hpp
 // (inlined) #include "concurrent/seqlock.hpp"                      // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin seqlock.hpp
+// begin concurrent/seqlock.hpp
 // ----------------------------------------------------------------------
 //
 //  seqlock.hpp
@@ -2950,10 +2950,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* ts_moveables_concurrent_seqlock_hpp */
-// end seqlock.hpp
+// end concurrent/seqlock.hpp
 // (inlined) #include "moveable/signal.hpp"              // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin signal.hpp
+// begin moveable/signal.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_signal.hpp
@@ -3206,10 +3206,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_signal_hpp */
-// end signal.hpp
+// end moveable/signal.hpp
 // (inlined) #include "logging/logger.hpp"                      // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin logger.hpp
+// begin logging/logger.hpp
 // ----------------------------------------------------------------------
 //
 //  logging.hpp
@@ -3314,7 +3314,7 @@ namespace snicholls
 // (inlined) #include "../concurrent/mpmc_queue.hpp"
 // (inlined) #include "../utils/json.hpp"
 // ----------------------------------------------------------------------
-// begin json.hpp
+// begin utils/json.hpp
 // ----------------------------------------------------------------------
 //
 //  utils/json.hpp
@@ -3388,7 +3388,7 @@ inline void json_escape(std::string_view in, std::string& out)
 } // namespace snicholls
 
 #endif /* ts_moveables_utils_json_hpp */
-// end json.hpp
+// end utils/json.hpp
 
 #include <atomic>
 #include <chrono>
@@ -4477,10 +4477,10 @@ private:
 #define SN_LOG_CRITICAL() SN_LOGGER_CRITICAL(::snicholls::log::default_logger())
 
 #endif /* logging_hpp */
-// end logger.hpp
+// end logging/logger.hpp
 // (inlined) #include "concurrent/thread_pool.hpp"                  // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin thread_pool.hpp
+// begin concurrent/thread_pool.hpp
 // ----------------------------------------------------------------------
 //
 //  thread_pool.hpp
@@ -4512,7 +4512,7 @@ private:
 // (inlined) #include "../moveable/condition_variable.hpp"
 // (inlined) #include "synchronized.hpp"
 // ----------------------------------------------------------------------
-// begin synchronized.hpp
+// begin concurrent/synchronized.hpp
 // ----------------------------------------------------------------------
 //
 //  synchronized.hpp
@@ -4793,12 +4793,51 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* synchronized_hpp */
-// end synchronized.hpp
+// end concurrent/synchronized.hpp
 // (inlined) #include "circular_buffer.hpp"
 // (inlined) #include "mpmc_queue.hpp"
 // (inlined) #include "../interfaces/task_pool.hpp"
 // ----------------------------------------------------------------------
-// begin task_pool.hpp
+// begin interfaces/task_pool.hpp
+// ----------------------------------------------------------------------
+//
+//  interfaces/task_pool.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Somewhere to submit work - the interface the thread pools share.
+//
+//  It is here on its own because the point of the pools was always
+//  *comparison*: one shared queue versus sharded versus work-stealing, weighed
+//  through a common surface. Code that only needs "somewhere to run this"
+//  should depend on that surface, not on five implementations.
+//
+
+#ifndef interfaces_task_pool_hpp
+#define interfaces_task_pool_hpp
+
+#include <cstddef>
+#include <functional>
+
+namespace snicholls
+{
+    struct task_pool {
+        using task = std::function<void()>;
+
+        virtual ~task_pool() = default;
+
+        virtual void submit(task t) = 0;                    // enqueue work
+        virtual void wait_idle() = 0;                       // block until all submitted work has run
+        virtual std::size_t worker_count() const noexcept = 0;
+    };
+} // namespace snicholls
+
+#endif /* interfaces_task_pool_hpp */
+// end interfaces/task_pool.hpp
+// (inlined) #include "../concepts/task_pool.hpp"
+// ----------------------------------------------------------------------
+// begin concepts/task_pool.hpp
 // ----------------------------------------------------------------------
 //
 //  concepts/task_pool.hpp
@@ -4984,11 +5023,10 @@ static_assert(snicholls::pool_task<snicholls::task_pool::task> && !snicholls::po
 static_assert(snicholls::is_pool_task_v<snicholls::task_pool::task> && !snicholls::is_pool_task_v<int>);
 
 #endif /* concepts_task_pool_hpp */
-// end task_pool.hpp
-// (inlined) #include "../concepts/task_pool.hpp"
+// end concepts/task_pool.hpp
 // (inlined) #include "work_stealing_deque.hpp"
 // ----------------------------------------------------------------------
-// begin work_stealing_deque.hpp
+// begin concurrent/work_stealing_deque.hpp
 // ----------------------------------------------------------------------
 //
 //  work_stealing_deque.hpp
@@ -5155,7 +5193,7 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* work_stealing_deque_hpp */
-// end work_stealing_deque.hpp
+// end concurrent/work_stealing_deque.hpp
 
 namespace snicholls
 {
@@ -5703,10 +5741,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* thread_pool_hpp */
-// end thread_pool.hpp
+// end concurrent/thread_pool.hpp
 // (inlined) #include "concurrent/task_group.hpp"                   // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin task_group.hpp
+// begin concurrent/task_group.hpp
 // ----------------------------------------------------------------------
 //
 //  task_group.hpp
@@ -5986,10 +6024,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* task_group_hpp */
-// end task_group.hpp
+// end concurrent/task_group.hpp
 // (inlined) #include "concurrent/parallel_for.hpp"                 // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin parallel_for.hpp
+// begin concurrent/parallel_for.hpp
 // ----------------------------------------------------------------------
 //
 //  parallel_for.hpp
@@ -6835,10 +6873,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* parallel_for_hpp */
-// end parallel_for.hpp
+// end concurrent/parallel_for.hpp
 // (inlined) #include "concurrent/task_graph.hpp"                   // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin task_graph.hpp
+// begin concurrent/task_graph.hpp
 // ----------------------------------------------------------------------
 //
 //  task_graph.hpp
@@ -7078,10 +7116,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* task_graph_hpp */
-// end task_graph.hpp
+// end concurrent/task_graph.hpp
 // (inlined) #include "net/tcp.hpp"                                 // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin tcp.hpp
+// begin net/tcp.hpp
 // ----------------------------------------------------------------------
 //
 //  net/tcp.hpp
@@ -7166,7 +7204,7 @@ namespace snicholls
 
 // (inlined) #include "../event/loop.hpp"
 // ----------------------------------------------------------------------
-// begin loop.hpp
+// begin event/loop.hpp
 // ----------------------------------------------------------------------
 //
 //  event_loop.hpp
@@ -7227,7 +7265,7 @@ namespace snicholls
 
 // (inlined) #include "clock.hpp"
 // ----------------------------------------------------------------------
-// begin clock.hpp
+// begin event/clock.hpp
 // ----------------------------------------------------------------------
 //
 //  event/clock.hpp
@@ -7509,7 +7547,7 @@ private:
 } // namespace snicholls
 
 #endif /* event_clock_hpp */
-// end clock.hpp
+// end event/clock.hpp
 // (inlined) #include "../moveable/signal.hpp"
 // (inlined) #include "../concurrent/mpmc_queue.hpp"
 
@@ -8294,10 +8332,10 @@ namespace snicholls
 
 #endif // !defined(_WIN32)
 #endif /* event_loop_hpp */
-// end loop.hpp
+// end event/loop.hpp
 // (inlined) #include "../interfaces/transport_delegate.hpp"
 // ----------------------------------------------------------------------
-// begin transport_delegate.hpp
+// begin interfaces/transport_delegate.hpp
 // ----------------------------------------------------------------------
 //
 //  interfaces/transport_delegate.hpp
@@ -8377,7 +8415,7 @@ public:
 } // namespace snicholls
 
 #endif /* interfaces_transport_delegate_hpp */
-// end transport_delegate.hpp
+// end interfaces/transport_delegate.hpp
 
 #include <chrono>
 #include <algorithm>
@@ -9403,10 +9441,10 @@ private:
 
 #endif // SNICHOLLS_HAS_TCP
 #endif /* net_tcp_hpp */
-// end tcp.hpp
+// end net/tcp.hpp
 // (inlined) #include "utils/constexpr_for.hpp"                    // IWYU pragma: export (forwards to snicholls-core)
 // ----------------------------------------------------------------------
-// begin constexpr_for.hpp
+// begin utils/constexpr_for.hpp
 // ----------------------------------------------------------------------
 //
 //  constexpr_for.hpp
@@ -9490,11 +9528,11 @@ private:
 // (inlined) #include <snicholls/core/constexpr_for.hpp>
 
 #endif /* constexpr_for_hpp */
-// end constexpr_for.hpp
+// end utils/constexpr_for.hpp
 // (inlined) #include "event/loop.hpp"                   // IWYU pragma: export (self-disables on Windows)
 // (inlined) #include "event/time_master.hpp"                  // IWYU pragma: export (a scheduler on it)
 // ----------------------------------------------------------------------
-// begin time_master.hpp
+// begin event/time_master.hpp
 // ----------------------------------------------------------------------
 //
 //  time_master.hpp
@@ -9676,10 +9714,10 @@ private:
 
 #endif // SNICHOLLS_HAS_EVENT_LOOP
 #endif /* time_master_hpp */
-// end time_master.hpp
+// end event/time_master.hpp
 // (inlined) #include "http/server.hpp"                  // IWYU pragma: export (follows the event loop)
 // ----------------------------------------------------------------------
-// begin server.hpp
+// begin http/server.hpp
 // ----------------------------------------------------------------------
 //
 //  http_server.hpp
@@ -9772,7 +9810,7 @@ private:
 
 // (inlined) #include "message.hpp"
 // ----------------------------------------------------------------------
-// begin message.hpp
+// begin http/message.hpp
 // ----------------------------------------------------------------------
 //
 //  http/message.hpp
@@ -10233,10 +10271,10 @@ public:
 } // namespace snicholls
 
 #endif /* http_message_hpp */
-// end message.hpp
+// end http/message.hpp
 // (inlined) #include "parser.hpp"
 // ----------------------------------------------------------------------
-// begin parser.hpp
+// begin http/parser.hpp
 // ----------------------------------------------------------------------
 //
 //  http/parser.hpp
@@ -10796,10 +10834,10 @@ private:
 } // namespace snicholls
 
 #endif /* http_parser_hpp */
-// end parser.hpp
+// end http/parser.hpp
 // (inlined) #include "config.hpp"
 // ----------------------------------------------------------------------
-// begin config.hpp
+// begin http/config.hpp
 // ----------------------------------------------------------------------
 //
 //  http/config.hpp
@@ -11073,10 +11111,10 @@ struct origin_policy {
 } // namespace snicholls
 
 #endif /* http_config_hpp */
-// end config.hpp
+// end http/config.hpp
 // (inlined) #include "../interfaces/protocol_delegate.hpp"
 // ----------------------------------------------------------------------
-// begin protocol_delegate.hpp
+// begin interfaces/protocol_delegate.hpp
 // ----------------------------------------------------------------------
 //
 //  interfaces/protocol_delegate.hpp
@@ -11190,7 +11228,7 @@ public:
 } // namespace snicholls
 
 #endif /* interfaces_protocol_delegate_hpp */
-// end protocol_delegate.hpp
+// end interfaces/protocol_delegate.hpp
 
 namespace snicholls {
 namespace http {
@@ -12872,10 +12910,10 @@ private:
 
 #endif // SNICHOLLS_HAS_EVENT_LOOP
 #endif /* http_server_hpp */
-// end server.hpp
+// end http/server.hpp
 // (inlined) #include "http/http2.hpp"                       // IWYU pragma: export (a protocol delegate too)
 // ----------------------------------------------------------------------
-// begin http2.hpp
+// begin http/http2.hpp
 // ----------------------------------------------------------------------
 //
 //  http2.hpp
@@ -15242,10 +15280,10 @@ inline void enable_http2_only(server& srv, h2_config cfg = h2_config{})
 
 #endif // SNICHOLLS_HAS_HTTP_SERVER
 #endif /* http2_hpp */
-// end http2.hpp
+// end http/http2.hpp
 // (inlined) #include "http/websocket.hpp"                    // IWYU pragma: export (a protocol delegate on it)
 // ----------------------------------------------------------------------
-// begin websocket.hpp
+// begin http/websocket.hpp
 // ----------------------------------------------------------------------
 //
 //  websocket.hpp
@@ -15289,7 +15327,7 @@ inline void enable_http2_only(server& srv, h2_config cfg = h2_config{})
 // (inlined) #include "server.hpp"
 // (inlined) #include "../interfaces/ws_extension.hpp"
 // ----------------------------------------------------------------------
-// begin ws_extension.hpp
+// begin interfaces/ws_extension.hpp
 // ----------------------------------------------------------------------
 //
 //  interfaces/ws_extension.hpp
@@ -15335,7 +15373,7 @@ public:
 } // namespace snicholls
 
 #endif /* interfaces_ws_extension_hpp */
-// end ws_extension.hpp
+// end interfaces/ws_extension.hpp
 
 #if !SNICHOLLS_HAS_HTTP_SERVER
 #define SNICHOLLS_HAS_WEBSOCKET 0
@@ -16113,10 +16151,10 @@ inline handler websocket_route(ws_handler on_open, ws_config cfg = ws_config{})
 
 #endif // SNICHOLLS_HAS_HTTP_SERVER
 #endif /* websocket_hpp */
-// end websocket.hpp
+// end http/websocket.hpp
 // (inlined) #include "http/ws_broadcast_hub.hpp"             // IWYU pragma: export (fan-out over that)
 // ----------------------------------------------------------------------
-// begin ws_broadcast_hub.hpp
+// begin http/ws_broadcast_hub.hpp
 // ----------------------------------------------------------------------
 //
 //  ws_broadcast_hub.hpp
@@ -16232,7 +16270,7 @@ inline handler websocket_route(ws_handler on_open, ws_config cfg = ws_config{})
 // (inlined) #include "../utils/json.hpp"
 // (inlined) #include "../utils/time.hpp"
 // ----------------------------------------------------------------------
-// begin time.hpp
+// begin utils/time.hpp
 // ----------------------------------------------------------------------
 //
 //  utils/time.hpp
@@ -16272,7 +16310,7 @@ inline std::uint64_t unix_millis() noexcept
 } // namespace snicholls
 
 #endif /* ts_moveables_utils_time_hpp */
-// end time.hpp
+// end utils/time.hpp
 
 #include <atomic>
 #include <chrono>
@@ -17051,10 +17089,10 @@ private:
 } // namespace snicholls
 
 #endif // SNICHOLLS_HAS_WEBSOCKET
-// end ws_broadcast_hub.hpp
+// end http/ws_broadcast_hub.hpp
 // (inlined) #include "http/websocket_client.hpp"            // IWYU pragma: export (the outbound half)
 // ----------------------------------------------------------------------
-// begin websocket_client.hpp
+// begin http/websocket_client.hpp
 // ----------------------------------------------------------------------
 //
 //  websocket_client.hpp
@@ -18037,11 +18075,11 @@ private:
 
 #endif /* SNICHOLLS_HAS_WEBSOCKET */
 #endif /* ts_moveables_websocket_client_hpp */
-// end websocket_client.hpp
+// end http/websocket_client.hpp
 // (inlined) #include "concurrent/synchronized.hpp"                 // IWYU pragma: export
 // (inlined) #include "concurrent/synchronized_heterogeneous.hpp"   // IWYU pragma: export
 // ----------------------------------------------------------------------
-// begin synchronized_heterogeneous.hpp
+// begin concurrent/synchronized_heterogeneous.hpp
 // ----------------------------------------------------------------------
 //
 //  synchronized_heterogeneous.hpp
@@ -18378,7 +18416,7 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* synchronized_heterogeneous_hpp */
-// end synchronized_heterogeneous.hpp
+// end concurrent/synchronized_heterogeneous.hpp
 
 #endif /* ts_moveables_hpp */
 // end ts_moveables.hpp

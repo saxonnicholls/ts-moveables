@@ -15,7 +15,7 @@
 #pragma once
 
 // ----------------------------------------------------------------------
-// begin server.hpp
+// begin http/server.hpp
 // ----------------------------------------------------------------------
 //
 //  http_server.hpp
@@ -135,7 +135,7 @@ constexpr const char* version_string() noexcept { return SNICHOLLS_VERSION_STRIN
 // end version.hpp
 // (inlined) #include "../event/loop.hpp"
 // ----------------------------------------------------------------------
-// begin loop.hpp
+// begin event/loop.hpp
 // ----------------------------------------------------------------------
 //
 //  event_loop.hpp
@@ -196,7 +196,7 @@ constexpr const char* version_string() noexcept { return SNICHOLLS_VERSION_STRIN
 
 // (inlined) #include "clock.hpp"
 // ----------------------------------------------------------------------
-// begin clock.hpp
+// begin event/clock.hpp
 // ----------------------------------------------------------------------
 //
 //  event/clock.hpp
@@ -478,10 +478,10 @@ private:
 } // namespace snicholls
 
 #endif /* event_clock_hpp */
-// end clock.hpp
+// end event/clock.hpp
 // (inlined) #include "../moveable/signal.hpp"
 // ----------------------------------------------------------------------
-// begin signal.hpp
+// begin moveable/signal.hpp
 // ----------------------------------------------------------------------
 //
 //  moveable_signal.hpp
@@ -734,10 +734,10 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* moveable_signal_hpp */
-// end signal.hpp
+// end moveable/signal.hpp
 // (inlined) #include "../concurrent/mpmc_queue.hpp"
 // ----------------------------------------------------------------------
-// begin mpmc_queue.hpp
+// begin concurrent/mpmc_queue.hpp
 // ----------------------------------------------------------------------
 //
 //  mpmc_queue.hpp
@@ -961,7 +961,7 @@ namespace snicholls
 } // namespace snicholls
 
 #endif /* mpmc_queue_hpp */
-// end mpmc_queue.hpp
+// end concurrent/mpmc_queue.hpp
 
 namespace snicholls
 {
@@ -1744,10 +1744,10 @@ namespace snicholls
 
 #endif // !defined(_WIN32)
 #endif /* event_loop_hpp */
-// end loop.hpp
+// end event/loop.hpp
 // (inlined) #include "../interfaces/transport_delegate.hpp"
 // ----------------------------------------------------------------------
-// begin transport_delegate.hpp
+// begin interfaces/transport_delegate.hpp
 // ----------------------------------------------------------------------
 //
 //  interfaces/transport_delegate.hpp
@@ -1827,7 +1827,7 @@ public:
 } // namespace snicholls
 
 #endif /* interfaces_transport_delegate_hpp */
-// end transport_delegate.hpp
+// end interfaces/transport_delegate.hpp
 // (inlined) #include "../moveable/signal.hpp"
 
 #if !SNICHOLLS_HAS_EVENT_LOOP
@@ -1870,7 +1870,7 @@ public:
 
 // (inlined) #include "message.hpp"
 // ----------------------------------------------------------------------
-// begin message.hpp
+// begin http/message.hpp
 // ----------------------------------------------------------------------
 //
 //  http/message.hpp
@@ -2331,10 +2331,10 @@ public:
 } // namespace snicholls
 
 #endif /* http_message_hpp */
-// end message.hpp
+// end http/message.hpp
 // (inlined) #include "parser.hpp"
 // ----------------------------------------------------------------------
-// begin parser.hpp
+// begin http/parser.hpp
 // ----------------------------------------------------------------------
 //
 //  http/parser.hpp
@@ -2894,10 +2894,10 @@ private:
 } // namespace snicholls
 
 #endif /* http_parser_hpp */
-// end parser.hpp
+// end http/parser.hpp
 // (inlined) #include "config.hpp"
 // ----------------------------------------------------------------------
-// begin config.hpp
+// begin http/config.hpp
 // ----------------------------------------------------------------------
 //
 //  http/config.hpp
@@ -3171,10 +3171,10 @@ struct origin_policy {
 } // namespace snicholls
 
 #endif /* http_config_hpp */
-// end config.hpp
+// end http/config.hpp
 // (inlined) #include "../interfaces/protocol_delegate.hpp"
 // ----------------------------------------------------------------------
-// begin protocol_delegate.hpp
+// begin interfaces/protocol_delegate.hpp
 // ----------------------------------------------------------------------
 //
 //  interfaces/protocol_delegate.hpp
@@ -3288,7 +3288,7 @@ public:
 } // namespace snicholls
 
 #endif /* interfaces_protocol_delegate_hpp */
-// end protocol_delegate.hpp
+// end interfaces/protocol_delegate.hpp
 
 namespace snicholls {
 namespace http {
@@ -4970,4 +4970,4 @@ private:
 
 #endif // SNICHOLLS_HAS_EVENT_LOOP
 #endif /* http_server_hpp */
-// end server.hpp
+// end http/server.hpp

@@ -20,8 +20,8 @@
 #  on that list leaks in (it would force -lz or -lssl on everyone). It also
 #  fails on:
 #
-#    - two headers sharing a basename: amalgamate.py expands each basename
-#      once, so the second would be silently dropped;
+#    (Two headers may share a basename - concepts/task_pool.hpp is the twin of
+#    interfaces/task_pool.hpp - because amalgamate.py knows each by its path.)
 #    - a file in single_include/ that no target regenerates: the drift check
 #      only notices files `make amalgamate` rewrites, so an orphan rots in
 #      place - which is how ts_server.hpp sat at 1.1 through 1.2.1.
@@ -33,7 +33,6 @@
 
 import os
 import sys
-from collections import defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "TSMoveables")
@@ -55,7 +54,7 @@ GENERATED = {
 
 
 def begun(path):
-    """Basenames amalgamate.py expanded into `path` (its '// begin x' markers)."""
+    """Headers amalgamate.py expanded into `path`, by their path under TSMoveables/ (its '// begin x' markers)."""
     with open(path, "r", encoding="utf-8") as f:
         return {line[len("// begin "):].strip()
                 for line in f if line.startswith("// begin ")}
@@ -71,26 +70,17 @@ def main():
 
     problems = []
 
-    by_base = defaultdict(list)
-    for h in headers:
-        by_base[os.path.basename(h)].append(h)
-    for base, paths in sorted(by_base.items()):
-        if len(paths) > 1:
-            problems.append("basename '{}' is shared by {} - amalgamate.py would keep only one"
-                            .format(base, ", ".join(paths)))
-
     for stale in sorted(OPT_IN - set(headers)):
         problems.append("OPT_IN names '{}', which no longer exists".format(stale))
 
     umbrella = os.path.join(SINGLE, "ts_moveables.hpp")
     inside = begun(umbrella)
     for h in headers:
-        base = os.path.basename(h)
         if h in OPT_IN:
-            if base in inside:
+            if h in inside:
                 problems.append("opt-in '{}' is inside ts_moveables.hpp - it would force its "
                                 "library on every user".format(h))
-        elif base not in inside:
+        elif h not in inside:
             problems.append("'{}' is missing from single_include/ts_moveables.hpp - include it "
                             "from TSMoveables/ts_moveables.hpp, or add it to OPT_IN".format(h))
 
@@ -98,7 +88,7 @@ def main():
         path = os.path.join(SINGLE, name)
         if not os.path.isfile(path):
             problems.append("single_include/{} is missing - run 'make amalgamate'".format(name))
-        elif os.path.basename(entry) not in begun(path):
+        elif entry not in begun(path):
             problems.append("single_include/{} does not contain its entry {}".format(name, entry))
 
     for name in sorted(os.listdir(SINGLE)):
