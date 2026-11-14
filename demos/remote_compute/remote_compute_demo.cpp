@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <future>
 #include <set>
 #include <string>
@@ -255,6 +256,9 @@ int selftest(bool lan)
     // 14. A machine that stops answering pings has its jobs failed, not left hanging
     {
         auto silent = snicholls::net::tcp_listener::bind("127.0.0.1", 0);
+        // The fake stays silent until the client has given up. A fixed 3 s was a race on a slow runner: when the
+        // close came first, the job failed as "connection lost" instead of "unresponsive".
+        std::atomic<bool> given_up{false};
         std::thread fake([&] {
             // Pass the handshake like a real worker, then answer nothing at all
             auto s = silent.accept(2s);
@@ -275,8 +279,8 @@ int selftest(bool lan)
             const auto w = r::detail::frame_bytes(r::frame_kind::welcome, "frozen", r::detail::protocol_signature, welcome);
             s.write_all(w.data(), w.size(), 1s);
             char sink_buf[4096];
-            const auto until = std::chrono::steady_clock::now() + 3s;
-            while (std::chrono::steady_clock::now() < until)   // read everything, answer nothing
+            const auto until = std::chrono::steady_clock::now() + 15s;   // a backstop, not the timing under test
+            while (!given_up.load() && std::chrono::steady_clock::now() < until)   // read everything, answer nothing
                 s.read(sink_buf, sizeof sink_buf, 100ms);
         });
         r::cluster<kernels> frozen(key);
@@ -286,8 +290,11 @@ int selftest(bool lan)
         auto f = frozen.async(r::on{"frozen"}, add, 1, 2);
         const auto t0 = std::chrono::steady_clock::now();
         const auto e = error_of([&] { f.get(); });
+        given_up = true;
         check(contains(e, "unresponsive") && contains(e, "did not come back"),
               "a worker that stops answering pings fails its jobs as unresponsive, after the resume window");
+        if (!(contains(e, "unresponsive") && contains(e, "did not come back")))
+            std::printf("        (the job failed with: %s)\n", e.c_str());
         // Configured: ~1 s (600 ms silence + 400 ms resume window). The
         // defaults would be 10 s + 60 s. 10 s tells the two apart even on a
         // slow CI runner, where 2.5 s did not.
