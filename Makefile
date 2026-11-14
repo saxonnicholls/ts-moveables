@@ -296,7 +296,7 @@ demo-remote: build/remote_compute_demo
 	./build/remote_compute_demo selftest --no-lan
 
 tsan-remote: build/remote_compute_demo_tsan
-	TSAN_OPTIONS="halt_on_error=1" ./build/remote_compute_demo_tsan selftest --no-lan
+	TSAN_OPTIONS="suppressions=tests/tsan.supp halt_on_error=1" ./build/remote_compute_demo_tsan selftest --no-lan
 
 # Where the time in a remote call goes, layer by layer, on loopback
 bench-remote: build/remote_compute_bench

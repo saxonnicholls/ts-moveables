@@ -12,3 +12,10 @@ mutex:std::timed_mutex::unlock
 mutex:std::recursive_timed_mutex::unlock
 mutex:std::shared_timed_mutex::unlock
 mutex:std::shared_timed_mutex::unlock_shared
+
+# libsupc++ frees an exception held by std::exception_ptr when its last reference goes, through an atomic
+# reference count inside the (uninstrumented) runtime, so TSan never sees the synchronisation. A thread that
+# catches an exception from std::future::get() and reads it can then be reported against the thread that later
+# drops the last std::promise holding it (GCC 15 on ubuntu-26.04 runners, remote_compute_demo). Scoped to that
+# release path: any other race involving the exception object still reports.
+race:std::__exception_ptr::exception_ptr::_M_release
