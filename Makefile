@@ -258,7 +258,7 @@ demo-timemaster: build/time_master_demo
 demo-http: build/http_server_demo
 	./build/http_server_demo
 
-build/bwt_dna_demo: demos/bwt_dna_demo.cpp $(HEADERS) | build
+build/bwt_dna_demo: demos/bwt_dna_demo.cpp demos/text_index/suffix_array.hpp $(HEADERS) | build
 	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -pedantic -O3 -DNDEBUG -pthread \
 	    demos/bwt_dna_demo.cpp -o $@ $(LDLIBS)
 
@@ -301,6 +301,44 @@ tsan-remote: build/remote_compute_demo_tsan
 # Where the time in a remote call goes, layer by layer, on loopback
 bench-remote: build/remote_compute_bench
 	./build/remote_compute_bench
+
+# Memory-mapped storage (TSMoveables/mmap/): C++20 and POSIX, like the remote
+# demo, so its tests are a program of their own rather than part of build/tests
+# (which also builds as C++17). Needs snicholls-core with containers/
+# index_pool.hpp and mapped_header.hpp. `make test-mmap` runs them; set
+# TSM_MMAP_SMALL_FS to a small filesystem to include the full-disk test.
+MMAP_HDRS := $(wildcard TSMoveables/mmap/*.hpp)
+MMAP_INC  := $(CORE_INC) -ITSMoveables
+
+build/tests_mmap: tests/mmap/tests_mmap.cpp $(MMAP_HDRS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) \
+	    tests/mmap/tests_mmap.cpp -o $@ $(LDLIBS)
+
+build/tests_mmap_asan: tests/mmap/tests_mmap.cpp $(MMAP_HDRS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O1 -g -fsanitize=address,undefined \
+	    -fno-sanitize-recover=all tests/mmap/tests_mmap.cpp -o $@ $(LDLIBS)
+
+build/mmap_bench: benchmarks/mmap_bench.cpp $(MMAP_HDRS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O3 -DNDEBUG $(EXTRA_FLAGS) \
+	    benchmarks/mmap_bench.cpp -o $@ $(LDLIBS)
+
+# The persistent full-text index (demos/text_index): a suffix array in
+# mapped files, built once and reopened in microseconds. Self-verifying.
+build/persistent_index_demo: demos/text_index/persistent_index_demo.cpp demos/text_index/suffix_array.hpp $(MMAP_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O3 -DNDEBUG $(EXTRA_FLAGS) -pthread \
+	    demos/text_index/persistent_index_demo.cpp -o $@ $(LDLIBS)
+
+demo-text-index: build/persistent_index_demo
+	./build/persistent_index_demo
+
+test-mmap: build/tests_mmap
+	./build/tests_mmap
+
+asan-mmap: build/tests_mmap_asan
+	./build/tests_mmap_asan
+
+bench-mmap: build/mmap_bench
+	./build/mmap_bench
 
 # Byte-level BPE (demos/tokenizer): C++20, like the remote demo. Needs a data
 # directory from scripts/tokenizer/prepare.py (Python, with tiktoken and
@@ -428,4 +466,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap demo-text-index amalgamate check-amalgamate clean

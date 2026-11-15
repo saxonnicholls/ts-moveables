@@ -7,6 +7,27 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Added
+
+- **Memory-mapped storage** (`TSMoveables/mmap/`, C++20 and POSIX, opt-in: not in the single header).
+  `mapped_region` reserves address space once and grows a file inside it without moving, preallocating the blocks
+  first so a full disk is ENOSPC rather than SIGBUS. `mapped_vector<T>` is a growable array in a file behind core's
+  checksummed header: it reopens in an `mmap` and a header check, refuses a file of another type or a torn header,
+  and makes its size durable at `flush()`. `mapped_pool<T>` is core's `index_pool` in a file. `mapped_memory_resource`
+  is a bump `std::pmr::memory_resource` over a region, for `object_pool` and pmr containers. `make test-mmap`,
+  `make asan-mmap`, `make bench-mmap`; the README's new section covers the benefits, the costs and when to use each.
+- **`persistent_index_demo`** (`demos/text_index/`, `make demo-text-index`): a full-text suffix-array index in three
+  `mapped_vector`s. The build is parallel and checkpointed every round, so it resumes after a kill; later runs
+  reopen it in about 0.3 ms and search it in microseconds. The suffix-array code moved to
+  `demos/text_index/suffix_array.hpp`, which `bwt_dna_demo` now shares.
+
+### Changed
+
+- **snicholls-core 0.8.0 is the minimum** (`snicholls_core_require`), for the mapped header, `index_pool`,
+  `offset_ptr` and `object_pool` on a `memory_resource` that `mmap/` builds on.
+
 ## [1.6.0] — 2026-11-11
 
 ### Added

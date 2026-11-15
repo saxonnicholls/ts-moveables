@@ -18,3 +18,6 @@ xcuserdata/
 # See scratch/README.md. Anything here that starts backing a claim in the
 # README should be promoted to a real benchmarks/ target so CI keeps it honest.
 scratch/
+
+# Local, unpublished agent instructions (they name private paths)
+CLAUDE.local.md

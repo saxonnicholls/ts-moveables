@@ -44,6 +44,13 @@ OPT_IN = {
     "tls/openssl.hpp",             # -lssl -lcrypto
     "tls/mbedtls.hpp",             # -lmbedtls
     "http/websocket_deflate.hpp",  # -lz
+    # memory-mapped storage: C++20 and POSIX, and it needs snicholls-core's
+    # containers beyond the one core header the single include ships
+    "mmap/mapped_error.hpp",
+    "mmap/mapped_memory_resource.hpp",
+    "mmap/mapped_pool.hpp",
+    "mmap/mapped_region.hpp",
+    "mmap/mapped_vector.hpp",
 }
 
 # (output, entry) - must match the `amalgamate` target in the Makefile

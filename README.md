@@ -349,6 +349,132 @@ every publish costs more than the allocation a hit would save, so the win there 
 the shared-frame fan-out (see [`ws_broadcast_hub`](#ws_broadcast_hub)), not
 interning. Right tool, placed where it pays.
 
+## Memory-mapped storage (`mmap/`)
+
+Containers that live in a file or in reserved address space instead of on the heap. They can be far larger than RAM,
+survive the process, and reopen with their contents. The types are in `TSMoveables/mmap/` (C++20, POSIX: macOS and
+Linux). The platform-free parts are in snicholls-core: the file header, the index-addressed pool, `offset_ptr`, and
+`object_pool` on any `std::pmr::memory_resource`.
+
+```cpp
+struct tick { std::int64_t time; double price; std::int32_t size, venue; };   // trivially copyable
+constexpr std::uint64_t tag = snicholls::fnv1a_64("tick v1");                 // names the type and its schema
+
+auto v = snicholls::mapped_vector<tick>::create("ticks.bin", {.type_tag = tag});
+for (const tick& t : feed)
+    if (auto r = v->push_back(t); r.is_err()) return r.err();   // a full disk is ENOSPC here, never a crash
+v->flush();                                                     // durable: the elements, then the size
+
+// Later, in another run or another process:
+auto again = snicholls::mapped_vector<tick>::open("ticks.bin", {.type_tag = tag});
+// again->size() is the size at the last flush. A torn, foreign or mistyped file is refused with a reason.
+```
+
+### What memory mapping buys you
+
+- **Bigger than the heap, and bigger than RAM.** The data is in the page cache, not in your process's private memory.
+  The kernel keeps the hot pages resident and drops cold ones when memory is short. Nothing is swapped, because the
+  file *is* the backing store. A 500 GB tick history is one `mapped_vector`.
+- **No load and no save.** Reopening is an `mmap` and a 64-byte header check, whatever the size: there is no parse
+  and no deserialisation, and nothing is read until it is touched. Shutting down is a `flush()`.
+- **Survives a process crash for free.** Every store goes straight into the page cache, so a process killed with
+  SIGKILL loses nothing it wrote. The tests kill a child after a flush and 200,000 further unflushed pushes; the
+  parent reopens with every flushed element intact. `flush()` adds durability against power loss.
+- **Growth without copying.** A large range of address space is reserved once, costing page tables at most, and the
+  file grows inside it. `data()` does not move and nothing is copied when the vector doubles, where a `std::vector`
+  of 100 GB would copy 100 GB. (macOS has no `mremap`, so this reservation is the portable way to grow in place.)
+- **Shared between processes.** A second process can map the same file and see elements as they are written:
+  one writer, many readers, no sockets, no copies.
+- **Refuses what it does not understand.** Each file starts with core's checksummed header: magic, format version,
+  element size and alignment, your type tag, count and capacity. Opening a file of another type, an older schema,
+  a truncated file or a torn header returns `mapped_errc::type_mismatch`, `element_mismatch`, `file_too_small` or
+  `bad_checksum` instead of reading garbage.
+- **A full disk is an error, not a crash.** Growing a file with `ftruncate` alone leaves a hole. The first store into
+  a hole on a full disk cannot allocate a block, and the kernel's only answer is SIGBUS, far from the cause. `grow()`
+  allocates the blocks first (`posix_fallocate` on Linux, `F_PREALLOCATE` on macOS), so a full disk is ENOSPC from
+  `push_back`, and every element already accepted stays valid. This is tested on a 1 MB tmpfs.
+
+### What it costs
+
+Measured on 5 million 24-byte elements, best of 5, against `std::vector`, with checksums checked for fairness
+(`make bench-mmap`):
+
+| | macOS (Xeon W-3245) | Linux (Docker) |
+|---|---:|---:|
+| `push_back`, growing from empty | 14.9 vs 10.1 ns | 19.3 vs 15.2 ns |
+| `push_back` into reserved capacity | 14.5 vs 4.3 ns | 18.9 vs 5.0 ns |
+| random read of resident data | 9.7 vs 9.9 ns | 14.0 vs 10.7 ns |
+| `flush()` of 120 MB | 59 ms | 101 ms |
+
+Reads of resident pages cost what heap reads cost. On Linux they are 1.3× slower, because file pages do not get the
+transparent huge pages that anonymous memory does. Writes pay for the first touch of each new file page: a page
+fault, about 2 µs per 4 KiB page, which a `madvise(WILLNEED)` up front mostly removes. Durability costs a `flush()`.
+If none of the benefits above matter, `std::vector` is faster to write.
+
+### When to use which
+
+| You need | Use | Why |
+|---|---|---|
+| An ordinary growable array that fits in RAM and dies with the process | `std::vector` | fastest writes; nothing to manage |
+| An array that persists, reopens, or outgrows RAM (histories, journals, feature tables, embeddings) | `mapped_vector<T>` | the size lives in the file's header; growth never copies; crash-safe at `flush()` |
+| Records created and deleted in any order that must persist and be reopened (orders, nodes, sessions) | `mapped_pool<T>` | core's `index_pool` in a file. Records are named by 32-bit index, not pointer, so the file reopens at any address with its free list, and links stored as indices stay valid |
+| Many objects of one type, in-process, with stable addresses and no per-object `new` | core's `object_pool<T>` | the pointer-addressed pool, 18× faster than `new`/`delete` in core's benchmark |
+| Those objects, or any `std::pmr` container, outside the heap | `object_pool<T>` or `std::pmr::vector` on a `mapped_memory_resource` | an anonymous region for scratch larger than the heap; a file region to spill to disk. The memory is persistent, the pointers are not |
+| A huge scratch space that grows without moving and is never persisted | `mapped_region::anonymous(1 << 40)` | reserve a terabyte of address space, use what you touch |
+| Raw control: your own layout in a file | `mapped_region` | `open`, `grow`, `flush`, `advise(sequential / random / willneed)`; `grow_or_move` when the reservation is outgrown |
+| Links inside a region that moves as a whole | core's `offset_ptr<T>` | stores the distance, so the links survive a remap; about 0.8 ns per hop over a raw pointer |
+
+### Allocating in a mapping
+
+`mapped_memory_resource` is a `std::pmr::memory_resource` over a `mapped_region`, so any pmr container, and core's
+`object_pool`, can put its memory in a mapping instead of on the heap:
+
+```cpp
+auto region = *snicholls::mapped_region::anonymous(std::size_t{1} << 40);   // a terabyte of address space
+snicholls::mapped_memory_resource mem(region);
+snicholls::containers::object_pool<order> pool(&mem);   // its chunks are in the mapping
+std::pmr::vector<double> prices(&mem);                  // and so are these elements
+```
+
+- **It is a bump allocator.** `allocate()` aligns a cursor and moves it forward, a few instructions. `deallocate()`
+  does nothing: memory comes back only on `reset()` or when the resource is destroyed, as with
+  `std::pmr::monotonic_buffer_resource`.
+- **That suits callers that take memory and keep it.** `object_pool` takes a chunk at a time and recycles objects
+  inside its chunks, and a container that only grows wastes at most what its last reallocations left behind. A
+  container that reallocates often should allocate through `std::pmr::unsynchronized_pool_resource pooled(&mem);`,
+  which frees and reuses, and takes fresh memory from the mapping only when it needs more.
+- **The region grows in place and never moves**, by at least `grow_step` (1 MiB by default) at a time. Allocation
+  fails once the reservation is used up, so reserve generously. `used()` and `available()` say how far it has got.
+- **It is not thread-safe.** For several threads, allocate through a `std::pmr::synchronized_pool_resource` on top
+  of it.
+- **A file-backed region persists the bytes, not the pointers.** A structure that must be reopened stores indices
+  (`mapped_pool`) or `offset_ptr`s.
+
+**Rules of thumb.**
+- Elements must be trivially copyable: they are stored byte for byte in this machine's layout, which the header's
+  element shape and your type tag guard.
+- Reserve generously. 64 GiB of address space is the default and costs nothing; growth inside it never moves
+  `data()`. Past it, `mapped_vector` moves the mapping to a larger reservation, as `std::vector` reallocates, unless
+  `allow_move = false` makes the reservation a hard limit.
+- Call `flush()` at the points that must survive a power cut. Between flushes, a process crash loses nothing, and an
+  OS crash loses at most what was written since the last flush. The header never counts an element that is not
+  durable.
+- One writer per file. Readers in other processes see elements as they are written, and the size as of the last
+  flush.
+- Every error is a `result<..., std::error_code>`, either errno or `mapped_errc`, and nothing throws on the hot
+  path. `mapped_memory_resource` is the exception: the `memory_resource` interface can only fail with
+  `std::bad_alloc`, and `last_error()` keeps the reason.
+- Not for Windows yet, and not for a type with pointers, virtual functions or owned resources.
+
+**In practice:** [persistent_index_demo](demos/text_index/persistent_index_demo.cpp) (`make demo-text-index`) puts a
+full-text suffix-array index in three `mapped_vector`s. The build is parallel and checkpointed after every round, so it
+resumes after a kill. It happens once; every later run reopens the index in 0.3 ms and searches it in microseconds.
+A reader that never grows its files can pass `.reserve = 0` to reserve only each file's size: on macOS, reserving
+and releasing 64 GiB of address space costs about 0.25 ms a file.
+
+`make test-mmap` runs the tests. Set `TSM_MMAP_SMALL_FS=/some/small/fs` to include the full-disk test. The
+`mmap/` headers need snicholls-core 0.8.0 or later.
+
 ## moveable_signal
 
 Thread-safe signal/slot for any object. Everything — connect, disconnect, emit, slot execution — may happen from any thread, and the classic failure modes are designed out:
@@ -597,6 +723,7 @@ Working programs, not snippets. Each builds and runs with one make target, and m
 | [drone_fleet_demo](demos/drone_fleet_demo.cpp) | `make demo-drones` | the shape this was built for: ten aircraft streaming telemetry, five operators on live consoles, fifteen flight logs, and one listener relaying to New York, London, San Francisco and Sydney — with a training replay paced by the original timestamps. Verifies that the flight record loses nothing, every office receives its stream **in order**, and logging never stalls an aircraft thread (0.041 ms worst case across 4,000 calls) |
 | [replay_loop_demo](demos/replay_loop_demo.cpp) | `make demo-replay` | determinism: a scripted session over sockets, timers and cross-thread posts is journalled through the loop's dispatch tap, replayed into a *fresh* handler graph with no sockets, timers, threads or clock, and the digests match bit for bit — with a negative control that drops one event and asserts they then diverge |
 | [bwt_dna_demo](demos/bwt_dna_demo.cpp) | `make demo-bwt` | the [parallel algorithms](#parallel-algorithms) composing into a real one: a Burrows-Wheeler transform over DNA, whose suffix array is prefix doubling — and each round is literally a `parallel_sort` followed by a prefix scan, where **the inclusive scan of the "these differ" flags *is* the new rank**. Round-trip verified exactly; the clustering BWT exists to create shows up as longest-run 8 → 9,790. Dependency-free, including of [base-encode-decode](https://github.com/saxonnicholls/base-encode-decode), whose 2-bit ACGT packing suggested the alphabet but is not linked |
+| [persistent_index_demo](demos/text_index/persistent_index_demo.cpp) | `make demo-text-index` | a full-text index that is **built once and never rebuilt**: the BWT demo's parallel suffix array, written to [memory-mapped files](#memory-mapped-storage-mmap) with the text and a 2-byte prefix table. Building 8 million bases takes 2.5 s on 32 threads; every later run reopens the index in 0.3 ms (8,000×) and searches in about 2 µs, checked against a naive scan. A build killed in the middle resumes from its last completed round, and produces the same suffix array byte for byte. An index of other data, or one with a damaged header, is refused. Four reader processes search one copy in the page cache. `query PATTERN...` searches a kept index; `--file` indexes your own text. C++20 and POSIX |
 | [remote_compute_demo](demos/remote_compute/remote_compute_demo.cpp) | `make demo-remote` | remote `std::async` / `std::invoke` on named machines, over this library's TCP and thread pools: kernels dispatched by a compile-time perfect hash, a field-wise binary wire format refused on a signature mismatch, mutual HMAC-SHA256 authentication, long jobs with progress and cancel, health pings, sessions that survive a reconnect, and UDP discovery. The self-test puts the client and every worker in one process on 127.0.0.1, so CI runs the whole protocol on one runner. C++20 and POSIX (the library stays C++17); [details below](#remote-execution-demo) |
 | [tokenizer_bench](demos/tokenizer/tokenizer_bench.cpp) | `make bench-tokenizer` | byte-level BPE, the tokenizer of GPT-4 and its relatives, **token for token tiktoken's**: on GPT-4's vocabulary level with toktok, the fastest of the eleven encoders we raced, at 32 threads (1,922 MB/s) and on new text, second to it from 2 to 16 threads, and first on every measure with a vocabulary of your own. The split pattern written as code with an SSE2 fast path, a per-thread memo of short pieces, one long text cut at proved piece boundaries across [`parallel_for`](#parallel_for), on snicholls-core's merge. Checks every document against tiktoken before timing anything. C++20 (the library stays C++17); [details below](#bpe-tokenizer-demo) |
 | [time_master_demo](demos/time_master_demo.cpp) | `make demo-timemaster` | a production periodic-event scheduler (TimeMaster) rebuilt on [`event_loop`](#event_loop) in ~60 lines: closures at intervals, add-while-running from any thread, cancel by id, drift-free *and* burst-free cadence asserted, teardown measured in microseconds — and the whole scheduler is a moveable value, which its Boost.Asio ancestor never was |

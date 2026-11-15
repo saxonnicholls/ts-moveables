@@ -126,6 +126,12 @@ jobs:
       - name: Remote execution demo (loopback self-test)
         run: make demo-remote CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
 
+      # mmap/: C++20 and POSIX, like the remote demo. The tests reopen files
+      # after a killed child; the demo builds, resumes and reopens a suffix-array
+      # index in three mapped_vectors and checks every query against a scan.
+      - name: Memory-mapped storage (tests, ASan, persistent index demo)
+        run: make test-mmap asan-mmap demo-text-index CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
+
       # Autobahn|Testsuite: the external RFC 6455 grader. x86-64 Linux only -
       # it needs Docker with --network host to reach the echo server, and the
       # official image is published for amd64 only. Protocol conformance does

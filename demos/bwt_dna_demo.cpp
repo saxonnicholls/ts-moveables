@@ -23,7 +23,7 @@
 //  BWT before its entropy coder, and it is why DNA is such a good subject -
 //  a four-letter alphabet with heavy local structure produces long runs.
 //
-//  The transform is computed here from a SUFFIX ARRAY, which is the standard
+//  The transform is computed here from a SUFFIX ARRAY (text_index/suffix_array.hpp), which is the standard
 //  route: append a sentinel smaller than every real character and the sorted
 //  suffixes are in the same order as the sorted rotations, so
 //
@@ -57,6 +57,7 @@
 
 #include "../TSMoveables/concurrent/parallel_for.hpp"
 #include "../TSMoveables/concurrent/thread_pool.hpp"
+#include "text_index/suffix_array.hpp"
 
 #include <algorithm>
 #include <array>
@@ -65,8 +66,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <functional>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -82,56 +81,9 @@ double ms_since(clk::time_point t0)
     return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
 }
 
-// ------------------------------------------------------------- suffix array
-//
-// Prefix doubling. `s` already carries its sentinel.
-template <TS_MOVEABLES_TASK_POOL Pool>
-std::vector<std::int32_t> suffix_array(Pool& pool, const std::string& s)
-{
-    const std::size_t n = s.size();
-    std::vector<std::int32_t> sa(n), rank(n), tmp(n);
-    std::vector<std::int32_t> flags(n), scanned(n);
-
-    parallel_for(pool, std::size_t{0}, n, [&](std::size_t i) {
-        sa[i]   = static_cast<std::int32_t>(i);
-        rank[i] = static_cast<unsigned char>(s[i]);
-    });
-
-    for (std::size_t k = 1;; k *= 2) {
-        // Order by (rank[i], rank[i+k]), with a missing second half sorting
-        // first - the sentinel's job, made explicit.
-        const auto key2 = [&](std::int32_t i) -> std::int32_t {
-            const std::size_t j = static_cast<std::size_t>(i) + k;
-            return j < n ? rank[j] : -1;
-        };
-        const auto less = [&](std::int32_t a, std::int32_t b) {
-            if (rank[a] != rank[b])
-                return rank[a] < rank[b];
-            return key2(a) < key2(b);
-        };
-
-        parallel_sort(pool, sa.begin(), sa.end(), less);
-
-        // "Does this suffix differ from the one before it?" - one flag each.
-        flags[0] = 0;
-        parallel_for(pool, std::size_t{1}, n, [&](std::size_t i) {
-            flags[i] = less(sa[i - 1], sa[i]) ? 1 : 0;
-        });
-
-        // The prefix sum of those flags IS the new rank, in sorted order.
-        parallel_inclusive_scan(pool, flags.begin(), flags.end(), scanned.begin(),
-                                std::int32_t{0}, std::plus<std::int32_t>{});
-
-        parallel_for(pool, std::size_t{0}, n, [&](std::size_t i) {
-            tmp[static_cast<std::size_t>(sa[i])] = scanned[i];
-        });
-        rank.swap(tmp);
-
-        if (static_cast<std::size_t>(rank[static_cast<std::size_t>(sa[n - 1])]) == n - 1)
-            break;                          // every suffix has its own rank
-    }
-    return sa;
-}
+// The suffix array (prefix doubling) is in text_index/suffix_array.hpp, shared
+// with the persistent index demo.
+using text_index::suffix_array;
 
 template <TS_MOVEABLES_TASK_POOL Pool>
 std::string bwt_forward(Pool& pool, const std::string& with_sentinel)
@@ -203,28 +155,7 @@ std::pair<std::size_t, double> run_stats(const std::string& s)
     return {longest, double(s.size()) / double(runs)};
 }
 
-// Synthetic DNA with local structure: mostly a random walk over ACGT, but with
-// repeated motifs spliced in, which is what real genomes look like and what
-// makes the transform's clustering visible.
-std::string make_dna(std::size_t n, unsigned seed)
-{
-    static const char bases[] = "ACGT";
-    std::mt19937 rng(seed);
-    std::string s;
-    s.reserve(n);
-    const std::string motif = "ACGTACGTTTTACGT";
-    while (s.size() < n) {
-        if (rng() % 5 == 0) {
-            s += motif;                     // a repeat, the thing BWT clusters
-        } else {
-            const std::size_t run = 1 + rng() % 12;
-            for (std::size_t i = 0; i < run && s.size() < n; ++i)
-                s.push_back(bases[rng() % 4]);
-        }
-    }
-    s.resize(n);
-    return s;
-}
+using text_index::make_dna;   // synthetic DNA with local structure, shared too
 
 void check(bool ok, const char* what)
 {

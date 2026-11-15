@@ -37,7 +37,7 @@ target_link_libraries(ts_moveables INTERFACE Threads::Threads)
 if(NOT TARGET snicholls::core)
     add_subdirectory(third_party/core EXCLUDE_FROM_ALL)
 endif()
-snicholls_core_require(0.5.0)
+snicholls_core_require(0.8.0)
 # In the build tree: the include directory of whichever copy of core won. Installed: ts-moveables ships the one core
 # header it uses (constexpr_for.hpp, standard library only) in its own tree, include/ts_moveables/core, so an
 # installed ts-moveables needs no installed core, and an installed core elsewhere is never overwritten. The header's
