@@ -7,7 +7,7 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
-## [Unreleased]
+## [1.7.0] — 2026-11-16
 
 ### Added
 
@@ -26,7 +26,17 @@ git tag, and `make check-version` fails if those three ever disagree.
 ### Changed
 
 - **snicholls-core 0.8.0 is the minimum** (`snicholls_core_require`), for the mapped header, `index_pool`,
-  `offset_ptr` and `object_pool` on a `memory_resource` that `mmap/` builds on.
+  `offset_ptr` and `object_pool` on a `memory_resource` that `mmap/` builds on. The bundled submodule moves from
+  core v0.6.0 to v0.8.0.
+
+### Fixed
+
+- **The remote demo's self-test no longer races the client's resume window.** The silent fake worker now stays
+  silent until the client has given up, with a 15-second backstop, instead of for a fixed time that a slow
+  runner could outlast; a failed check prints the job's error.
+- **ThreadSanitizer no longer reports the `std::exception_ptr` release in libsupc++**, which TSan cannot see
+  synchronise because the runtime is uninstrumented. It is suppressed in `tests/tsan.supp`, which `make tsan-remote`
+  now uses.
 
 ## [1.6.0] — 2026-11-11
 
@@ -1039,6 +1049,8 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.7.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.7.0
+[1.6.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.6.0
 [1.5.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.5.1
 [1.5.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.5.0
 [1.4.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.4.0
