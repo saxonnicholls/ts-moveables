@@ -14,6 +14,8 @@
 // before merging, which its encode_ordinary does not, and is the faster of the two.
 // Load time is not timed. Output lines "RESULT<TAB>vocab<TAB>library<TAB>threads<TAB>seconds<TAB>bytes
 // <TAB>tokens<TAB>differing documents", as rust_baselines prints them.
+#include "fs/file.hpp"   // ts-moveables, with snicholls-core on the include path (build.sh)
+
 #include <quicktok.hpp>
 #include <tiktoken.hpp>
 
@@ -22,8 +24,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -31,16 +33,15 @@
 
 namespace {
 
-std::string slurp(const std::string& path)
+// The demo's error policy over the library's read: report and stop
+std::string read_or_exit(const std::string& path)
 {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        std::fprintf(stderr, "cannot read %s\n", path.c_str());
+    auto r = snicholls::read_file(path);
+    if (r.is_err()) {
+        std::fprintf(stderr, "cannot read %s: %s\n", path.c_str(), r.unwrap_err_unchecked().message().c_str());
         std::exit(2);
     }
-    std::ostringstream s;
-    s << f.rdbuf();
-    return s.str();
+    return std::move(*r);
 }
 
 std::uint32_t read_u32(const char*& p)
@@ -122,7 +123,7 @@ int main(int argc, char** argv)
         }
     }
 
-    const std::string docs_raw = slurp(dir + "/docs.bin");
+    const std::string docs_raw = read_or_exit(dir + "/docs.bin");
     std::vector<std::string_view> views;
     std::vector<std::string> docs;
     {
@@ -143,7 +144,7 @@ int main(int argc, char** argv)
     for (const std::string name : {"cl100k", "rust32k"}) {
         std::vector<std::vector<std::uint32_t>> expected;
         {
-            const std::string raw = slurp(dir + "/" + name + ".tokens");
+            const std::string raw = read_or_exit(dir + "/" + name + ".tokens");
             const char* p = raw.data();
             const std::uint32_t m = read_u32(p);
             for (std::uint32_t i = 0; i < m; ++i) {
@@ -192,7 +193,7 @@ int main(int argc, char** argv)
         // TokenDagger: raw ranks and the vocabulary's own pattern, as tiktoken.Encoding takes them
         {
             std::vector<VocabItem> vocab;
-            std::istringstream in(slurp(dir + "/" + name + ".ranks"));
+            std::istringstream in(read_or_exit(dir + "/" + name + ".ranks"));
             std::string b;
             int r;
             while (in >> b >> r) {
@@ -200,7 +201,7 @@ int main(int argc, char** argv)
                 vocab.push_back(VocabItem{r, std::vector<unsigned char>(bytes_.begin(), bytes_.end()), bytes_});
             }
             const std::string pat = [&] {
-                std::string p = slurp(dir + "/" + name + ".pattern");
+                std::string p = read_or_exit(dir + "/" + name + ".pattern");
                 while (!p.empty() && (p.back() == '\n' || p.back() == '\r'))
                     p.pop_back();
                 return p;

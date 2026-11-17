@@ -307,7 +307,7 @@ bench-remote: build/remote_compute_bench
 # (which also builds as C++17). Needs snicholls-core with containers/
 # index_pool.hpp and mapped_header.hpp. `make test-mmap` runs them; set
 # TSM_MMAP_SMALL_FS to a small filesystem to include the full-disk test.
-MMAP_HDRS := $(wildcard TSMoveables/mmap/*.hpp)
+MMAP_HDRS := $(wildcard TSMoveables/mmap/*.hpp) TSMoveables/fs/sync.hpp
 MMAP_INC  := $(CORE_INC) -ITSMoveables
 
 build/tests_mmap: tests/mmap/tests_mmap.cpp $(MMAP_HDRS) | build
@@ -321,6 +321,62 @@ build/tests_mmap_asan: tests/mmap/tests_mmap.cpp $(MMAP_HDRS) | build
 build/mmap_bench: benchmarks/mmap_bench.cpp $(MMAP_HDRS) | build
 	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O3 -DNDEBUG $(EXTRA_FLAGS) \
 	    benchmarks/mmap_bench.cpp -o $@ $(LDLIBS)
+
+# Whole-file reads and atomic replacement (TSMoveables/fs/): C++20 and POSIX,
+# like mmap/, so a program of its own. `make test-fs` runs it.
+FS_HDRS := $(wildcard TSMoveables/fs/*.hpp)
+
+build/tests_fs: tests/fs/tests_fs.cpp $(FS_HDRS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) -pthread \
+	    tests/fs/tests_fs.cpp -o $@ $(LDLIBS)
+
+build/tests_fs_asan: tests/fs/tests_fs.cpp $(FS_HDRS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O1 -g -pthread -fsanitize=address,undefined \
+	    -fno-sanitize-recover=all tests/fs/tests_fs.cpp -o $@ $(LDLIBS)
+
+test-fs: build/tests_fs
+	./build/tests_fs
+
+asan-fs: build/tests_fs_asan
+	./build/tests_fs_asan
+
+# Process lifecycle (TSMoveables/process/: signals, exit codes, .env, config,
+# environment, health and the boot gate): C++20 and POSIX, and the tests raise
+# real signals and fork death tests, so a program of their own.
+PROC_HDRS := $(wildcard TSMoveables/process/*.hpp) $(FS_HDRS) $(wildcard tests/process/*.hpp)
+PROC_SRC  := $(wildcard tests/process/*.cpp)
+
+build/tests_process: $(PROC_SRC) $(PROC_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) -pthread \
+	    $(PROC_SRC) -o $@ $(LDLIBS)
+
+build/tests_process_asan: $(PROC_SRC) $(PROC_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O1 -g -pthread -fsanitize=address,undefined \
+	    -fno-sanitize-recover=all $(PROC_SRC) -o $@ $(LDLIBS)
+
+test-process: build/tests_process
+	./build/tests_process
+
+asan-process: build/tests_process_asan
+	./build/tests_process_asan
+
+# HTTP/1.1 client (TSMoveables/http/client.hpp): C++20, like process/. Its
+# tests run against http::server and a scripted raw-socket server.
+CLIENT_HDRS := TSMoveables/http/client.hpp TSMoveables/net/outbound.hpp TSMoveables/net/url.hpp
+
+build/tests_http_client: tests/client/tests_http_client.cpp $(CLIENT_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) -pthread \
+	    tests/client/tests_http_client.cpp -o $@ $(LDLIBS)
+
+build/tests_http_client_asan: tests/client/tests_http_client.cpp $(CLIENT_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O1 -g -pthread -fsanitize=address,undefined \
+	    -fno-sanitize-recover=all tests/client/tests_http_client.cpp -o $@ $(LDLIBS)
+
+test-client: build/tests_http_client
+	./build/tests_http_client
+
+asan-client: build/tests_http_client_asan
+	./build/tests_http_client_asan
 
 # The persistent full-text index (demos/text_index): a suffix array in
 # mapped files, built once and reopened in microseconds. Self-verifying.
@@ -466,4 +522,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap demo-text-index amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap test-fs asan-fs test-process asan-process test-client asan-client demo-text-index amalgamate check-amalgamate clean

@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cstdio>
 #include <string>
+#include <string_view>
 
 // Each platform-gated header defines its macro as 0 or 1. Undefined means the
 // header never made it into the amalgamation - the http2.hpp failure exactly.
@@ -42,8 +43,21 @@
 
 using namespace snicholls;
 
+struct drop_in_global
+{
+    static constexpr std::string_view name = "drop_in_global";
+    int value = 7;
+};
+
 int main()
 {
+    // process/
+    {
+        global_scope scope;
+        assert(global<drop_in_global>::get().value == 7);
+    }
+    assert(global<drop_in_global>::shut_down());
+
     // the moveable primitives - each moved, which is the whole point
     moveable_atomic<int> a{1};
     moveable_atomic<int> a2 = std::move(a);

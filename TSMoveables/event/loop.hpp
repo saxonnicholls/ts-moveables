@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -300,6 +301,9 @@ namespace snicholls
             std::uint64_t next_seq = 0;
             std::uint64_t next_timer_id = 1;
             mpmc_queue<std::function<void()>> posted;
+            // Posts from the loop thread that found `posted` full. Only the
+            // loop thread touches it, so it needs no lock: see enqueue_task.
+            std::deque<std::function<void()>> overflow;
             std::atomic<bool> running{false};
             std::atomic<bool> stop_flag{false};
             // True from the post that wrote a wake byte until the loop has
@@ -368,9 +372,25 @@ namespace snicholls
             // drain BEFORE clearing: cleared first, a post could see false,
             // write, and have its byte swallowed by the drain, leaving the flag
             // set, the pipe empty and the loop asleep with work queued.
+            //
+            // A full queue makes other threads wait (backpressure: the loop is
+            // draining it). The loop thread cannot wait - it is the only thing
+            // that drains - so its post goes to `overflow` instead, and keeps
+            // going there until overflow is empty again, which keeps its posts
+            // in order. Running the task inline would break post's promise
+            // that the task runs later, after the caller returns; failing
+            // would break callers. No wake is needed: iterate() does not sleep
+            // while overflow holds work.
             void enqueue_task(std::function<void()> t) {
-                while (!posted.push(std::move(t)))          // bounded: backpressure when full
-                    std::this_thread::yield();
+                if (running.load(std::memory_order_acquire) && on_loop_thread()) {
+                    if (!overflow.empty() || !posted.push(std::move(t))) {
+                        overflow.push_back(std::move(t));
+                        return;
+                    }
+                } else {
+                    while (!posted.push(std::move(t)))      // bounded: backpressure when full
+                        std::this_thread::yield();
+                }
                 if (!wake_pending.exchange(true, std::memory_order_acq_rel))
                     wake();
             }
@@ -388,10 +408,23 @@ namespace snicholls
                 bool did = false;
 
                 // 1. Posted tasks - a snapshot's worth, so a task that posts
-                // more work cannot starve IO (the wake byte re-arms the poll)
+                // more work cannot starve IO (the wake byte re-arms the poll).
+                // Overflow's snapshot is taken now, before any task runs, and
+                // run after posted's: everything in it was posted after every
+                // loop-thread task already in posted, and a task posted into
+                // posted while these run must not be overtaken by one posted
+                // into overflow after it.
                 std::size_t budget = posted.size();
+                std::size_t overflow_budget = overflow.size();
                 std::function<void()> task;
                 while (budget-- > 0 && posted.try_pop(task)) {
+                    tap(dispatch_info{dispatch_info::kind::task, -1, 0});
+                    task();
+                    did = true;
+                }
+                while (overflow_budget-- > 0 && !overflow.empty()) {
+                    task = std::move(overflow.front());
+                    overflow.pop_front();
                     tap(dispatch_info{dispatch_info::kind::task, -1, 0});
                     task();
                     did = true;
@@ -420,8 +453,8 @@ namespace snicholls
 
                 // 3. How long may the poller sleep?
                 long long timeout_ms;
-                if (stop_flag.load(std::memory_order_acquire)) {
-                    timeout_ms = 0;
+                if (stop_flag.load(std::memory_order_acquire) || !overflow.empty()) {
+                    timeout_ms = 0;                         // overflow has work and no wake byte
                 } else if (!timers.empty()) {
                     // How long in REAL time, for a deadline in the clock's own
                     // timeline - not the same number once the two differ. A

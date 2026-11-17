@@ -475,6 +475,152 @@ and releasing 64 GiB of address space costs about 0.25 ms a file.
 `make test-mmap` runs the tests. Set `TSM_MMAP_SMALL_FS=/some/small/fs` to include the full-disk test. The
 `mmap/` headers need snicholls-core 0.8.0 or later.
 
+## Reading and replacing files (`fs/`)
+
+Whole-file reads, and a replace that no reader and no crash can catch halfway (`TSMoveables/fs/file.hpp`, C++20 and
+POSIX, opt-in like `mmap/`):
+
+```cpp
+#include "fs/file.hpp"
+
+auto text = snicholls::read_file("book.csv");           // result<std::string, std::error_code>
+if (text.is_err() && text.unwrap_err_unchecked() == std::errc::no_such_file_or_directory) { /* first run */ }
+
+auto bytes = snicholls::read_file_bytes("key.bin");      // result<std::vector<std::uint8_t>, std::error_code>
+
+if (auto w = snicholls::write_file_atomically("book.csv", updated); w.is_err())
+    log(w.unwrap_err_unchecked().message());             // the old book.csv is untouched
+```
+
+- **`read_file` tells a missing file from an empty one.** Every failure is a `std::error_code` you can compare:
+  `no_such_file_or_directory`, `is_a_directory`, `permission_denied`. It opens once, sizes from `fstat`, reads to end
+  of file (so `/proc` files and FIFOs come back whole), and retries `EINTR`.
+- **`write_file_atomically` is all or nothing.** It writes a temporary beside the file and renames it over the old
+  one, so a reader opens the whole old file or the whole new one, and concurrent writers leave one writer's complete
+  contents. The tests race 4 writers against 3 readers and kill a writer mid-replace 20 times; no read ever sees a
+  mixture.
+- **Durable by default.** The temporary is synced before the rename and the directory after it (`F_FULLFSYNC` on
+  macOS), so after a power cut the file holds the old contents or the new, never an empty file under the new name.
+  `{.durable = false}` skips both syncs, for files that are cheap to lose.
+- **The mode carries over.** The new file takes `.mode` if given, else the replaced file's mode, else 0666 less the
+  umask. `{.create_directories = true}` makes missing parents. A symbolic link at `path` is itself replaced, not its
+  target.
+- `full_sync(fd)` (`fs/sync.hpp`) is the one place the library pushes data through the drive's cache; `mapped_region`
+  uses it too.
+
+`make test-fs` runs the tests.
+
+## Process-wide initialisers (`global<T>`)
+
+An SDK's `InitAPI`, `curl_global_init`, OpenSSL, a connection pool: things that must start once per process, from
+whichever thread needs them first, and stop in a known order before static destruction
+(`TSMoveables/process/global.hpp`, C++17, in the single header):
+
+```cpp
+struct aws_sdk {
+    static constexpr std::string_view name = "aws_sdk";
+    aws_sdk()  { Aws::InitAPI(options); }       // may throw: the next get() retries
+    ~aws_sdk() { Aws::ShutdownAPI(options); }
+    Aws::SDKOptions options;
+};
+
+int main() {
+    snicholls::global_scope globals;              // shutdown_globals() when main returns
+    snicholls::global<aws_sdk>::get();            // any thread, any number of times: constructed once
+}
+```
+
+- **Once, from any thread.** After the first call `get()` is one acquire load; racing first callers wait for one
+  constructor. A constructor that throws leaves nothing behind, and the next `get()` tries again.
+- **Dependencies in order.** A constructor that calls `global<dep>::get()` makes `dep` complete first, so it shuts
+  down last. A cycle on one thread throws `global_init_error` instead of deadlocking.
+- **Explicit shutdown.** `shutdown_globals()` (or a `global_scope`) destroys every global in reverse order of
+  completion and returns their names. Nothing runs from a static destructor, so the order of static destruction
+  across files never matters. After shutdown, `get()` throws unless the type says `reinitialisable = true`.
+- `active_globals()` lists what is running; `set_global_observer(fn)` reports each start and stop, for a logger.
+
+## Process lifecycle (`process/`)
+
+Everything a long-running service does around its real work: start only when it is safe to, read its
+configuration, report its health, and stop cleanly when told to (`TSMoveables/process/`, C++20 and POSIX, opt-in):
+
+```cpp
+#include "process/config.hpp"
+#include "process/environment.hpp"
+#include "process/health.hpp"
+#include "process/http_health.hpp"
+#include "process/signals.hpp"
+
+int main() {
+    auto cfg = snicholls::load_config({.defaults = {{"PORT", "8080"}}, .env_files = {".env"}});
+    cfg.require({"DATABASE_URL"});                              // every missing key named at once
+    auto env = snicholls::environment_or(cfg, snicholls::run_environment::staging);
+    if (env.is_err()) return snicholls::to_int(snicholls::exit_code::config);
+
+    auto gate = std::make_shared<snicholls::boot_gate>();
+    gate->add("clock", snicholls::check_severity::hard, snicholls::clock_check());
+    gate->add("database", snicholls::check_severity::hard, [&] { return ping(cfg); });
+    if (auto r = gate->enforce(*env); r.is_err()) {             // hard failure in staging or production
+        std::cerr << r.unwrap_err_unchecked().failures() << "\n";
+        return snicholls::to_int(snicholls::exit_code::unavailable);
+    }
+
+    snicholls::http::server srv;
+    auto health = std::make_shared<snicholls::health_registry>();
+    snicholls::serve_health(srv, health);                         // /healthz and /readyz
+    snicholls::boot_monitor monitor(srv.loop(), gate, std::chrono::seconds{30}, on_change, health);
+    snicholls::signal_watcher stop(srv.loop(), [&](int) { srv.stop(); });   // SIGTERM as a loop task
+    srv.listen("0.0.0.0", cfg.get<std::uint16_t>("PORT"));
+    srv.run();
+}
+```
+
+| Header | What it gives you |
+|---|---|
+| `signals.hpp` | `signal_watcher`: signals as ordinary calls, on a thread of its own or as tasks on an event loop (the self-pipe trick, so the callback may lock and allocate). A second SIGINT or SIGTERM exits at once; previous handlers come back when it is destroyed. `install_crash_handlers()` reports fatal signals from an alternate stack and re-raises; `scoped_ignore_sigpipe` |
+| `exit_code.hpp` | sysexits-style exit statuses (64 usage, 70 software, 75 restart me, 78 bad config, 124 shutdown timeout, 128+n for a signal), so a supervisor can tell "restart" from "fix the config first" |
+| `dotenv.hpp` | `.env` files as people write them: `export`, both quote styles, multi-line values, `${NAME}`, `${NAME:-default}`, `${NAME:?message}`; errors give `file:line` and never quote a value |
+| `config.hpp` | defaults < `.env` files < environment < command line, each value knowing its source; strict typed `get` (numbers, bools, durations like `250ms`, lists, maps, core's `secret<T>`), `try_get` returning a result, `require` naming every missing key, `describe()` with secrets masked |
+| `environment.hpp` | local, staging or production from `ENVIRONMENT`, read through the config so a `.env` value counts; an unknown value is an error, never a guess |
+| `health.hpp` | a health registry (live, ready, JSON), systemd notify without libsystemd, an atomically written health file, and the boot gate: hard and soft checks, `enforce` that returns an error in staging and production (the library never exits the process), `clock_check`, and `boot_monitor` re-running the gate on an event-loop timer and reporting regressions and recoveries |
+| `http_health.hpp` | `/healthz` and `/readyz` on `http::server`, 200 or 503, holding the registry by `shared_ptr` |
+
+Most of it is ported from an earlier application framework, moved here because the operating-system layer is this
+library's job; the boot gate is new. `make test-process` runs the 60 tests, death tests included.
+
+## HTTP client (`http/client.hpp`)
+
+The other direction: requests out, on the same event loop as everything else (C++20, opt-in):
+
+```cpp
+snicholls::event_loop loop;
+snicholls::http::client http(loop);
+http.post("http://hooks.internal/notify", R"({"order":42})", "application/json",
+          [](snicholls::http::client_result r) {
+              if (r.is_err()) log(r.unwrap_err_unchecked().what());   // timed_out, connect_failed, ...
+              else if (r->status >= 300) log("rejected: " + std::to_string(r->status));
+          });
+
+auto r = snicholls::http::fetch({.url = "http://127.0.0.1:8080/health"});   // one blocking call, its own loop
+```
+
+- **Keep-alive by default**, a pool per `scheme://host:port`: five sequential requests to one service use one
+  connection. At most `max_connections_per_host` (4) are open per destination; the rest queue in order.
+- **A dead pooled connection is not your problem.** A server may close an idle keep-alive connection, and that only
+  shows when the next request goes out. A GET, HEAD, PUT, DELETE or OPTIONS that received no byte back is retried
+  once on a fresh connection; a POST never is, because it may already have taken effect.
+- **The server's parser, pointed the other way.** Responses go through the same strict code as requests
+  (`response_parser` is `basic_parser<response>`): Content-Length, chunked with trailers kept in
+  `response::trailers`, bodies that run to the close, no body for HEAD, 1xx, 204 and 304, interim 1xx skipped.
+  Conflicting lengths are a `protocol_error`, never a guess.
+- **Every failure is a value.** `client_result` is `result<response, client_error>`; an HTTP 404 is a response, and
+  a refused connection, a timeout, a malformed response, a body over the limit or a header that would inject a line
+  are errors with a code. Requests may be made from any thread; the callback runs on the loop's.
+- `https://` uses the same `transport_factory` as `websocket_client`; without one it is an error, never plain text.
+
+`make test-client` runs it against `http::server` and a scripted server that misbehaves on purpose. Not yet: HTTP/2
+(gRPC needs it), streamed request bodies, redirects (follow them in the callback), compression.
+
 ## moveable_signal
 
 Thread-safe signal/slot for any object. Everything — connect, disconnect, emit, slot execution — may happen from any thread, and the classic failure modes are designed out:

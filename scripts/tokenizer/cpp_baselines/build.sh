@@ -16,6 +16,7 @@ set -eu
 deps=$1
 out=$2
 here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../../.." && pwd)   # for fs/file.hpp (read_file) and the snicholls-core it uses
 pcre2=$(pcre2-config --prefix 2>/dev/null || brew --prefix pcre2)
 mkdir -p "$deps"
 [ -d "$deps/quicktok" ] || git clone -q https://github.com/dmatth1/quicktok.git "$deps/quicktok"
@@ -25,6 +26,7 @@ git -C "$deps/tokendagger" checkout -q 1eed815d1ef3a23a73b0d6554f99fc0be6ff4164
 make -C "$deps/quicktok" lib >/dev/null
 CXX=${CXX:-c++}
 $CXX -std=c++20 -O3 -DNDEBUG -march=native -pthread -w \
+    -I"$repo/TSMoveables" -I"$repo/third_party/core/include" \
     -I"$deps/quicktok/include" -I"$deps/tokendagger/src/tiktoken" -I"$pcre2/include" \
     "$here/cpp_baselines.cpp" "$deps/tokendagger/src/tiktoken/tiktoken.cpp" \
     "$deps/quicktok/build/libquicktok.a" "$pcre2/lib/libpcre2-8.a" -o "$out"

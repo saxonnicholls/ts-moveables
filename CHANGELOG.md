@@ -7,6 +7,70 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Added
+
+- **`read_file`, `read_file_bytes` and `write_file_atomically`** (`TSMoveables/fs/file.hpp`, C++20 and POSIX, opt-in:
+  not in the single header), each built from a comparison of about twenty copies in use. Reads return
+  `result<..., std::error_code>`, so a missing file, a directory and a permission error are told apart, and a FIFO
+  or `/proc` file is read whole. The atomic write uses an exclusive temporary with a name unique across threads and
+  processes, keeps the replaced file's mode, and by default syncs the file before the rename and the directory after
+  it. `make test-fs` and `make asan-fs`; CI runs both.
+- **`full_sync(fd)`** (`fs/sync.hpp`): `F_FULLFSYNC` on macOS, falling back to `fsync` where a filesystem refuses
+  it, and `fsync` elsewhere. `mapped_region::full_sync` now uses it, so it gains that fallback.
+- **`global<T>`, process-wide initialisers** (`TSMoveables/process/global.hpp`, C++17, in the single header), ported
+  from an earlier application framework: constructed once from any thread, a throwing
+  constructor retried, dependencies shut down in reverse order of completion by `shutdown_globals()` or a
+  `global_scope`, a one-thread cycle reported as `global_init_error`, restart only for a `reinitialisable` type.
+  `set_global_observer` replaces its debug log lines. Seven tests in the main suite; the single-header drop-in
+  uses it.
+- **Process lifecycle** (`TSMoveables/process/`, C++20 and POSIX, opt-in), each chosen by comparing
+  the implementations in use across several codebases:
+  - `signals.hpp`: the `signal_watcher` (self-pipe; a second SIGINT/SIGTERM exits with 128+n; previous handlers
+    restored; crash handlers on an alternate stack that re-raise), plus delivery as tasks on an `event_loop`,
+    `scoped_ignore_sigpipe` and `set_crash_hook`.
+  - `exit_code.hpp`: sysexits-style exit statuses.
+  - `dotenv.hpp` and `config.hpp`: a strict `.env` parser and layered config on core's `secret<T>`, plus
+    `${NAME:?message}`, `require` (every missing key in one error), `missing`, `try_get` (a result) and maps.
+    Binding into reflected objects is not carried over: it needs a reflection layer this library does not have.
+  - `environment.hpp`: local, staging or production, read through the config, an error on
+    an unknown value, and the caller's fallback when unset.
+  - `health.hpp` and `http_health.hpp`: a health registry, systemd notifier and health file (now written by
+    `write_file_atomically`), and `/healthz` and `/readyz` on `http::server` holding the registry by `shared_ptr`.
+    New: `boot_gate` (hard and soft checks; `enforce` returns an error in staging and production and never exits),
+    `clock_check`, and `boot_monitor`, which re-runs the gate on an event-loop timer and reports regressions and
+    recoveries.
+  - 60 tests in `make test-process` (and `asan-process`), most ported through a small GoogleTest-compatible shim
+    (`tests/process/mini_gtest.hpp`, death tests by fork), plus 12 for what is new; CI runs both.
+- **`http::client`, an HTTP/1.1 client on the event loop** (`http/client.hpp`, C++20, opt-in): keep-alive pools per
+  destination with a per-host connection limit and a queue, one retry on a fresh connection when a pooled one
+  turns out dead (idempotent methods only), per-request and idle timeouts, a body limit, https through a
+  `transport_factory`, and `fetch()` for one blocking call. Results are `result<response, client_error>`. Nine
+  tests in `make test-client` (and `asan-client`) against `http::server` and a scripted misbehaving server.
+- **`response_parser`.** The request parser is now `basic_parser<Message>`: `request_parser` is
+  `basic_parser<request>`, unchanged for the server, and `response_parser` is `basic_parser<response>`, sharing its
+  header, chunked and trailer code, adding the status line, the response framing rules (no body for HEAD, 1xx, 204,
+  304; close-delimited bodies through `finish_eof()`) and keeping trailers in `response::trailers`. `response`
+  gains `reason`, `http_major`/`http_minor`, `keep_alive`, `trailers` and `clear()`.
+- **`net::url` and `net::outbound_connection`** (in the single header): URL parsing and one outbound connection
+  (every resolved address tried in turn, a TLS transport pumped both ways, a connect timeout), shared by both
+  clients; `parse_ws_url` now uses `net::parse_url`, which also refuses credentials in the URL.
+
+### Changed
+
+- The tokenizer demos and the C++ baseline harness read their data with `read_file` instead of private copies.
+- **A request's trailer fields are now checked** like header fields (a malformed one is a 400) before being dropped.
+  The parser's comment always said they were validated; no code did it.
+
+### Fixed
+
+- **A task on the event loop's thread that posted into a full queue spun for ever**, because only that thread drains
+  the queue. Its posts now go to a loop-only overflow deque when the queue is full, and keep going there until it
+  drains, so they run in the order they were posted; posts from other threads still wait for room. The loop does
+  not sleep while the overflow holds work. A test posts 2,000 times past a 4-slot queue from inside tasks and a
+  timer; the coalesced-wakes test is back on the default capacity, and hangs without the fix.
+
 ## [1.7.0] — 2026-11-16
 
 ### Added

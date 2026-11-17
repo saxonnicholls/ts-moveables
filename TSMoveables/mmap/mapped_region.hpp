@@ -98,6 +98,7 @@
 
 #include <snicholls/core/result.hpp>
 
+#include "../fs/sync.hpp"
 #include "mapped_error.hpp"
 
 namespace snicholls {
@@ -273,12 +274,7 @@ public:
     {
         if (auto r = flush(); r.is_err()) return r;
         if (fd_ < 0) return ok();
-#if defined(__APPLE__)
-        if (::fcntl(fd_, F_FULLFSYNC) != 0) return err(errno_code());
-#else
-        if (::fsync(fd_) != 0) return err(errno_code());
-#endif
-        return ok();
+        return snicholls::full_sync(fd_);
     }
 
     // madvise over [offset, offset + length) (default: the whole region)
@@ -310,7 +306,6 @@ public:
     unsigned generation() const noexcept { return generation_; }   // how many times grow_or_move moved it
 
 private:
-    static std::error_code errno_code() noexcept { return {errno, std::system_category()}; }
     // Best effort, on a path that is already failing: the error reported is the first one
     static void truncate_back(int fd, std::size_t bytes) noexcept
     {

@@ -25,13 +25,14 @@
 
 #include "concurrent/thread_pool.hpp"
 
+#include "fs/file.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -43,16 +44,15 @@ namespace tk = snicholls::tokenizer;
 
 namespace {
 
-std::string slurp(const std::string& path)
+// The demo's error policy over the library's read: report and stop
+std::string read_or_exit(const std::string& path)
 {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        std::fprintf(stderr, "cannot read %s\n", path.c_str());
+    auto r = snicholls::read_file(path);
+    if (r.is_err()) {
+        std::fprintf(stderr, "cannot read %s: %s\n", path.c_str(), r.unwrap_err_unchecked().message().c_str());
         std::exit(2);
     }
-    std::stringstream s;
-    s << f.rdbuf();
-    return s.str();
+    return std::move(*r);
 }
 
 std::string unbase64(std::string_view in)
@@ -145,7 +145,7 @@ int main(int argc, char** argv)
         thread_counts.push_back(hw);
 
     // The corpus, the vocabulary and tiktoken's tokens
-    const std::string docs_raw = slurp(dir + "/docs.bin");
+    const std::string docs_raw = read_or_exit(dir + "/docs.bin");
     std::vector<std::string_view> docs;
     {
         const char* p = docs_raw.data();
@@ -162,17 +162,17 @@ int main(int argc, char** argv)
 
     std::vector<std::pair<std::string, std::uint32_t>> kv;
     {
-        std::istringstream in(slurp(dir + "/" + name + ".ranks"));
+        std::istringstream in(read_or_exit(dir + "/" + name + ".ranks"));
         std::string b;
         std::uint32_t r;
         while (in >> b >> r)
             kv.emplace_back(unbase64(b), r);
     }
-    const tk::encoder enc(tk::vocab(kv), pattern_of(slurp(dir + "/" + name + ".pattern")));
+    const tk::encoder enc(tk::vocab(kv), pattern_of(read_or_exit(dir + "/" + name + ".pattern")));
 
     std::vector<std::vector<std::uint32_t>> expected;
     {
-        const std::string raw = slurp(dir + "/" + name + ".tokens");
+        const std::string raw = read_or_exit(dir + "/" + name + ".tokens");
         const char* p = raw.data();
         const std::uint32_t n = read_u32(p);
         for (std::uint32_t i = 0; i < n; ++i) {

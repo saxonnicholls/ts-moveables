@@ -7235,6 +7235,7 @@ namespace snicholls
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -7792,6 +7793,9 @@ namespace snicholls
             std::uint64_t next_seq = 0;
             std::uint64_t next_timer_id = 1;
             mpmc_queue<std::function<void()>> posted;
+            // Posts from the loop thread that found `posted` full. Only the
+            // loop thread touches it, so it needs no lock: see enqueue_task.
+            std::deque<std::function<void()>> overflow;
             std::atomic<bool> running{false};
             std::atomic<bool> stop_flag{false};
             // True from the post that wrote a wake byte until the loop has
@@ -7860,9 +7864,25 @@ namespace snicholls
             // drain BEFORE clearing: cleared first, a post could see false,
             // write, and have its byte swallowed by the drain, leaving the flag
             // set, the pipe empty and the loop asleep with work queued.
+            //
+            // A full queue makes other threads wait (backpressure: the loop is
+            // draining it). The loop thread cannot wait - it is the only thing
+            // that drains - so its post goes to `overflow` instead, and keeps
+            // going there until overflow is empty again, which keeps its posts
+            // in order. Running the task inline would break post's promise
+            // that the task runs later, after the caller returns; failing
+            // would break callers. No wake is needed: iterate() does not sleep
+            // while overflow holds work.
             void enqueue_task(std::function<void()> t) {
-                while (!posted.push(std::move(t)))          // bounded: backpressure when full
-                    std::this_thread::yield();
+                if (running.load(std::memory_order_acquire) && on_loop_thread()) {
+                    if (!overflow.empty() || !posted.push(std::move(t))) {
+                        overflow.push_back(std::move(t));
+                        return;
+                    }
+                } else {
+                    while (!posted.push(std::move(t)))      // bounded: backpressure when full
+                        std::this_thread::yield();
+                }
                 if (!wake_pending.exchange(true, std::memory_order_acq_rel))
                     wake();
             }
@@ -7880,10 +7900,23 @@ namespace snicholls
                 bool did = false;
 
                 // 1. Posted tasks - a snapshot's worth, so a task that posts
-                // more work cannot starve IO (the wake byte re-arms the poll)
+                // more work cannot starve IO (the wake byte re-arms the poll).
+                // Overflow's snapshot is taken now, before any task runs, and
+                // run after posted's: everything in it was posted after every
+                // loop-thread task already in posted, and a task posted into
+                // posted while these run must not be overtaken by one posted
+                // into overflow after it.
                 std::size_t budget = posted.size();
+                std::size_t overflow_budget = overflow.size();
                 std::function<void()> task;
                 while (budget-- > 0 && posted.try_pop(task)) {
+                    tap(dispatch_info{dispatch_info::kind::task, -1, 0});
+                    task();
+                    did = true;
+                }
+                while (overflow_budget-- > 0 && !overflow.empty()) {
+                    task = std::move(overflow.front());
+                    overflow.pop_front();
                     tap(dispatch_info{dispatch_info::kind::task, -1, 0});
                     task();
                     did = true;
@@ -7912,8 +7945,8 @@ namespace snicholls
 
                 // 3. How long may the poller sleep?
                 long long timeout_ms;
-                if (stop_flag.load(std::memory_order_acquire)) {
-                    timeout_ms = 0;
+                if (stop_flag.load(std::memory_order_acquire) || !overflow.empty()) {
+                    timeout_ms = 0;                         // overflow has work and no wake byte
                 } else if (!timers.empty()) {
                     // How long in REAL time, for a deadline in the clock's own
                     // timeline - not the same number once the two differ. A
@@ -10249,6 +10282,27 @@ public:
     header_list headers;
     std::string body;
 
+    // Filled when a response is parsed (the client side); a server building one leaves them alone
+    std::string reason;                 // the status line's reason phrase
+    int http_major = 1;
+    int http_minor = 1;
+    bool keep_alive = true;             // may the connection carry another request
+    header_list trailers;               // after a chunked body (gRPC's status lives here)
+
+    // Reset for reuse, keeping the buffers
+    void clear() noexcept
+    {
+        status = 200;
+        headers.clear();
+        body.clear();
+        reason.clear();
+        http_major = http_minor = 1;
+        keep_alive = true;
+        trailers.clear();
+    }
+
+    const std::string* header(const char* name) const noexcept { return headers.find(name); }
+
     response() = default;
     explicit response(int s) : status(s) {}
 
@@ -10304,6 +10358,7 @@ public:
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 namespace snicholls {
 namespace http {
@@ -10322,18 +10377,44 @@ struct parse_limits {
     std::size_t max_chunk_line   = 1024;
 };
 
-class request_parser {
-public:
-    enum class status { need_more, have_request, failed };
+// One parser for both directions. basic_parser<request> is the server's
+// request_parser; basic_parser<response> is the client's response_parser. They
+// share the header, chunked and trailer handling, so the strictness that
+// protects the server protects the client too. What differs is the start line
+// and how a body is framed: a response to HEAD, and every 1xx, 204 and 304,
+// has none; a response with neither Content-Length nor chunked encoding runs
+// to the end of the connection (finish_eof()); and a response's trailers are
+// kept, where a request's are validated and dropped.
+template <class Message>
+class basic_parser {
+    static constexpr bool is_request = std::is_same_v<Message, request>;
 
-    request_parser() = default;
-    explicit request_parser(parse_limits lim) : lim_(lim) {}
+public:
+    // have_message and have_request are the same value: one name for each side
+    enum class status { need_more, have_request, failed, have_message = have_request };
+
+    basic_parser() = default;
+    explicit basic_parser(parse_limits lim) : lim_(lim) {}
+
+    // Responses only: the request was HEAD, so whatever the headers say there is no body. Set after reset()
+    void expect_no_body(bool v = true) noexcept { no_body_expected_ = v; }
+
+    // Responses only: the connection closed. A body delimited by the close is complete; anything else
+    // in progress was cut short
+    status finish_eof() noexcept
+    {
+        if (st_ == state::body_until_close)
+            return complete();
+        if (st_ == state::complete)
+            return status::have_request;
+        return fail(502, started_ ? "connection closed mid-response" : "connection closed before a response");
+    }
 
     void limits(const parse_limits& l) noexcept { lim_ = l; }
     const parse_limits& limits() const noexcept { return lim_; }
 
-    request& message() noexcept { return req_; }
-    const request& message() const noexcept { return req_; }
+    Message& message() noexcept { return msg_; }
+    const Message& message() const noexcept { return msg_; }
 
     bool headers_done() const noexcept { return headers_done_; }
     bool expects_continue() const noexcept { return expect_continue_; }
@@ -10343,7 +10424,7 @@ public:
 
     void reset()
     {
-        req_.clear();                           // reuse the buffers, do not free them
+        msg_.clear();                           // reuse the buffers, do not free them
         st_ = state::start_line;
         headers_done_ = expect_continue_ = started_ = false;
         header_bytes_ = 0;
@@ -10353,6 +10434,7 @@ public:
         framing_ = framing::none;
         err_status_ = 0;
         err_reason_ = nullptr;
+        no_body_expected_ = false;
     }
 
     status parse(const char* data, std::size_t len, std::size_t& consumed)
@@ -10389,7 +10471,7 @@ public:
                     p = lf + 1;
                     break;
                 }
-                if (!parse_request_line(p, line_end))
+                if (!parse_start_line(p, line_end))
                     return status::failed;
                 p = lf + 1;
                 st_ = state::headers;
@@ -10419,23 +10501,32 @@ public:
                         consumed = std::size_t(p - data);
                         return complete();
                     }
-                    st_ = (framing_ == framing::identity) ? state::body_identity
-                                                          : state::chunk_size;
+                    st_ = framing_ == framing::identity  ? state::body_identity
+                        : framing_ == framing::chunked ? state::chunk_size
+                                                       : state::body_until_close;
                     break;
                 }
                 if (*p == ' ' || *p == '\t')
                     return fail(400, "obsolete line folding");
                 if (++n_headers_ > lim_.max_headers)
                     return fail(431, "too many header fields");
-                if (!parse_header_line(p, line_end))
+                if (!parse_header_line(p, line_end, msg_.headers))
                     return status::failed;
                 p = lf + 1;
                 break;
             }
 
+            case state::body_until_close: {      // responses only: everything until the peer closes
+                if (msg_.body.size() + std::size_t(end - p) > lim_.max_body)
+                    return fail(413, "response body too large");
+                msg_.body.append(p, std::size_t(end - p));
+                consumed = len;
+                return status::need_more;
+            }
+
             case state::body_identity: {
                 const std::size_t take = std::min(std::size_t(end - p), body_remaining_);
-                req_.body.append(p, take);
+                msg_.body.append(p, take);
                 p += take;
                 body_remaining_ -= take;
                 consumed = std::size_t(p - data);
@@ -10465,7 +10556,7 @@ public:
                     st_ = state::trailers;
                     break;
                 }
-                if (req_.body.size() + size > lim_.max_body)
+                if (msg_.body.size() + size > lim_.max_body)
                     return fail(413, "chunked body too large");
                 chunk_remaining_ = size;
                 st_ = state::chunk_data;
@@ -10474,7 +10565,7 @@ public:
 
             case state::chunk_data: {
                 const std::size_t take = std::min(std::size_t(end - p), chunk_remaining_);
-                req_.body.append(p, take);
+                msg_.body.append(p, take);
                 p += take;
                 chunk_remaining_ -= take;
                 if (chunk_remaining_ != 0) {
@@ -10512,13 +10603,25 @@ public:
                 if (!terminate_line(p, lf, line_end))
                     return fail(400, "bare LF or stray CR in trailer");
                 const bool blank = (line_end == p);
+                const char* const line_begin = p;
                 p = lf + 1;
                 if (blank) {                    // blank line: trailers done
                     consumed = std::size_t(p - data);
                     return complete();
                 }
-                // Trailers are validated and discarded: merging them into the
-                // header set is a header-injection gadget
+                // A request's trailers are validated and discarded: merging them
+                // into the header set is a header-injection gadget. A response's
+                // are kept apart, in `trailers`, where gRPC puts its status
+                if constexpr (is_request) {
+                    if (!parse_header_line(line_begin, line_end, scratch_))
+                        return status::failed;
+                    scratch_.clear();
+                } else {
+                    if (++n_headers_ > lim_.max_headers)
+                        return fail(431, "too many trailer fields");
+                    if (!parse_header_line(line_begin, line_end, msg_.trailers))
+                        return status::failed;
+                }
                 break;
             }
 
@@ -10534,11 +10637,11 @@ public:
 
 private:
     enum class state {
-        start_line, headers, body_identity,
+        start_line, headers, body_identity, body_until_close,
         chunk_size, chunk_data, chunk_crlf, trailers,
         complete, failed
     };
-    enum class framing { none, identity, chunked };
+    enum class framing { none, identity, chunked, until_close };
 
     static const char* find_lf(const char* p, const char* end) noexcept
     {
@@ -10575,6 +10678,39 @@ private:
         return status::have_request;
     }
 
+    bool parse_start_line(const char* b, const char* e)
+    {
+        if constexpr (is_request)
+            return parse_request_line(b, e);
+        else
+            return parse_status_line(b, e);
+    }
+
+    // HTTP/1.x SP 3DIGIT SP reason - the reason may be empty, and the space before it may be missing
+    bool parse_status_line(const char* b, const char* e)
+    {
+        if (e - b < 12 || std::memcmp(b, "HTTP/", 5) != 0 || !detail::is_digit(b[5]) || b[6] != '.' ||
+            !detail::is_digit(b[7]) || b[8] != ' ')
+            return bad(502, "malformed status line");
+        msg_.http_major = b[5] - '0';
+        msg_.http_minor = b[7] - '0';
+        if (msg_.http_major != 1)
+            return bad(502, "unsupported HTTP version in response");
+        if (!detail::is_digit(b[9]) || !detail::is_digit(b[10]) || !detail::is_digit(b[11]) || b[9] == '0')
+            return bad(502, "malformed status code");
+        msg_.status = (b[9] - '0') * 100 + (b[10] - '0') * 10 + (b[11] - '0');
+        if (e - b > 12 && b[12] != ' ')
+            return bad(502, "malformed status line");
+        const char* r = (e - b > 12) ? b + 13 : e;
+        for (const char* q = r; q < e; ++q) {
+            const unsigned char c = static_cast<unsigned char>(*q);
+            if ((c < 0x20 && c != '\t') || c == 0x7f)
+                return bad(502, "control character in reason phrase");
+        }
+        msg_.reason.assign(r, std::size_t(e - r));
+        return true;
+    }
+
     bool parse_request_line(const char* b, const char* e)
     {
         const char* sp1 = static_cast<const char*>(std::memchr(b, ' ', std::size_t(e - b)));
@@ -10590,16 +10726,16 @@ private:
         for (const char* q = b; q < sp1; ++q)
             if (!detail::is_token_char(*q))
                 return bad(400, "invalid character in method");
-        req_.method_text.assign(b, std::size_t(sp1 - b));
-        req_.method = parse_method(req_.method_text);
+        msg_.method_text.assign(b, std::size_t(sp1 - b));
+        msg_.method = parse_method(msg_.method_text);
 
         const char* v = sp2 + 1;
         if (std::size_t(e - v) != 8 || std::memcmp(v, "HTTP/", 5) != 0 ||
             !detail::is_digit(v[5]) || v[6] != '.' || !detail::is_digit(v[7]))
             return bad(400, "malformed HTTP version");
-        req_.http_major = v[5] - '0';
-        req_.http_minor = v[7] - '0';
-        if (req_.http_major != 1)
+        msg_.http_major = v[5] - '0';
+        msg_.http_minor = v[7] - '0';
+        if (msg_.http_major != 1)
             return bad(505, "unsupported HTTP version");
 
         return parse_target(sp1 + 1, sp2);
@@ -10607,12 +10743,12 @@ private:
 
     bool parse_target(const char* b, const char* e)
     {
-        req_.target.assign(b, std::size_t(e - b));
+        msg_.target.assign(b, std::size_t(e - b));
         if (b == e)
             return bad(400, "empty request target");
 
         if (e - b == 1 && *b == '*') {          // asterisk-form (OPTIONS *)
-            req_.path = "*";
+            msg_.path = "*";
             return true;
         }
         // Work over the incoming bytes rather than a copy of them
@@ -10627,25 +10763,25 @@ private:
             tb = slash ? slash : nullptr;
             absolute_form_ = true;
             if (!tb) {                          // "http://host" with no path
-                req_.path = "/";
-                req_.query.clear();
+                msg_.path = "/";
+                msg_.query.clear();
                 return true;
             }
         }
         const char* q = static_cast<const char*>(std::memchr(tb, '?', std::size_t(e - tb)));
         const std::size_t path_len = std::size_t((q ? q : e) - tb);
         if (q)
-            req_.query.assign(q + 1, std::size_t(e - (q + 1)));
+            msg_.query.assign(q + 1, std::size_t(e - (q + 1)));
         else
-            req_.query.clear();
-        if (!detail::percent_decode(tb, path_len, req_.path, false))
+            msg_.query.clear();
+        if (!detail::percent_decode(tb, path_len, msg_.path, false))
             return bad(400, "invalid percent-encoding in request target");
-        if (req_.path.find('\0') != std::string::npos)
+        if (msg_.path.find('\0') != std::string::npos)
             return bad(400, "NUL byte in request target");
         return true;
     }
 
-    bool parse_header_line(const char* b, const char* e)
+    bool parse_header_line(const char* b, const char* e, header_list& into)
     {
         const char* colon = static_cast<const char*>(std::memchr(b, ':', std::size_t(e - b)));
         if (!colon || colon == b)
@@ -10668,7 +10804,7 @@ private:
 
         std::string name(b, std::size_t(colon - b));
         detail::ascii_lower(name);              // lowercase, as HTTP/2 will require anyway
-        req_.headers.add(std::move(name), std::string(vb, std::size_t(ve - vb)));
+        into.add(std::move(name), std::string(vb, std::size_t(ve - vb)));
         return true;
     }
 
@@ -10706,17 +10842,19 @@ private:
 
     bool finish_headers()
     {
-        const std::size_t hosts = req_.headers.count("host");
-        if (hosts > 1)
-            return bad(400, "multiple Host headers");
-        if (req_.http_minor >= 1 && hosts != 1 && !absolute_form_)
-            return bad(400, "HTTP/1.1 requires a Host header");
+        if constexpr (is_request) {
+            const std::size_t hosts = msg_.headers.count("host");
+            if (hosts > 1)
+                return bad(400, "multiple Host headers");
+            if (msg_.http_minor >= 1 && hosts != 1 && !absolute_form_)
+                return bad(400, "HTTP/1.1 requires a Host header");
+        }
 
         bool te_present = false, te_chunked = false;
         unsigned long long content_length = 0;
         std::size_t cl_fields = 0;
 
-        for (const auto& h : req_.headers) {
+        for (const auto& h : msg_.headers) {
             if (h.first == "transfer-encoding") {
                 te_present = true;
                 // The final coding must be chunked, and chunked must appear once
@@ -10756,21 +10894,21 @@ private:
         // RFC 9112 §6.1: both present is a smuggling attempt - 400 and close
         if (te_present && cl_fields)
             return bad(400, "Content-Length together with Transfer-Encoding");
-        if (te_present && !te_chunked)
+        if (te_present && !te_chunked && is_request)
             return bad(501, "unsupported Transfer-Encoding");
 
         bool close_requested = false, keepalive_requested = false;
-        for (const auto& h : req_.headers)
+        for (const auto& h : msg_.headers)
             if (h.first == "connection") {
                 if (detail::has_token(h.second, "close"))
                     close_requested = true;
                 if (detail::has_token(h.second, "keep-alive"))
                     keepalive_requested = true;
             }
-        req_.keep_alive = (req_.http_minor >= 1) ? !close_requested : keepalive_requested;
+        msg_.keep_alive = (msg_.http_minor >= 1) ? !close_requested : keepalive_requested;
 
-        if (req_.http_minor >= 1)
-            for (const auto& h : req_.headers)
+        if (is_request && msg_.http_minor >= 1)
+            for (const auto& h : msg_.headers)
                 if (h.first == "expect") {
                     if (detail::has_token(h.second, "100-continue"))
                         expect_continue_ = true;
@@ -10778,15 +10916,34 @@ private:
                         return bad(417, "unsupported Expect");
                 }
 
+        if constexpr (!is_request) {
+            // RFC 9112 §6.3: no body for HEAD, 1xx, 204 and 304, whatever the headers say;
+            // a Transfer-Encoding other than chunked last runs to the close; so does no framing at all
+            const int code = msg_.status;
+            if (no_body_expected_ || (code >= 100 && code < 200) || code == 204 || code == 304) {
+                framing_ = framing::none;
+                return true;
+            }
+            if (te_present && !te_chunked) {
+                framing_ = framing::until_close;
+                msg_.keep_alive = false;
+                return true;
+            }
+            if (!te_present && cl_fields == 0) {
+                framing_ = framing::until_close;
+                msg_.keep_alive = false;
+                return true;
+            }
+        }
         if (te_present) {
             framing_ = framing::chunked;
         } else if (content_length > 0) {
             if (content_length > lim_.max_body)
-                return bad(413, "request body too large");
+                return bad(413, is_request ? "request body too large" : "response body too large");
             framing_ = framing::identity;
             body_remaining_ = std::size_t(content_length);
             // Reserve modestly: a declared length is a claim, not a promise
-            req_.body.reserve(std::min<std::size_t>(body_remaining_, 64u * 1024));
+            msg_.body.reserve(std::min<std::size_t>(body_remaining_, 64u * 1024));
         } else {
             framing_ = framing::none;
         }
@@ -10815,7 +10972,8 @@ private:
     }
 
     parse_limits lim_{};
-    request req_{};
+    Message msg_{};
+    header_list scratch_{};                   // a request's trailers, validated then dropped
     state st_ = state::start_line;
     framing framing_ = framing::none;
     std::size_t header_bytes_ = 0;
@@ -10826,9 +10984,13 @@ private:
     bool expect_continue_ = false;
     bool started_ = false;
     bool absolute_form_ = false;
+    bool no_body_expected_ = false;
     int err_status_ = 0;
     const char* err_reason_ = nullptr;
 };
+
+using request_parser = basic_parser<request>;
+using response_parser = basic_parser<response>;
 
 } // namespace http
 } // namespace snicholls
@@ -17162,6 +17324,133 @@ private:
 // (inlined) #include "../interfaces/transport_delegate.hpp"
 // (inlined) #include "../moveable/atomic.hpp"
 // (inlined) #include "../moveable/signal.hpp"
+// (inlined) #include "../net/url.hpp"
+// ----------------------------------------------------------------------
+// begin net/url.hpp
+// ----------------------------------------------------------------------
+//
+//  url.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - scheme://host[:port]/path?query, enough URL
+//  parsing for a client to know where to connect and what to ask for, and no
+//  more. Anything it does not understand is refused rather than guessed at,
+//  because a guess here means connecting somewhere the caller did not ask for:
+//
+//      snicholls::net::url u;
+//      if (snicholls::net::parse_url("https://api.example.com/v1/items?limit=5", u))
+//          // u.scheme "https", u.host "api.example.com", u.port "443", u.target "/v1/items?limit=5"
+//
+//    - http and ws default to port 80, https and wss to 443, and those two
+//      are `secure`; any other scheme is refused
+//    - a bracketed IPv6 literal keeps its colons: http://[::1]:8080/
+//    - user information (user:password@) is refused: a credential in a URL
+//      ends up in logs, and headers are the place for it
+//    - a fragment (#...) is dropped, as no client sends one
+//
+//  Shared by http::client and http::websocket_client. C++17, standard
+//  library only.
+//
+
+#ifndef ts_moveables_net_url_hpp
+#define ts_moveables_net_url_hpp
+
+#include <string>
+
+namespace snicholls {
+namespace net {
+
+struct url {
+    std::string scheme;                 // lower case
+    std::string host;                   // without brackets
+    std::string port;                   // explicit or the scheme's default
+    std::string target = "/";           // path and query, as sent on the request line
+    bool secure = false;                // https, wss
+
+    // The Host header's value: the port only when it is not the default
+    std::string authority() const
+    {
+        const bool v6 = host.find(':') != std::string::npos;
+        std::string a = v6 ? "[" + host + "]" : host;
+        const bool default_port = (port == "80" && !secure) || (port == "443" && secure);
+        if (!default_port)
+            a += ":" + port;
+        return a;
+    }
+};
+
+inline bool parse_url(const std::string& text, url& out)
+{
+    const std::size_t sep = text.find("://");
+    if (sep == std::string::npos || sep == 0)
+        return false;
+    std::string scheme = text.substr(0, sep);
+    for (char& c : scheme)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    if (scheme == "http" || scheme == "ws") {
+        out.port = "80";
+        out.secure = false;
+    } else if (scheme == "https" || scheme == "wss") {
+        out.port = "443";
+        out.secure = true;
+    } else {
+        return false;
+    }
+    out.scheme = scheme;
+
+    const std::size_t start = sep + 3;
+    std::size_t end = text.find_first_of("/?#", start);
+    std::string authority = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (authority.empty() || authority.find('@') != std::string::npos)
+        return false;
+    std::string rest = end == std::string::npos ? std::string() : text.substr(end);
+    if (const std::size_t hash = rest.find('#'); hash != std::string::npos)
+        rest.erase(hash);
+    if (rest.empty() || rest[0] == '?')
+        rest.insert(rest.begin(), '/');
+    for (const char c : rest) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u <= 0x20 || u == 0x7f)
+            return false;                   // a space or control character would split the request line
+    }
+    out.target = rest;
+
+    // A bracketed IPv6 literal keeps its colons; only a colon after it separates the port
+    if (authority[0] == '[') {
+        const std::size_t close = authority.find(']');
+        if (close == std::string::npos)
+            return false;
+        out.host = authority.substr(1, close - 1);
+        if (close + 1 < authority.size()) {
+            if (authority[close + 1] != ':')
+                return false;
+            out.port = authority.substr(close + 2);
+        }
+    } else {
+        const std::size_t colon = authority.rfind(':');
+        if (colon == std::string::npos) {
+            out.host = authority;
+        } else {
+            out.host = authority.substr(0, colon);
+            out.port = authority.substr(colon + 1);
+        }
+    }
+    if (out.host.empty() || out.port.empty())
+        return false;
+    for (const char c : out.port)
+        if (c < '0' || c > '9')
+            return false;
+    return true;
+}
+
+} // namespace net
+} // namespace snicholls
+
+#endif // ts_moveables_net_url_hpp
+// end net/url.hpp
 
 #include <cctype>
 #include <functional>
@@ -17235,42 +17524,14 @@ struct ws_url {
 
 inline bool parse_ws_url(const std::string& url, ws_url& out)
 {
-    std::size_t i = 0;
-    if (url.compare(0, 5, "ws://") == 0) {
-        i = 5;
-        out.secure = false;
-        out.port = "80";
-    } else if (url.compare(0, 6, "wss://") == 0) {
-        i = 6;
-        out.secure = true;
-        out.port = "443";
-    } else {
+    net::url u;
+    if (!net::parse_url(url, u) || (u.scheme != "ws" && u.scheme != "wss"))
         return false;
-    }
-    const std::size_t slash = url.find('/', i);
-    std::string authority = url.substr(i, slash == std::string::npos ? std::string::npos : slash - i);
-    out.path = (slash == std::string::npos) ? "/" : url.substr(slash);
-    if (authority.empty())
-        return false;
-    // A bracketed IPv6 literal keeps its colons; only the last colon outside
-    // brackets separates the port
-    if (authority[0] == '[') {
-        const std::size_t close = authority.find(']');
-        if (close == std::string::npos)
-            return false;
-        out.host = authority.substr(1, close - 1);
-        if (close + 1 < authority.size() && authority[close + 1] == ':')
-            out.port = authority.substr(close + 2);
-    } else {
-        const std::size_t colon = authority.rfind(':');
-        if (colon == std::string::npos) {
-            out.host = authority;
-        } else {
-            out.host = authority.substr(0, colon);
-            out.port = authority.substr(colon + 1);
-        }
-    }
-    return !out.host.empty() && !out.port.empty();
+    out.host = u.host;
+    out.port = u.port;
+    out.path = u.target;
+    out.secure = u.secure;
+    return true;
 }
 
 } // namespace detail
@@ -18076,6 +18337,402 @@ private:
 #endif /* SNICHOLLS_HAS_WEBSOCKET */
 #endif /* ts_moveables_websocket_client_hpp */
 // end http/websocket_client.hpp
+// (inlined) #include "net/outbound.hpp"                      // IWYU pragma: export (one outbound connection)
+// ----------------------------------------------------------------------
+// begin net/outbound.hpp
+// ----------------------------------------------------------------------
+//
+//  outbound.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - one outbound connection on an event loop: resolve,
+//  connect, optionally TLS, then bytes in and bytes out. The part of a client
+//  that is the same for every protocol, so it is written once:
+//
+//      auto c = std::make_shared<snicholls::net::outbound_connection>(loop, "example.com", "443", tls_factory);
+//      c->on_open  = [&] { c->write(request); };
+//      c->on_data  = [&](std::string& in) { /* consume from the front of in */ };
+//      c->on_close = [&](snicholls::net::outbound_status why) { ... };
+//      c->start();
+//
+//    - Every address the name resolves to is tried in order. A non-blocking
+//      connect() to a dead address returns EINPROGRESS exactly like a live
+//      one, so "the first that did not fail at once" silently commits to the
+//      wrong one; `localhost` resolving to ::1 first while only IPv4 listens
+//      is the everyday case.
+//    - A transport (TLS) gets every byte both ways when one is given: it
+//      speaks first (the ClientHello), and bytes it owes the peer in reply to
+//      bytes received are flushed at once, or the handshake stalls.
+//    - on_open fires when the transport is established, so the first write
+//      already rides inside TLS.
+//    - Loop thread only: start(), write() and close() are called there, and
+//      the callbacks run there. Own it by shared_ptr; the watch holds only
+//      a weak reference, so destroying the owner's pointer ends it.
+//
+//  Extracted from http::websocket_client's connection core so http::client
+//  shares it. POSIX, like the event loop.
+//
+
+#ifndef ts_moveables_net_outbound_hpp
+#define ts_moveables_net_outbound_hpp
+
+// (inlined) #include "../event/loop.hpp"
+
+#if SNICHOLLS_HAS_EVENT_LOOP
+
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// (inlined) #include "../interfaces/transport_delegate.hpp"
+
+namespace snicholls {
+namespace net {
+
+enum class outbound_status : std::uint8_t {
+    closed_by_us,       // close() was called
+    closed_by_peer,     // orderly EOF
+    resolve_failed,     // the name did not resolve
+    connect_failed,     // every address refused or timed out
+    transport_error,    // the socket or the TLS engine failed after connecting
+    handshake_failed,   // the TLS handshake failed
+    timed_out,          // the connect timeout passed
+};
+
+inline const char* to_string(outbound_status s) noexcept
+{
+    switch (s) {
+    case outbound_status::closed_by_us: return "closed by us";
+    case outbound_status::closed_by_peer: return "closed by peer";
+    case outbound_status::resolve_failed: return "name did not resolve";
+    case outbound_status::connect_failed: return "connect failed";
+    case outbound_status::transport_error: return "transport error";
+    case outbound_status::handshake_failed: return "TLS handshake failed";
+    case outbound_status::timed_out: return "connect timed out";
+    }
+    return "?";
+}
+
+using transport_factory = std::function<std::unique_ptr<http::transport_delegate>(const std::string& host)>;
+
+class outbound_connection : public std::enable_shared_from_this<outbound_connection> {
+public:
+    outbound_connection(event_loop& loop, std::string host, std::string port, transport_factory factory = {},
+                        std::chrono::milliseconds connect_timeout = std::chrono::seconds{10})
+        : loop_(&loop), host_(std::move(host)), port_(std::move(port)), factory_(std::move(factory)),
+          connect_timeout_(connect_timeout)
+    {
+    }
+
+    outbound_connection(const outbound_connection&) = delete;
+    outbound_connection& operator=(const outbound_connection&) = delete;
+
+    ~outbound_connection() { teardown(); }
+
+    std::function<void()> on_open;
+    std::function<void(std::string& in)> on_data;         // plaintext appended; erase what you consume
+    std::function<void(outbound_status)> on_close;        // once, after which nothing else fires
+
+    void start()
+    {
+        if (started_)
+            return;
+        started_ = true;
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        if (::getaddrinfo(host_.c_str(), port_.c_str(), &hints, &res) != 0 || !res)
+            return finish(outbound_status::resolve_failed);
+        for (addrinfo* a = res; a; a = a->ai_next) {
+            if (a->ai_addrlen > sizeof(sockaddr_storage))
+                continue;
+            candidate c;
+            c.family = a->ai_family;
+            c.socktype = a->ai_socktype;
+            c.protocol = a->ai_protocol;
+            c.len = a->ai_addrlen;
+            std::memcpy(&c.addr, a->ai_addr, a->ai_addrlen);
+            addrs_.push_back(c);
+        }
+        ::freeaddrinfo(res);
+        if (addrs_.empty())
+            return finish(outbound_status::resolve_failed);
+        if (connect_timeout_.count() > 0) {
+            deadline_ = loop_->after(connect_timeout_);
+            std::weak_ptr<outbound_connection> weak = shared_from_this();
+            deadline_.on_fire([weak] {
+                if (auto self = weak.lock())
+                    if (!self->open_)
+                        self->finish(outbound_status::timed_out);
+            });
+        }
+        try_next_address();
+    }
+
+    // Queue `n` bytes of plaintext; false once the connection has failed
+    bool write(const char* data, std::size_t n)
+    {
+        if (closed_ || fd_ < 0)
+            return false;
+        const bool ok = transport_ ? transport_->app_out(data, n, out_) : (out_.append(data, n), true);
+        if (!ok) {
+            finish(outbound_status::transport_error);
+            return false;
+        }
+        if (open_)
+            flush();
+        return true;
+    }
+    bool write(const std::string& s) { return write(s.data(), s.size()); }
+
+    // Close now; on_close fires with closed_by_us
+    void close() { finish(outbound_status::closed_by_us); }
+
+    bool open() const noexcept { return open_; }
+    bool closed() const noexcept { return closed_; }
+    std::size_t backlog() const noexcept { return out_.size() - sent_; }
+    const std::string& host() const noexcept { return host_; }
+    const char* alpn() const noexcept { return transport_ ? transport_->alpn() : ""; }
+
+private:
+    struct candidate {
+        int family = 0, socktype = 0, protocol = 0;
+        sockaddr_storage addr{};
+        socklen_t len = 0;
+    };
+
+    void try_next_address()
+    {
+        watch_.reset();
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        while (addr_at_ < addrs_.size()) {
+            const candidate& c = addrs_[addr_at_++];
+            const int s = ::socket(c.family, c.socktype, c.protocol);
+            if (s < 0)
+                continue;
+            ::fcntl(s, F_SETFD, FD_CLOEXEC);
+            ::fcntl(s, F_SETFL, O_NONBLOCK);
+            const int on = 1;
+            ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+#if defined(SO_NOSIGPIPE)
+            ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#endif
+            const int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&c.addr), c.len);
+            if (rc != 0 && errno != EINPROGRESS) {
+                ::close(s);
+                continue;                       // refused outright: the next address
+            }
+            fd_ = s;
+            in_.clear();
+            out_.clear();
+            sent_ = 0;
+            // A fresh transport per attempt: TLS state cannot outlive its connection
+            transport_.reset();
+            if (factory_) {
+                transport_ = factory_(host_);
+                if (!transport_)
+                    return finish(outbound_status::connect_failed);
+            }
+            watch_ = loop_->watch(fd_, fd_interest::write);
+            std::weak_ptr<outbound_connection> weak = shared_from_this();
+            watch_.on_writable([weak] {
+                if (auto self = weak.lock())
+                    self->on_writable();
+            });
+            watch_.on_readable([weak] {
+                if (auto self = weak.lock())
+                    self->on_readable();
+            });
+            watch_.on_error([weak] {
+                if (auto self = weak.lock()) {
+                    if (self->connecting_)
+                        self->try_next_address();
+                    else
+                        self->on_readable();     // EOF can arrive as an error event: read what is buffered
+                                                 // first, and recv() then says closed or the real error
+                }
+            });
+            connecting_ = true;
+            return;
+        }
+        finish(outbound_status::connect_failed);   // every address exhausted
+    }
+
+    void on_writable()
+    {
+        if (connecting_) {
+            int err = 0;
+            socklen_t len = sizeof err;
+            if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0)
+                return try_next_address();      // this address refused: the next
+            connecting_ = false;
+            if (transport_) {
+                // TLS speaks first: the ClientHello goes before any application byte
+                if (!transport_->start(out_))
+                    return finish(outbound_status::handshake_failed);
+                watch_.set_interest(fd_interest::read_write);
+                flush();
+                if (!closed_ && transport_->established())
+                    become_open();
+                return;
+            }
+            become_open();
+            return;
+        }
+        flush();
+    }
+
+    void become_open()
+    {
+        open_ = true;
+        deadline_.cancel();
+        watch_.set_interest(backlog() > 0 ? fd_interest::read_write : fd_interest::read);
+        auto keep = shared_from_this();     // a callback may drop the owner's pointer
+        if (on_open)
+            on_open();
+        if (!closed_ && !out_.empty())
+            flush();
+    }
+
+    void flush()
+    {
+        while (sent_ < out_.size()) {
+            const ssize_t n = ::send(fd_, out_.data() + sent_, out_.size() - sent_, MSG_NOSIGNAL_FLAG);
+            if (n > 0) {
+                sent_ += std::size_t(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                watch_.set_interest(fd_interest::read_write);
+                return;
+            }
+            return finish(outbound_status::transport_error);
+        }
+        out_.clear();
+        sent_ = 0;
+        if (open_)
+            watch_.set_interest(fd_interest::read);
+    }
+
+    void on_readable()
+    {
+        auto keep = shared_from_this();
+        bool eof = false;
+        for (;;) {
+            char buf[16 * 1024];
+            const ssize_t n = ::recv(fd_, buf, sizeof buf, 0);
+            if (n > 0) {
+                if (transport_) {
+                    if (!transport_->wire_in(buf, std::size_t(n), in_, out_))
+                        return finish(open_ ? outbound_status::transport_error : outbound_status::handshake_failed);
+                } else {
+                    in_.append(buf, std::size_t(n));
+                }
+                if (std::size_t(n) < sizeof buf)
+                    break;
+                continue;
+            }
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            return finish(outbound_status::transport_error);
+        }
+        // The TLS handshake answers bytes with bytes; without this both ends wait
+        if (transport_ && !out_.empty())
+            flush();
+        if (closed_)
+            return;
+        if (!open_ && transport_ && transport_->established())
+            become_open();
+        if (closed_)
+            return;
+        if (open_ && !in_.empty() && on_data)
+            on_data(in_);
+        if (closed_)
+            return;
+        if (eof)
+            finish(open_ ? outbound_status::closed_by_peer : outbound_status::handshake_failed);
+    }
+
+    void finish(outbound_status why)
+    {
+        if (closed_)
+            return;
+        closed_ = true;
+        open_ = false;
+        teardown();
+        auto cb = std::move(on_close);
+        on_open = nullptr;
+        on_data = nullptr;
+        if (cb)
+            cb(why);
+    }
+
+    void teardown() noexcept
+    {
+        deadline_.cancel();
+        watch_.reset();
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+#if defined(MSG_NOSIGNAL)
+    static constexpr int MSG_NOSIGNAL_FLAG = MSG_NOSIGNAL;
+#else
+    static constexpr int MSG_NOSIGNAL_FLAG = 0;
+#endif
+
+    event_loop* loop_;
+    std::string host_, port_;
+    transport_factory factory_;
+    std::chrono::milliseconds connect_timeout_;
+    std::vector<candidate> addrs_;
+    std::size_t addr_at_ = 0;
+    int fd_ = -1;
+    std::unique_ptr<http::transport_delegate> transport_;
+    event_loop::fd_watch watch_;
+    event_loop::timer deadline_;
+    std::string in_, out_;
+    std::size_t sent_ = 0;
+    bool started_ = false, connecting_ = false, open_ = false, closed_ = false;
+};
+
+} // namespace net
+} // namespace snicholls
+
+#endif // SNICHOLLS_HAS_EVENT_LOOP
+
+#endif // ts_moveables_net_outbound_hpp
+// end net/outbound.hpp
+// (inlined) #include "net/url.hpp"                           // IWYU pragma: export
 // (inlined) #include "concurrent/synchronized.hpp"                 // IWYU pragma: export
 // (inlined) #include "concurrent/synchronized_heterogeneous.hpp"   // IWYU pragma: export
 // ----------------------------------------------------------------------
@@ -18417,6 +19074,277 @@ namespace snicholls
 
 #endif /* synchronized_heterogeneous_hpp */
 // end concurrent/synchronized_heterogeneous.hpp
+// (inlined) #include "process/global.hpp"                     // IWYU pragma: export
+// ----------------------------------------------------------------------
+// begin process/global.hpp
+// ----------------------------------------------------------------------
+//
+//  global.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - one-off, process-wide initialisers (an SDK's
+//  InitAPI, curl_global_init, OpenSSL, gRPC, a connection pool) as RAII
+//  singletons with a defined start and a defined, ordered shutdown:
+//
+//      struct aws_sdk {
+//          static constexpr std::string_view name = "aws_sdk";
+//          aws_sdk()  { Aws::InitAPI(options); }       // may throw: the next get() retries
+//          ~aws_sdk() { Aws::ShutdownAPI(options); }   // must not throw
+//          Aws::SDKOptions options;
+//      };
+//      snicholls::global<aws_sdk>::get();              // any thread, any number of times: constructed once
+//      snicholls::shutdown_globals();                  // reverse order of completion
+//
+//  ------------------------------------------------------------------ the rules
+//
+//    - Idempotent and thread-safe. Once initialised, get() is one acquire
+//      load. Concurrent first callers wait for one constructor. A constructor
+//      that throws leaves the global uninitialised, the exception propagates,
+//      and the next get() tries again.
+//    - Dependencies: call global<dep>::get() inside the constructor. dep
+//      completes first, so it shuts down last. A cycle on one thread (a needs
+//      b needs a) throws global_init_error instead of deadlocking. A cycle
+//      across threads - each constructor waiting on a global the other thread
+//      is constructing - is not detected; keep constructors to their own
+//      dependencies.
+//    - Shutdown is explicit: shutdown_globals() destroys every initialised
+//      global in reverse order of completion, before static destruction and
+//      never from atexit. A global_scope does it at the end of main(). Call
+//      it once nothing still uses the globals: a reference from an earlier
+//      get() dangles afterwards.
+//    - After shutdown, get() throws global_init_error unless T declares
+//      `static constexpr bool reinitialisable = true` (most SDKs cannot be
+//      started twice).
+//    - Storage is leaked on purpose: no static destructor ever runs, so
+//      nothing depends on the order of static destruction across files.
+//
+//  T must be default-constructible, nothrow-destructible, and have a static
+//  `name` convertible to std::string_view (shown by active_globals() and in
+//  errors).
+//
+//  Moved here from an earlier application framework, whose copy was the best
+//  of several; the behaviour is the same, the debug log lines are not
+//  (subscribe with set_global_observer).
+//
+//  C++17, standard library only.
+//
+
+#ifndef ts_moveables_process_global_hpp
+#define ts_moveables_process_global_hpp
+
+#include <atomic>
+#include <cstddef>
+#include <mutex>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <type_traits>
+#include <vector>
+
+namespace snicholls {
+
+// Thrown by global<T>::get() on a cycle, or after shutdown when T is not reinitialisable
+class global_init_error : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// What a global observer is told
+enum class global_event { initialising, initialised, shutting_down };
+
+// Called for every global as it starts and stops: wire it to a logger. A plain function pointer, so it costs
+// nothing when unset and needs no allocation; it must not throw.
+using global_observer = void (*)(global_event, std::string_view name) noexcept;
+
+namespace detail::globals {
+
+template <class T, class = void>
+struct has_name : std::false_type {};
+template <class T>
+struct has_name<T, std::void_t<decltype(T::name)>>
+    : std::bool_constant<std::is_convertible_v<decltype(T::name), std::string_view>> {};
+
+template <class T, class = void>
+struct reinitialisable : std::false_type {};
+template <class T>
+struct reinitialisable<T, std::void_t<decltype(T::reinitialisable)>> : std::bool_constant<T::reinitialisable> {};
+
+inline std::atomic<global_observer>& observer() noexcept
+{
+    static std::atomic<global_observer> o{nullptr};   // constant-initialised, so safe from any static initialiser
+    return o;
+}
+
+inline void notify(global_event e, std::string_view name) noexcept
+{
+    if (global_observer o = observer().load(std::memory_order_acquire)) o(e, name);
+}
+
+class registry
+{
+public:
+    struct record
+    {
+        std::string_view name;
+        void (*destroy)() noexcept;
+    };
+
+    static registry& instance() noexcept
+    {
+        static registry* const r = new registry;   // leaked on purpose
+        return *r;
+    }
+
+    void completed(std::string_view name, void (*destroy)() noexcept)
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        records_.push_back({name, destroy});
+    }
+
+    // Destroys in reverse order of completion; the names in the order they were shut down
+    std::vector<std::string> shutdown_all() noexcept
+    {
+        std::vector<std::string> names;
+        for (;;) {
+            record r;
+            {
+                const std::lock_guard<std::mutex> lock(mutex_);
+                if (records_.empty()) break;
+                r = records_.back();
+                records_.pop_back();
+            }
+            try {
+                names.emplace_back(r.name);
+            } catch (...) {
+            }
+            notify(global_event::shutting_down, r.name);
+            r.destroy();   // never under the registry lock, so a destructor may use other globals
+        }
+        return names;
+    }
+
+    std::vector<std::string> active() const
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> names;
+        names.reserve(records_.size());
+        for (const record& r : records_) names.emplace_back(r.name);
+        return names;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<record> records_;
+};
+
+} // namespace detail::globals
+
+template <class T>
+class global
+{
+    static_assert(std::is_default_constructible_v<T>, "snicholls::global<T>: T must be default-constructible");
+    static_assert(std::is_nothrow_destructible_v<T>, "snicholls::global<T>: T's destructor must not throw");
+    static_assert(detail::globals::has_name<T>::value,
+                  "snicholls::global<T>: T needs `static constexpr std::string_view name = \"...\";`");
+
+public:
+    global() = delete;
+
+    // The instance, constructed on first use
+    static T& get()
+    {
+        state& s = storage();
+        if (T* p = s.instance.load(std::memory_order_acquire)) return *p;
+        return slow_get(s);
+    }
+
+    [[nodiscard]] static bool initialised() noexcept
+    {
+        return storage().instance.load(std::memory_order_acquire) != nullptr;
+    }
+
+    [[nodiscard]] static bool shut_down() noexcept { return storage().shut_down.load(std::memory_order_acquire); }
+
+private:
+    struct state
+    {
+        std::mutex mutex;
+        std::atomic<T*> instance{nullptr};
+        std::atomic<std::thread::id> initialising{};
+        std::atomic<bool> shut_down{false};
+        alignas(T) unsigned char buffer[sizeof(T)];
+    };
+
+    static state& storage() noexcept
+    {
+        static state* const s = new state;   // leaked on purpose
+        return *s;
+    }
+
+    static T& slow_get(state& s)
+    {
+        if (s.initialising.load(std::memory_order_acquire) == std::this_thread::get_id())
+            throw global_init_error("snicholls::global: initialisation cycle through " + std::string(T::name));
+        const std::lock_guard<std::mutex> lock(s.mutex);
+        if (T* p = s.instance.load(std::memory_order_acquire)) return *p;
+        if (s.shut_down.load(std::memory_order_acquire) && !detail::globals::reinitialisable<T>::value)
+            throw global_init_error("snicholls::global: " + std::string(T::name) +
+                                    " was shut down and is not reinitialisable");
+        s.initialising.store(std::this_thread::get_id(), std::memory_order_release);
+        struct reset_owner
+        {
+            state& s;
+            ~reset_owner() { s.initialising.store(std::thread::id{}, std::memory_order_release); }
+        } guard{s};
+        detail::globals::notify(global_event::initialising, T::name);
+        T* p = ::new (static_cast<void*>(s.buffer)) T();   // throws: nothing recorded, the next get() retries
+        s.shut_down.store(false, std::memory_order_release);
+        s.instance.store(p, std::memory_order_release);
+        detail::globals::registry::instance().completed(T::name, &destroy);
+        detail::globals::notify(global_event::initialised, T::name);
+        return *p;
+    }
+
+    static void destroy() noexcept
+    {
+        state& s = storage();
+        const std::lock_guard<std::mutex> lock(s.mutex);
+        if (T* p = s.instance.exchange(nullptr, std::memory_order_acq_rel)) p->~T();
+        s.shut_down.store(true, std::memory_order_release);
+    }
+};
+
+// Shut down every initialised global in reverse order of completion; their names in shutdown order
+inline std::vector<std::string> shutdown_globals() noexcept { return detail::globals::registry::instance().shutdown_all(); }
+
+// The initialised globals, in order of completion
+[[nodiscard]] inline std::vector<std::string> active_globals() { return detail::globals::registry::instance().active(); }
+
+// Set (or clear, with nullptr) the observer told of every start and stop; returns the previous one
+inline global_observer set_global_observer(global_observer o) noexcept
+{
+    return detail::globals::observer().exchange(o, std::memory_order_acq_rel);
+}
+
+// shutdown_globals() at the end of a scope: put one at the top of main()
+class global_scope
+{
+public:
+    global_scope() = default;
+    global_scope(const global_scope&) = delete;
+    global_scope& operator=(const global_scope&) = delete;
+    ~global_scope() { shutdown_globals(); }
+};
+
+} // namespace snicholls
+
+#endif // ts_moveables_process_global_hpp
+// end process/global.hpp
 
 #endif /* ts_moveables_hpp */
 // end ts_moveables.hpp

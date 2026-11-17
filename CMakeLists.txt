@@ -85,7 +85,8 @@ if(TS_MOVEABLES_BUILD_TESTS)
         tests/tests_websocket_client.cpp
         tests/tests_ws_deflate.cpp
         tests/tests_logging.cpp
-        tests/tests_http2.cpp)
+        tests/tests_http2.cpp
+        tests/tests_global.cpp)
     target_link_libraries(ts_moveables_tests PRIVATE snicholls::ts_moveables)
     add_test(NAME unit_tests COMMAND ts_moveables_tests)
 

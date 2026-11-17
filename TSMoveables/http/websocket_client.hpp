@@ -66,6 +66,7 @@
 #include "../interfaces/transport_delegate.hpp"
 #include "../moveable/atomic.hpp"
 #include "../moveable/signal.hpp"
+#include "../net/url.hpp"
 
 #include <cctype>
 #include <functional>
@@ -139,42 +140,14 @@ struct ws_url {
 
 inline bool parse_ws_url(const std::string& url, ws_url& out)
 {
-    std::size_t i = 0;
-    if (url.compare(0, 5, "ws://") == 0) {
-        i = 5;
-        out.secure = false;
-        out.port = "80";
-    } else if (url.compare(0, 6, "wss://") == 0) {
-        i = 6;
-        out.secure = true;
-        out.port = "443";
-    } else {
+    net::url u;
+    if (!net::parse_url(url, u) || (u.scheme != "ws" && u.scheme != "wss"))
         return false;
-    }
-    const std::size_t slash = url.find('/', i);
-    std::string authority = url.substr(i, slash == std::string::npos ? std::string::npos : slash - i);
-    out.path = (slash == std::string::npos) ? "/" : url.substr(slash);
-    if (authority.empty())
-        return false;
-    // A bracketed IPv6 literal keeps its colons; only the last colon outside
-    // brackets separates the port
-    if (authority[0] == '[') {
-        const std::size_t close = authority.find(']');
-        if (close == std::string::npos)
-            return false;
-        out.host = authority.substr(1, close - 1);
-        if (close + 1 < authority.size() && authority[close + 1] == ':')
-            out.port = authority.substr(close + 2);
-    } else {
-        const std::size_t colon = authority.rfind(':');
-        if (colon == std::string::npos) {
-            out.host = authority;
-        } else {
-            out.host = authority.substr(0, colon);
-            out.port = authority.substr(colon + 1);
-        }
-    }
-    return !out.host.empty() && !out.port.empty();
+    out.host = u.host;
+    out.port = u.port;
+    out.path = u.target;
+    out.secure = u.secure;
+    return true;
 }
 
 } // namespace detail

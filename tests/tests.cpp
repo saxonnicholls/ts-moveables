@@ -41,6 +41,7 @@ void run_ws_broadcast_hub_tests();
 void run_ws_deflate_tests();
 void run_logging_tests();
 void run_http2_tests();
+void run_global_tests();
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -873,6 +874,7 @@ int main(int argc, char** argv)
         run_seqlock_tests();
         run_thread_pool_tests();
         run_parallel_for_tests();
+        run_global_tests();
         test_once_flag();
         test_semaphore();
         test_latch();
@@ -920,6 +922,7 @@ int main(int argc, char** argv)
     run_ws_deflate_tests();
     run_logging_tests();
     run_http2_tests();
+    run_global_tests();
 
     test_once_flag();
 

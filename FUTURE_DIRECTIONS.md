@@ -275,7 +275,7 @@ The dispatch bench ships as `make bench-dispatch`, and the honest answer is *nea
 
 Filed, not built:
 
-- **A task on the loop thread that posts into a full queue waits forever.** `post` yields until the bounded queue has room, and only the loop thread can make room. It predates 1.6.0 (the new stress test found it when its nested bursts outran the default 4,096 slots); the test now sizes its queue past the most it queues. The fix is a policy decision: run the task inline when posting from the loop thread into a full queue (as the work-stealing pool does on saturation), or grow, or fail loudly. Until then: size the queue for the bursts you post from handlers.
+- **A task on the loop thread that posts into a full queue waited forever** ✅ *fixed after 1.7.0.* `post` yielded until the bounded queue had room, and only the loop thread can make room. Of the three policies, growing won: a post from the loop thread that finds the queue full goes to a loop-only overflow deque (no lock, since only the loop thread touches it) and keeps going there until it drains, so its posts stay in order. Running inline would break `post`'s promise that the task runs after the caller returns, and failing would break callers. Other threads keep the backpressure, which is safe for them. One limit remains: a loop driven by `run_once` from a thread that posts between calls is not *running* then, so that thread waits like any other; size the queue for it.
 - **A typed `post(F&&)`** storing a move-only, small-buffer task (~64 B inline) instead of a `std::function`: post captures are 48-80 B, past every standard library's small buffer, so each hop allocates on one thread and frees on another. Worth doing now that the syscall is gone; measure with a cross-thread post benchmark first.
 - **`task_group::run` makes three or four allocations per task.** A unit holding the callable directly, the shape `work_stealing_task_pool`'s nodes now have, would make it one. Share that shape with the typed `post`.
 
@@ -645,6 +645,10 @@ typed stubs. Known gaps for the design pass: **there is no h2 client yet**
 be verified in both directions, and the design must pick which subset of the
 grpc/grpc interop matrix is the honest first gate.
 
+**Update (after 1.7.0):** an HTTP/1.1 client now exists (`http/client.hpp`), on a shared
+`net::outbound_connection` and a `response_parser` that is the server's parser pointed the other way, with
+trailers kept in `response::trailers`. The h2 client is still the gap.
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:
@@ -678,5 +682,5 @@ Written down so nobody — including us — spends a busy week on them:
 | 18 | `task_pool_like` concept twin, pool algorithms as templates, `submit(F&&)` on the work-stealing and inline pools (§5) | Small | ✅ **Done, 1.6.0** — C++17 and C++20; `make bench-pool-dispatch`: the virtual call is free, `std::function` is not (1.7× / 8× with a 48-byte capture) |
 | 19 | Small-buffer move-only task in the by-value pools' queues (§5) | Medium | Filed — only for a workload of many small, large-capture tasks on those pools |
 | 20 | Coalesced wake writes for `post`, and an empty signal that returns at once (§7) | Small | ✅ **Done, 1.6.0** — one `write()` per burst of posts; ~114 → ~88 ns of dispatch overhead per event |
-| 21 | Posting from the loop thread into a full queue deadlocks (§7) | Small | Filed — a policy decision (inline, grow, or fail loudly); predates 1.6.0 |
+| 21 | Posting from the loop thread into a full queue deadlocks (§7) | Small | ✅ **Fixed after 1.7.0** — the loop thread's posts overflow into a loop-only deque, in order; other threads keep the backpressure |
 | 22 | Typed `post(F&&)` and a one-allocation `task_group::run` (§7) | Medium | Filed — next, now that the wake syscall is gone |

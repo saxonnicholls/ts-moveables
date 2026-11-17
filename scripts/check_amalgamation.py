@@ -51,6 +51,19 @@ OPT_IN = {
     "mmap/mapped_pool.hpp",
     "mmap/mapped_region.hpp",
     "mmap/mapped_vector.hpp",
+    # whole-file reads and atomic replacement: C++20 and POSIX, on core's result.hpp
+    "fs/file.hpp",
+    "fs/sync.hpp",
+    # process lifecycle: C++20 and POSIX, on core's result and secret (process/global.hpp is in the single header)
+    "process/config.hpp",
+    "process/dotenv.hpp",
+    "process/environment.hpp",
+    "process/exit_code.hpp",
+    "process/health.hpp",
+    "process/http_health.hpp",
+    "process/signals.hpp",
+    # the HTTP client returns core's result: C++20
+    "http/client.hpp",
 }
 
 # (output, entry) - must match the `amalgamate` target in the Makefile

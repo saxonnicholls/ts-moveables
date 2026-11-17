@@ -41,7 +41,10 @@
 #include "http/websocket.hpp"                    // IWYU pragma: export (a protocol delegate on it)
 #include "http/ws_broadcast_hub.hpp"             // IWYU pragma: export (fan-out over that)
 #include "http/websocket_client.hpp"            // IWYU pragma: export (the outbound half)
+#include "net/outbound.hpp"                      // IWYU pragma: export (one outbound connection)
+#include "net/url.hpp"                           // IWYU pragma: export
 #include "concurrent/synchronized.hpp"                 // IWYU pragma: export
 #include "concurrent/synchronized_heterogeneous.hpp"   // IWYU pragma: export
+#include "process/global.hpp"                     // IWYU pragma: export
 
 #endif /* ts_moveables_hpp */

@@ -14,12 +14,14 @@
 #include "tok/encoder.hpp"
 #include "tok/long_merge.hpp"
 
+#include "fs/file.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <map>
 #include <random>
 #include <sstream>
@@ -54,12 +56,15 @@ constexpr bool agree(std::string_view s)
 }
 static_assert(agree("a") && agree("ab") && agree("abab") && agree("ababab") && agree("bababa") && agree("aabbab"));
 
-std::string slurp(const std::string& p)
+// The demo's error policy over the library's read: report and stop
+std::string read_or_exit(const std::string& path)
 {
-    std::ifstream f(p, std::ios::binary);
-    std::stringstream s;
-    s << f.rdbuf();
-    return s.str();
+    auto r = snicholls::read_file(path);
+    if (r.is_err()) {
+        std::fprintf(stderr, "cannot read %s: %s\n", path.c_str(), r.unwrap_err_unchecked().message().c_str());
+        std::exit(2);
+    }
+    return std::move(*r);
 }
 std::string unbase64(std::string_view in)
 {
@@ -100,7 +105,7 @@ int main(int argc, char** argv)
         return 2;
     }
     const std::string dir = argv[1], name = argv[2];
-    const std::string raw = slurp(dir + "/docs.bin");
+    const std::string raw = read_or_exit(dir + "/docs.bin");
     std::vector<std::string_view> docs;
     {
         const char* p = raw.data();
@@ -117,7 +122,7 @@ int main(int argc, char** argv)
     }
     std::vector<std::pair<std::string, std::uint32_t>> kv;
     {
-        std::istringstream in(slurp(dir + "/" + name + ".ranks"));
+        std::istringstream in(read_or_exit(dir + "/" + name + ".ranks"));
         std::string b;
         std::uint32_t r;
         while (in >> b >> r)

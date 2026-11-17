@@ -166,6 +166,7 @@ constexpr const char* version_string() noexcept { return SNICHOLLS_VERSION_STRIN
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -1204,6 +1205,9 @@ namespace snicholls
             std::uint64_t next_seq = 0;
             std::uint64_t next_timer_id = 1;
             mpmc_queue<std::function<void()>> posted;
+            // Posts from the loop thread that found `posted` full. Only the
+            // loop thread touches it, so it needs no lock: see enqueue_task.
+            std::deque<std::function<void()>> overflow;
             std::atomic<bool> running{false};
             std::atomic<bool> stop_flag{false};
             // True from the post that wrote a wake byte until the loop has
@@ -1272,9 +1276,25 @@ namespace snicholls
             // drain BEFORE clearing: cleared first, a post could see false,
             // write, and have its byte swallowed by the drain, leaving the flag
             // set, the pipe empty and the loop asleep with work queued.
+            //
+            // A full queue makes other threads wait (backpressure: the loop is
+            // draining it). The loop thread cannot wait - it is the only thing
+            // that drains - so its post goes to `overflow` instead, and keeps
+            // going there until overflow is empty again, which keeps its posts
+            // in order. Running the task inline would break post's promise
+            // that the task runs later, after the caller returns; failing
+            // would break callers. No wake is needed: iterate() does not sleep
+            // while overflow holds work.
             void enqueue_task(std::function<void()> t) {
-                while (!posted.push(std::move(t)))          // bounded: backpressure when full
-                    std::this_thread::yield();
+                if (running.load(std::memory_order_acquire) && on_loop_thread()) {
+                    if (!overflow.empty() || !posted.push(std::move(t))) {
+                        overflow.push_back(std::move(t));
+                        return;
+                    }
+                } else {
+                    while (!posted.push(std::move(t)))      // bounded: backpressure when full
+                        std::this_thread::yield();
+                }
                 if (!wake_pending.exchange(true, std::memory_order_acq_rel))
                     wake();
             }
@@ -1292,10 +1312,23 @@ namespace snicholls
                 bool did = false;
 
                 // 1. Posted tasks - a snapshot's worth, so a task that posts
-                // more work cannot starve IO (the wake byte re-arms the poll)
+                // more work cannot starve IO (the wake byte re-arms the poll).
+                // Overflow's snapshot is taken now, before any task runs, and
+                // run after posted's: everything in it was posted after every
+                // loop-thread task already in posted, and a task posted into
+                // posted while these run must not be overtaken by one posted
+                // into overflow after it.
                 std::size_t budget = posted.size();
+                std::size_t overflow_budget = overflow.size();
                 std::function<void()> task;
                 while (budget-- > 0 && posted.try_pop(task)) {
+                    tap(dispatch_info{dispatch_info::kind::task, -1, 0});
+                    task();
+                    did = true;
+                }
+                while (overflow_budget-- > 0 && !overflow.empty()) {
+                    task = std::move(overflow.front());
+                    overflow.pop_front();
                     tap(dispatch_info{dispatch_info::kind::task, -1, 0});
                     task();
                     did = true;
@@ -1324,8 +1357,8 @@ namespace snicholls
 
                 // 3. How long may the poller sleep?
                 long long timeout_ms;
-                if (stop_flag.load(std::memory_order_acquire)) {
-                    timeout_ms = 0;
+                if (stop_flag.load(std::memory_order_acquire) || !overflow.empty()) {
+                    timeout_ms = 0;                         // overflow has work and no wake byte
                 } else if (!timers.empty()) {
                     // How long in REAL time, for a deadline in the clock's own
                     // timeline - not the same number once the two differ. A
@@ -2309,6 +2342,27 @@ public:
     header_list headers;
     std::string body;
 
+    // Filled when a response is parsed (the client side); a server building one leaves them alone
+    std::string reason;                 // the status line's reason phrase
+    int http_major = 1;
+    int http_minor = 1;
+    bool keep_alive = true;             // may the connection carry another request
+    header_list trailers;               // after a chunked body (gRPC's status lives here)
+
+    // Reset for reuse, keeping the buffers
+    void clear() noexcept
+    {
+        status = 200;
+        headers.clear();
+        body.clear();
+        reason.clear();
+        http_major = http_minor = 1;
+        keep_alive = true;
+        trailers.clear();
+    }
+
+    const std::string* header(const char* name) const noexcept { return headers.find(name); }
+
     response() = default;
     explicit response(int s) : status(s) {}
 
@@ -2364,6 +2418,7 @@ public:
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <type_traits>
 
 namespace snicholls {
 namespace http {
@@ -2382,18 +2437,44 @@ struct parse_limits {
     std::size_t max_chunk_line   = 1024;
 };
 
-class request_parser {
-public:
-    enum class status { need_more, have_request, failed };
+// One parser for both directions. basic_parser<request> is the server's
+// request_parser; basic_parser<response> is the client's response_parser. They
+// share the header, chunked and trailer handling, so the strictness that
+// protects the server protects the client too. What differs is the start line
+// and how a body is framed: a response to HEAD, and every 1xx, 204 and 304,
+// has none; a response with neither Content-Length nor chunked encoding runs
+// to the end of the connection (finish_eof()); and a response's trailers are
+// kept, where a request's are validated and dropped.
+template <class Message>
+class basic_parser {
+    static constexpr bool is_request = std::is_same_v<Message, request>;
 
-    request_parser() = default;
-    explicit request_parser(parse_limits lim) : lim_(lim) {}
+public:
+    // have_message and have_request are the same value: one name for each side
+    enum class status { need_more, have_request, failed, have_message = have_request };
+
+    basic_parser() = default;
+    explicit basic_parser(parse_limits lim) : lim_(lim) {}
+
+    // Responses only: the request was HEAD, so whatever the headers say there is no body. Set after reset()
+    void expect_no_body(bool v = true) noexcept { no_body_expected_ = v; }
+
+    // Responses only: the connection closed. A body delimited by the close is complete; anything else
+    // in progress was cut short
+    status finish_eof() noexcept
+    {
+        if (st_ == state::body_until_close)
+            return complete();
+        if (st_ == state::complete)
+            return status::have_request;
+        return fail(502, started_ ? "connection closed mid-response" : "connection closed before a response");
+    }
 
     void limits(const parse_limits& l) noexcept { lim_ = l; }
     const parse_limits& limits() const noexcept { return lim_; }
 
-    request& message() noexcept { return req_; }
-    const request& message() const noexcept { return req_; }
+    Message& message() noexcept { return msg_; }
+    const Message& message() const noexcept { return msg_; }
 
     bool headers_done() const noexcept { return headers_done_; }
     bool expects_continue() const noexcept { return expect_continue_; }
@@ -2403,7 +2484,7 @@ public:
 
     void reset()
     {
-        req_.clear();                           // reuse the buffers, do not free them
+        msg_.clear();                           // reuse the buffers, do not free them
         st_ = state::start_line;
         headers_done_ = expect_continue_ = started_ = false;
         header_bytes_ = 0;
@@ -2413,6 +2494,7 @@ public:
         framing_ = framing::none;
         err_status_ = 0;
         err_reason_ = nullptr;
+        no_body_expected_ = false;
     }
 
     status parse(const char* data, std::size_t len, std::size_t& consumed)
@@ -2449,7 +2531,7 @@ public:
                     p = lf + 1;
                     break;
                 }
-                if (!parse_request_line(p, line_end))
+                if (!parse_start_line(p, line_end))
                     return status::failed;
                 p = lf + 1;
                 st_ = state::headers;
@@ -2479,23 +2561,32 @@ public:
                         consumed = std::size_t(p - data);
                         return complete();
                     }
-                    st_ = (framing_ == framing::identity) ? state::body_identity
-                                                          : state::chunk_size;
+                    st_ = framing_ == framing::identity  ? state::body_identity
+                        : framing_ == framing::chunked ? state::chunk_size
+                                                       : state::body_until_close;
                     break;
                 }
                 if (*p == ' ' || *p == '\t')
                     return fail(400, "obsolete line folding");
                 if (++n_headers_ > lim_.max_headers)
                     return fail(431, "too many header fields");
-                if (!parse_header_line(p, line_end))
+                if (!parse_header_line(p, line_end, msg_.headers))
                     return status::failed;
                 p = lf + 1;
                 break;
             }
 
+            case state::body_until_close: {      // responses only: everything until the peer closes
+                if (msg_.body.size() + std::size_t(end - p) > lim_.max_body)
+                    return fail(413, "response body too large");
+                msg_.body.append(p, std::size_t(end - p));
+                consumed = len;
+                return status::need_more;
+            }
+
             case state::body_identity: {
                 const std::size_t take = std::min(std::size_t(end - p), body_remaining_);
-                req_.body.append(p, take);
+                msg_.body.append(p, take);
                 p += take;
                 body_remaining_ -= take;
                 consumed = std::size_t(p - data);
@@ -2525,7 +2616,7 @@ public:
                     st_ = state::trailers;
                     break;
                 }
-                if (req_.body.size() + size > lim_.max_body)
+                if (msg_.body.size() + size > lim_.max_body)
                     return fail(413, "chunked body too large");
                 chunk_remaining_ = size;
                 st_ = state::chunk_data;
@@ -2534,7 +2625,7 @@ public:
 
             case state::chunk_data: {
                 const std::size_t take = std::min(std::size_t(end - p), chunk_remaining_);
-                req_.body.append(p, take);
+                msg_.body.append(p, take);
                 p += take;
                 chunk_remaining_ -= take;
                 if (chunk_remaining_ != 0) {
@@ -2572,13 +2663,25 @@ public:
                 if (!terminate_line(p, lf, line_end))
                     return fail(400, "bare LF or stray CR in trailer");
                 const bool blank = (line_end == p);
+                const char* const line_begin = p;
                 p = lf + 1;
                 if (blank) {                    // blank line: trailers done
                     consumed = std::size_t(p - data);
                     return complete();
                 }
-                // Trailers are validated and discarded: merging them into the
-                // header set is a header-injection gadget
+                // A request's trailers are validated and discarded: merging them
+                // into the header set is a header-injection gadget. A response's
+                // are kept apart, in `trailers`, where gRPC puts its status
+                if constexpr (is_request) {
+                    if (!parse_header_line(line_begin, line_end, scratch_))
+                        return status::failed;
+                    scratch_.clear();
+                } else {
+                    if (++n_headers_ > lim_.max_headers)
+                        return fail(431, "too many trailer fields");
+                    if (!parse_header_line(line_begin, line_end, msg_.trailers))
+                        return status::failed;
+                }
                 break;
             }
 
@@ -2594,11 +2697,11 @@ public:
 
 private:
     enum class state {
-        start_line, headers, body_identity,
+        start_line, headers, body_identity, body_until_close,
         chunk_size, chunk_data, chunk_crlf, trailers,
         complete, failed
     };
-    enum class framing { none, identity, chunked };
+    enum class framing { none, identity, chunked, until_close };
 
     static const char* find_lf(const char* p, const char* end) noexcept
     {
@@ -2635,6 +2738,39 @@ private:
         return status::have_request;
     }
 
+    bool parse_start_line(const char* b, const char* e)
+    {
+        if constexpr (is_request)
+            return parse_request_line(b, e);
+        else
+            return parse_status_line(b, e);
+    }
+
+    // HTTP/1.x SP 3DIGIT SP reason - the reason may be empty, and the space before it may be missing
+    bool parse_status_line(const char* b, const char* e)
+    {
+        if (e - b < 12 || std::memcmp(b, "HTTP/", 5) != 0 || !detail::is_digit(b[5]) || b[6] != '.' ||
+            !detail::is_digit(b[7]) || b[8] != ' ')
+            return bad(502, "malformed status line");
+        msg_.http_major = b[5] - '0';
+        msg_.http_minor = b[7] - '0';
+        if (msg_.http_major != 1)
+            return bad(502, "unsupported HTTP version in response");
+        if (!detail::is_digit(b[9]) || !detail::is_digit(b[10]) || !detail::is_digit(b[11]) || b[9] == '0')
+            return bad(502, "malformed status code");
+        msg_.status = (b[9] - '0') * 100 + (b[10] - '0') * 10 + (b[11] - '0');
+        if (e - b > 12 && b[12] != ' ')
+            return bad(502, "malformed status line");
+        const char* r = (e - b > 12) ? b + 13 : e;
+        for (const char* q = r; q < e; ++q) {
+            const unsigned char c = static_cast<unsigned char>(*q);
+            if ((c < 0x20 && c != '\t') || c == 0x7f)
+                return bad(502, "control character in reason phrase");
+        }
+        msg_.reason.assign(r, std::size_t(e - r));
+        return true;
+    }
+
     bool parse_request_line(const char* b, const char* e)
     {
         const char* sp1 = static_cast<const char*>(std::memchr(b, ' ', std::size_t(e - b)));
@@ -2650,16 +2786,16 @@ private:
         for (const char* q = b; q < sp1; ++q)
             if (!detail::is_token_char(*q))
                 return bad(400, "invalid character in method");
-        req_.method_text.assign(b, std::size_t(sp1 - b));
-        req_.method = parse_method(req_.method_text);
+        msg_.method_text.assign(b, std::size_t(sp1 - b));
+        msg_.method = parse_method(msg_.method_text);
 
         const char* v = sp2 + 1;
         if (std::size_t(e - v) != 8 || std::memcmp(v, "HTTP/", 5) != 0 ||
             !detail::is_digit(v[5]) || v[6] != '.' || !detail::is_digit(v[7]))
             return bad(400, "malformed HTTP version");
-        req_.http_major = v[5] - '0';
-        req_.http_minor = v[7] - '0';
-        if (req_.http_major != 1)
+        msg_.http_major = v[5] - '0';
+        msg_.http_minor = v[7] - '0';
+        if (msg_.http_major != 1)
             return bad(505, "unsupported HTTP version");
 
         return parse_target(sp1 + 1, sp2);
@@ -2667,12 +2803,12 @@ private:
 
     bool parse_target(const char* b, const char* e)
     {
-        req_.target.assign(b, std::size_t(e - b));
+        msg_.target.assign(b, std::size_t(e - b));
         if (b == e)
             return bad(400, "empty request target");
 
         if (e - b == 1 && *b == '*') {          // asterisk-form (OPTIONS *)
-            req_.path = "*";
+            msg_.path = "*";
             return true;
         }
         // Work over the incoming bytes rather than a copy of them
@@ -2687,25 +2823,25 @@ private:
             tb = slash ? slash : nullptr;
             absolute_form_ = true;
             if (!tb) {                          // "http://host" with no path
-                req_.path = "/";
-                req_.query.clear();
+                msg_.path = "/";
+                msg_.query.clear();
                 return true;
             }
         }
         const char* q = static_cast<const char*>(std::memchr(tb, '?', std::size_t(e - tb)));
         const std::size_t path_len = std::size_t((q ? q : e) - tb);
         if (q)
-            req_.query.assign(q + 1, std::size_t(e - (q + 1)));
+            msg_.query.assign(q + 1, std::size_t(e - (q + 1)));
         else
-            req_.query.clear();
-        if (!detail::percent_decode(tb, path_len, req_.path, false))
+            msg_.query.clear();
+        if (!detail::percent_decode(tb, path_len, msg_.path, false))
             return bad(400, "invalid percent-encoding in request target");
-        if (req_.path.find('\0') != std::string::npos)
+        if (msg_.path.find('\0') != std::string::npos)
             return bad(400, "NUL byte in request target");
         return true;
     }
 
-    bool parse_header_line(const char* b, const char* e)
+    bool parse_header_line(const char* b, const char* e, header_list& into)
     {
         const char* colon = static_cast<const char*>(std::memchr(b, ':', std::size_t(e - b)));
         if (!colon || colon == b)
@@ -2728,7 +2864,7 @@ private:
 
         std::string name(b, std::size_t(colon - b));
         detail::ascii_lower(name);              // lowercase, as HTTP/2 will require anyway
-        req_.headers.add(std::move(name), std::string(vb, std::size_t(ve - vb)));
+        into.add(std::move(name), std::string(vb, std::size_t(ve - vb)));
         return true;
     }
 
@@ -2766,17 +2902,19 @@ private:
 
     bool finish_headers()
     {
-        const std::size_t hosts = req_.headers.count("host");
-        if (hosts > 1)
-            return bad(400, "multiple Host headers");
-        if (req_.http_minor >= 1 && hosts != 1 && !absolute_form_)
-            return bad(400, "HTTP/1.1 requires a Host header");
+        if constexpr (is_request) {
+            const std::size_t hosts = msg_.headers.count("host");
+            if (hosts > 1)
+                return bad(400, "multiple Host headers");
+            if (msg_.http_minor >= 1 && hosts != 1 && !absolute_form_)
+                return bad(400, "HTTP/1.1 requires a Host header");
+        }
 
         bool te_present = false, te_chunked = false;
         unsigned long long content_length = 0;
         std::size_t cl_fields = 0;
 
-        for (const auto& h : req_.headers) {
+        for (const auto& h : msg_.headers) {
             if (h.first == "transfer-encoding") {
                 te_present = true;
                 // The final coding must be chunked, and chunked must appear once
@@ -2816,21 +2954,21 @@ private:
         // RFC 9112 §6.1: both present is a smuggling attempt - 400 and close
         if (te_present && cl_fields)
             return bad(400, "Content-Length together with Transfer-Encoding");
-        if (te_present && !te_chunked)
+        if (te_present && !te_chunked && is_request)
             return bad(501, "unsupported Transfer-Encoding");
 
         bool close_requested = false, keepalive_requested = false;
-        for (const auto& h : req_.headers)
+        for (const auto& h : msg_.headers)
             if (h.first == "connection") {
                 if (detail::has_token(h.second, "close"))
                     close_requested = true;
                 if (detail::has_token(h.second, "keep-alive"))
                     keepalive_requested = true;
             }
-        req_.keep_alive = (req_.http_minor >= 1) ? !close_requested : keepalive_requested;
+        msg_.keep_alive = (msg_.http_minor >= 1) ? !close_requested : keepalive_requested;
 
-        if (req_.http_minor >= 1)
-            for (const auto& h : req_.headers)
+        if (is_request && msg_.http_minor >= 1)
+            for (const auto& h : msg_.headers)
                 if (h.first == "expect") {
                     if (detail::has_token(h.second, "100-continue"))
                         expect_continue_ = true;
@@ -2838,15 +2976,34 @@ private:
                         return bad(417, "unsupported Expect");
                 }
 
+        if constexpr (!is_request) {
+            // RFC 9112 §6.3: no body for HEAD, 1xx, 204 and 304, whatever the headers say;
+            // a Transfer-Encoding other than chunked last runs to the close; so does no framing at all
+            const int code = msg_.status;
+            if (no_body_expected_ || (code >= 100 && code < 200) || code == 204 || code == 304) {
+                framing_ = framing::none;
+                return true;
+            }
+            if (te_present && !te_chunked) {
+                framing_ = framing::until_close;
+                msg_.keep_alive = false;
+                return true;
+            }
+            if (!te_present && cl_fields == 0) {
+                framing_ = framing::until_close;
+                msg_.keep_alive = false;
+                return true;
+            }
+        }
         if (te_present) {
             framing_ = framing::chunked;
         } else if (content_length > 0) {
             if (content_length > lim_.max_body)
-                return bad(413, "request body too large");
+                return bad(413, is_request ? "request body too large" : "response body too large");
             framing_ = framing::identity;
             body_remaining_ = std::size_t(content_length);
             // Reserve modestly: a declared length is a claim, not a promise
-            req_.body.reserve(std::min<std::size_t>(body_remaining_, 64u * 1024));
+            msg_.body.reserve(std::min<std::size_t>(body_remaining_, 64u * 1024));
         } else {
             framing_ = framing::none;
         }
@@ -2875,7 +3032,8 @@ private:
     }
 
     parse_limits lim_{};
-    request req_{};
+    Message msg_{};
+    header_list scratch_{};                   // a request's trailers, validated then dropped
     state st_ = state::start_line;
     framing framing_ = framing::none;
     std::size_t header_bytes_ = 0;
@@ -2886,9 +3044,13 @@ private:
     bool expect_continue_ = false;
     bool started_ = false;
     bool absolute_form_ = false;
+    bool no_body_expected_ = false;
     int err_status_ = 0;
     const char* err_reason_ = nullptr;
 };
+
+using request_parser = basic_parser<request>;
+using response_parser = basic_parser<response>;
 
 } // namespace http
 } // namespace snicholls

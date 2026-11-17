@@ -435,6 +435,27 @@ public:
     header_list headers;
     std::string body;
 
+    // Filled when a response is parsed (the client side); a server building one leaves them alone
+    std::string reason;                 // the status line's reason phrase
+    int http_major = 1;
+    int http_minor = 1;
+    bool keep_alive = true;             // may the connection carry another request
+    header_list trailers;               // after a chunked body (gRPC's status lives here)
+
+    // Reset for reuse, keeping the buffers
+    void clear() noexcept
+    {
+        status = 200;
+        headers.clear();
+        body.clear();
+        reason.clear();
+        http_major = http_minor = 1;
+        keep_alive = true;
+        trailers.clear();
+    }
+
+    const std::string* header(const char* name) const noexcept { return headers.find(name); }
+
     response() = default;
     explicit response(int s) : status(s) {}
 

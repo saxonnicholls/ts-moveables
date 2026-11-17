@@ -208,11 +208,10 @@ void test_loop_post_from_threads()
 // thread itself.
 void test_loop_coalesced_wakes_lose_nothing()
 {
-    // Capacity above the most this test ever queues (2 x 4 x 5000): a task on
-    // the loop thread that posts into a FULL queue waits for room only the
-    // loop thread can make, which is a separate, known limit of post(), not
-    // what this test is about
-    event_loop loop(1 << 16);
+    // The default capacity (4,096) against up to 2 x 4 x 5000 queued: the
+    // posters wait for room, and the follow-ups posted from the loop thread
+    // overflow instead of waiting for room only the loop thread can make
+    event_loop loop;
     std::thread lt([&] { loop.run(); });
     assert(spin_until_for([&] { return loop.running(); }, std::chrono::milliseconds(5000)));
 
@@ -249,6 +248,68 @@ void test_loop_coalesced_wakes_lose_nothing()
     assert(all);
 
     pass("event loop: coalesced wake writes - ping-pong and nested bursts, nothing lost");
+}
+
+// A task on the loop thread that posts into a full queue used to spin for
+// ever: only the loop thread drains the queue. Its posts now overflow into a
+// loop-only queue and run in the order they were posted - a burst 1,000 times
+// the capacity, tasks that post more from inside the burst, and a timer
+// between bursts. Every wait has a deadline, so a regression fails, not hangs.
+void test_loop_thread_posts_past_capacity()
+{
+    event_loop loop(4);
+    std::vector<int> order;
+    std::atomic<bool> finished{false};
+    static constexpr int burst = 4000;
+
+    loop.post([&] {
+        for (int i = 0; i < burst; ++i)
+            loop.post([&order, i] { order.push_back(i); });
+        loop.post([&] {
+            // A second burst from inside the first's drain, then nested posts
+            for (int i = burst; i < 2 * burst; ++i)
+                loop.post([&order, &loop, i] {
+                    order.push_back(i);
+                    if (i == 2 * burst - 1)
+                        loop.post([&order] { order.push_back(-1); });
+                });
+        });
+    });
+    std::thread lt([&] { loop.run(); });
+    assert(spin_until_for([&] { return loop.running(); }, std::chrono::milliseconds(5000)));
+    // Posts from another thread still wait for room, and still arrive
+    std::atomic<int> outside{0};
+    for (int i = 0; i < 100; ++i)
+        loop.post([&outside] { outside.fetch_add(1, std::memory_order_relaxed); });
+    loop.post([&] { finished = true; });
+    const bool done = spin_until_for([&] { return finished.load() && outside.load() == 100 && order.size() ==
+                                                                        static_cast<std::size_t>(2 * burst + 1); },
+                                     std::chrono::milliseconds(10000));
+    loop.stop();
+    lt.join();
+    assert(done);   // a regression: the loop thread spun on its own full queue
+    for (int i = 0; i < 2 * burst; ++i)
+        assert(order[static_cast<std::size_t>(i)] == i);
+    assert(order.back() == -1);
+
+    // And on a loop driven by run_once from this thread, with a timer between bursts
+    event_loop small(2);
+    int fired = 0;
+    std::vector<int> seen;
+    small.post([&] {
+        for (int i = 0; i < 50; ++i) small.post([&seen, i] { seen.push_back(i); });
+    });
+    auto t = small.after(std::chrono::milliseconds(1));
+    t.on_fire([&] {
+        ++fired;
+        for (int i = 50; i < 100; ++i) small.post([&seen, i] { seen.push_back(i); });
+    });
+    for (int spins = 0; spins < 2000 && (seen.size() < 100 || fired == 0); ++spins)
+        small.run_once(std::chrono::milliseconds(1));
+    assert(fired == 1 && seen.size() == 100);
+    for (int i = 0; i < 100; ++i) assert(seen[static_cast<std::size_t>(i)] == i);
+
+    pass("event loop: the loop thread posts 2,000x past capacity without spinning, in order");
 }
 
 void test_loop_thread_contract()
@@ -662,6 +723,7 @@ void run_event_loop_tests()
     test_loop_timers();
     test_loop_post_from_threads();
     test_loop_coalesced_wakes_lose_nothing();
+    test_loop_thread_posts_past_capacity();
     test_loop_thread_contract();
     test_loop_reentrancy();
     test_loop_moveability();

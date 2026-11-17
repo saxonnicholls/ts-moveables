@@ -132,6 +132,15 @@ jobs:
       - name: Memory-mapped storage (tests, ASan, persistent index demo)
         run: make test-mmap asan-mmap demo-text-index CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
 
+      - name: Whole-file reads and atomic replacement (tests, ASan)
+        run: make test-fs asan-fs CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
+
+      - name: Process lifecycle - signals, config, environment, health, boot gate (tests, ASan)
+        run: make test-process asan-process CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
+
+      - name: HTTP client (tests against http::server and a scripted server, ASan)
+        run: make test-client asan-client CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
+
       # Autobahn|Testsuite: the external RFC 6455 grader. x86-64 Linux only -
       # it needs Docker with --network host to reach the echo server, and the
       # official image is published for amd64 only. Protocol conformance does
