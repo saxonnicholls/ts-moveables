@@ -51,6 +51,9 @@
 
 #include "../../TSMoveables/http/websocket.hpp"
 #include "../../TSMoveables/http/websocket_client.hpp"
+#if __cplusplus >= 202002L
+#include "../../TSMoveables/http/client.hpp"
+#endif
 #include "../../TSMoveables/moveable/mutex.hpp"
 
 #if SNICHOLLS_HAS_TLS
@@ -62,6 +65,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -774,6 +778,52 @@ void test_wss_refuses_hostname_mismatch(const self_signed& cred)
     pass("wss: a trusted certificate for the wrong host is still refused");
 }
 
+#if __cplusplus >= 202002L && SNICHOLLS_HAS_HTTP_CLIENT
+// http::client over the same TLS transport websocket_client uses: GET and a large POST on one verified session,
+// an untrusted certificate refused, and https:// without a transport refused rather than sent in the clear
+void test_https_client(const self_signed& cred)
+{
+    https_server<openssl_backend> s(cred);
+    wss_fixture fx(cred);
+    openssl_client_config ccfg;
+    ccfg.ca_file = fx.ca_path;
+    auto tls = std::make_shared<openssl_client_context>(ccfg);
+
+    snicholls::http::client_config cfg;
+    cfg.transport_factory = [tls](const std::string& host) {
+        return std::unique_ptr<transport_delegate>(tls->connect(host).release());
+    };
+    const std::string base = "https://localhost:" + std::to_string(s.port);
+    event_loop loop;
+    snicholls::http::client http(loop, cfg);
+    std::vector<snicholls::http::client_result> got;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    http.get(base + "/hello", [&](snicholls::http::client_result r) { got.push_back(std::move(r)); });
+    while (got.size() < 1 && std::chrono::steady_clock::now() < until) loop.run_once(std::chrono::milliseconds(10));
+    const std::string big(512 * 1024, 'z');     // after the first answer, so it can reuse that session
+    http.request({"POST", base + "/echo", {}, big, {}},
+                 [&](snicholls::http::client_result r) { got.push_back(std::move(r)); });
+    while (got.size() < 2 && std::chrono::steady_clock::now() < until) loop.run_once(std::chrono::milliseconds(10));
+    assert(got.size() == 2);
+    assert(got[0].is_ok() && got[0]->status == 200 && got[0]->body == "secure hello");
+    assert(got[1].is_ok() && got[1]->body == big);
+    assert(http.stats().connections_opened == 1);   // one TLS session, kept alive for the second request
+
+    // A client that trusts nothing in particular: the self-signed certificate is refused
+    snicholls::http::client_config strict;
+    auto untrusting = std::make_shared<openssl_client_context>(openssl_client_config{});
+    strict.transport_factory = [untrusting](const std::string& host) {
+        return std::unique_ptr<transport_delegate>(untrusting->connect(host).release());
+    };
+    const auto refused = snicholls::http::fetch({"GET", base + "/hello", {}, {}, {}}, strict);
+    assert(refused.is_err() && refused.unwrap_err_unchecked().code() == snicholls::http::client_errc::tls_failed);
+    const auto plain = snicholls::http::fetch({"GET", base + "/hello", {}, {}, {}});
+    assert(plain.is_err() && plain.unwrap_err_unchecked().code() == snicholls::http::client_errc::tls_unavailable);
+    pass("https: http::client over TLS - GET and a 512 KiB POST on one verified session; untrusted refused; "
+         "no transport, no request");
+}
+#endif
+
 void test_wss_without_a_transport_is_refused_not_downgraded()
 {
     // The failure that would matter most: a wss:// URL quietly connecting in
@@ -799,6 +849,9 @@ int main()
     test_wss_refuses_untrusted_certificate(cred);
     test_wss_refuses_hostname_mismatch(cred);
     test_wss_without_a_transport_is_refused_not_downgraded();
+#if __cplusplus >= 202002L && SNICHOLLS_HAS_HTTP_CLIENT
+    test_https_client(cred);
+#endif
 
 #if defined(SNICHOLLS_TEST_MBEDTLS)
     run_backend<mbedtls_backend>(cred);

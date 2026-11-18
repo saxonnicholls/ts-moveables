@@ -161,6 +161,17 @@ public:
     // Close now; on_close fires with closed_by_us
     void close() { finish(outbound_status::closed_by_us); }
 
+    // Send FIN after what is queued, keeping the read side open: a close frame then EOF, in that order
+    void shutdown_write()
+    {
+        if (fd_ < 0 || closed_)
+            return;
+        if (backlog() == 0)
+            ::shutdown(fd_, SHUT_WR);
+        else
+            shutdown_after_flush_ = true;
+    }
+
     bool open() const noexcept { return open_; }
     bool closed() const noexcept { return closed_; }
     std::size_t backlog() const noexcept { return out_.size() - sent_; }
@@ -288,6 +299,10 @@ private:
         }
         out_.clear();
         sent_ = 0;
+        if (shutdown_after_flush_) {
+            shutdown_after_flush_ = false;
+            ::shutdown(fd_, SHUT_WR);
+        }
         if (open_)
             watch_.set_interest(fd_interest::read);
     }
@@ -380,6 +395,7 @@ private:
     std::string in_, out_;
     std::size_t sent_ = 0;
     bool started_ = false, connecting_ = false, open_ = false, closed_ = false;
+    bool shutdown_after_flush_ = false;
 };
 
 } // namespace net

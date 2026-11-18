@@ -17324,6 +17324,417 @@ private:
 // (inlined) #include "../interfaces/transport_delegate.hpp"
 // (inlined) #include "../moveable/atomic.hpp"
 // (inlined) #include "../moveable/signal.hpp"
+// (inlined) #include "../net/outbound.hpp"
+// ----------------------------------------------------------------------
+// begin net/outbound.hpp
+// ----------------------------------------------------------------------
+//
+//  outbound.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - one outbound connection on an event loop: resolve,
+//  connect, optionally TLS, then bytes in and bytes out. The part of a client
+//  that is the same for every protocol, so it is written once:
+//
+//      auto c = std::make_shared<snicholls::net::outbound_connection>(loop, "example.com", "443", tls_factory);
+//      c->on_open  = [&] { c->write(request); };
+//      c->on_data  = [&](std::string& in) { /* consume from the front of in */ };
+//      c->on_close = [&](snicholls::net::outbound_status why) { ... };
+//      c->start();
+//
+//    - Every address the name resolves to is tried in order. A non-blocking
+//      connect() to a dead address returns EINPROGRESS exactly like a live
+//      one, so "the first that did not fail at once" silently commits to the
+//      wrong one; `localhost` resolving to ::1 first while only IPv4 listens
+//      is the everyday case.
+//    - A transport (TLS) gets every byte both ways when one is given: it
+//      speaks first (the ClientHello), and bytes it owes the peer in reply to
+//      bytes received are flushed at once, or the handshake stalls.
+//    - on_open fires when the transport is established, so the first write
+//      already rides inside TLS.
+//    - Loop thread only: start(), write() and close() are called there, and
+//      the callbacks run there. Own it by shared_ptr; the watch holds only
+//      a weak reference, so destroying the owner's pointer ends it.
+//
+//  Extracted from http::websocket_client's connection core so http::client
+//  shares it. POSIX, like the event loop.
+//
+
+#ifndef ts_moveables_net_outbound_hpp
+#define ts_moveables_net_outbound_hpp
+
+// (inlined) #include "../event/loop.hpp"
+
+#if SNICHOLLS_HAS_EVENT_LOOP
+
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+// (inlined) #include "../interfaces/transport_delegate.hpp"
+
+namespace snicholls {
+namespace net {
+
+enum class outbound_status : std::uint8_t {
+    closed_by_us,       // close() was called
+    closed_by_peer,     // orderly EOF
+    resolve_failed,     // the name did not resolve
+    connect_failed,     // every address refused or timed out
+    transport_error,    // the socket or the TLS engine failed after connecting
+    handshake_failed,   // the TLS handshake failed
+    timed_out,          // the connect timeout passed
+};
+
+inline const char* to_string(outbound_status s) noexcept
+{
+    switch (s) {
+    case outbound_status::closed_by_us: return "closed by us";
+    case outbound_status::closed_by_peer: return "closed by peer";
+    case outbound_status::resolve_failed: return "name did not resolve";
+    case outbound_status::connect_failed: return "connect failed";
+    case outbound_status::transport_error: return "transport error";
+    case outbound_status::handshake_failed: return "TLS handshake failed";
+    case outbound_status::timed_out: return "connect timed out";
+    }
+    return "?";
+}
+
+using transport_factory = std::function<std::unique_ptr<http::transport_delegate>(const std::string& host)>;
+
+class outbound_connection : public std::enable_shared_from_this<outbound_connection> {
+public:
+    outbound_connection(event_loop& loop, std::string host, std::string port, transport_factory factory = {},
+                        std::chrono::milliseconds connect_timeout = std::chrono::seconds{10})
+        : loop_(&loop), host_(std::move(host)), port_(std::move(port)), factory_(std::move(factory)),
+          connect_timeout_(connect_timeout)
+    {
+    }
+
+    outbound_connection(const outbound_connection&) = delete;
+    outbound_connection& operator=(const outbound_connection&) = delete;
+
+    ~outbound_connection() { teardown(); }
+
+    std::function<void()> on_open;
+    std::function<void(std::string& in)> on_data;         // plaintext appended; erase what you consume
+    std::function<void(outbound_status)> on_close;        // once, after which nothing else fires
+
+    void start()
+    {
+        if (started_)
+            return;
+        started_ = true;
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        if (::getaddrinfo(host_.c_str(), port_.c_str(), &hints, &res) != 0 || !res)
+            return finish(outbound_status::resolve_failed);
+        for (addrinfo* a = res; a; a = a->ai_next) {
+            if (a->ai_addrlen > sizeof(sockaddr_storage))
+                continue;
+            candidate c;
+            c.family = a->ai_family;
+            c.socktype = a->ai_socktype;
+            c.protocol = a->ai_protocol;
+            c.len = a->ai_addrlen;
+            std::memcpy(&c.addr, a->ai_addr, a->ai_addrlen);
+            addrs_.push_back(c);
+        }
+        ::freeaddrinfo(res);
+        if (addrs_.empty())
+            return finish(outbound_status::resolve_failed);
+        if (connect_timeout_.count() > 0) {
+            deadline_ = loop_->after(connect_timeout_);
+            std::weak_ptr<outbound_connection> weak = shared_from_this();
+            deadline_.on_fire([weak] {
+                if (auto self = weak.lock())
+                    if (!self->open_)
+                        self->finish(outbound_status::timed_out);
+            });
+        }
+        try_next_address();
+    }
+
+    // Queue `n` bytes of plaintext; false once the connection has failed
+    bool write(const char* data, std::size_t n)
+    {
+        if (closed_ || fd_ < 0)
+            return false;
+        const bool ok = transport_ ? transport_->app_out(data, n, out_) : (out_.append(data, n), true);
+        if (!ok) {
+            finish(outbound_status::transport_error);
+            return false;
+        }
+        if (open_)
+            flush();
+        return true;
+    }
+    bool write(const std::string& s) { return write(s.data(), s.size()); }
+
+    // Close now; on_close fires with closed_by_us
+    void close() { finish(outbound_status::closed_by_us); }
+
+    // Send FIN after what is queued, keeping the read side open: a close frame then EOF, in that order
+    void shutdown_write()
+    {
+        if (fd_ < 0 || closed_)
+            return;
+        if (backlog() == 0)
+            ::shutdown(fd_, SHUT_WR);
+        else
+            shutdown_after_flush_ = true;
+    }
+
+    bool open() const noexcept { return open_; }
+    bool closed() const noexcept { return closed_; }
+    std::size_t backlog() const noexcept { return out_.size() - sent_; }
+    const std::string& host() const noexcept { return host_; }
+    const char* alpn() const noexcept { return transport_ ? transport_->alpn() : ""; }
+
+private:
+    struct candidate {
+        int family = 0, socktype = 0, protocol = 0;
+        sockaddr_storage addr{};
+        socklen_t len = 0;
+    };
+
+    void try_next_address()
+    {
+        watch_.reset();
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        while (addr_at_ < addrs_.size()) {
+            const candidate& c = addrs_[addr_at_++];
+            const int s = ::socket(c.family, c.socktype, c.protocol);
+            if (s < 0)
+                continue;
+            ::fcntl(s, F_SETFD, FD_CLOEXEC);
+            ::fcntl(s, F_SETFL, O_NONBLOCK);
+            const int on = 1;
+            ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
+#if defined(SO_NOSIGPIPE)
+            ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#endif
+            const int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&c.addr), c.len);
+            if (rc != 0 && errno != EINPROGRESS) {
+                ::close(s);
+                continue;                       // refused outright: the next address
+            }
+            fd_ = s;
+            in_.clear();
+            out_.clear();
+            sent_ = 0;
+            // A fresh transport per attempt: TLS state cannot outlive its connection
+            transport_.reset();
+            if (factory_) {
+                transport_ = factory_(host_);
+                if (!transport_)
+                    return finish(outbound_status::connect_failed);
+            }
+            watch_ = loop_->watch(fd_, fd_interest::write);
+            std::weak_ptr<outbound_connection> weak = shared_from_this();
+            watch_.on_writable([weak] {
+                if (auto self = weak.lock())
+                    self->on_writable();
+            });
+            watch_.on_readable([weak] {
+                if (auto self = weak.lock())
+                    self->on_readable();
+            });
+            watch_.on_error([weak] {
+                if (auto self = weak.lock()) {
+                    if (self->connecting_)
+                        self->try_next_address();
+                    else
+                        self->on_readable();     // EOF can arrive as an error event: read what is buffered
+                                                 // first, and recv() then says closed or the real error
+                }
+            });
+            connecting_ = true;
+            return;
+        }
+        finish(outbound_status::connect_failed);   // every address exhausted
+    }
+
+    void on_writable()
+    {
+        if (connecting_) {
+            int err = 0;
+            socklen_t len = sizeof err;
+            if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0)
+                return try_next_address();      // this address refused: the next
+            connecting_ = false;
+            if (transport_) {
+                // TLS speaks first: the ClientHello goes before any application byte
+                if (!transport_->start(out_))
+                    return finish(outbound_status::handshake_failed);
+                watch_.set_interest(fd_interest::read_write);
+                flush();
+                if (!closed_ && transport_->established())
+                    become_open();
+                return;
+            }
+            become_open();
+            return;
+        }
+        flush();
+    }
+
+    void become_open()
+    {
+        open_ = true;
+        deadline_.cancel();
+        watch_.set_interest(backlog() > 0 ? fd_interest::read_write : fd_interest::read);
+        auto keep = shared_from_this();     // a callback may drop the owner's pointer
+        if (on_open)
+            on_open();
+        if (!closed_ && !out_.empty())
+            flush();
+    }
+
+    void flush()
+    {
+        while (sent_ < out_.size()) {
+            const ssize_t n = ::send(fd_, out_.data() + sent_, out_.size() - sent_, MSG_NOSIGNAL_FLAG);
+            if (n > 0) {
+                sent_ += std::size_t(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                watch_.set_interest(fd_interest::read_write);
+                return;
+            }
+            return finish(outbound_status::transport_error);
+        }
+        out_.clear();
+        sent_ = 0;
+        if (shutdown_after_flush_) {
+            shutdown_after_flush_ = false;
+            ::shutdown(fd_, SHUT_WR);
+        }
+        if (open_)
+            watch_.set_interest(fd_interest::read);
+    }
+
+    void on_readable()
+    {
+        auto keep = shared_from_this();
+        bool eof = false;
+        for (;;) {
+            char buf[16 * 1024];
+            const ssize_t n = ::recv(fd_, buf, sizeof buf, 0);
+            if (n > 0) {
+                if (transport_) {
+                    if (!transport_->wire_in(buf, std::size_t(n), in_, out_))
+                        return finish(open_ ? outbound_status::transport_error : outbound_status::handshake_failed);
+                } else {
+                    in_.append(buf, std::size_t(n));
+                }
+                if (std::size_t(n) < sizeof buf)
+                    break;
+                continue;
+            }
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            return finish(outbound_status::transport_error);
+        }
+        // The TLS handshake answers bytes with bytes; without this both ends wait
+        if (transport_ && !out_.empty())
+            flush();
+        if (closed_)
+            return;
+        if (!open_ && transport_ && transport_->established())
+            become_open();
+        if (closed_)
+            return;
+        if (open_ && !in_.empty() && on_data)
+            on_data(in_);
+        if (closed_)
+            return;
+        if (eof)
+            finish(open_ ? outbound_status::closed_by_peer : outbound_status::handshake_failed);
+    }
+
+    void finish(outbound_status why)
+    {
+        if (closed_)
+            return;
+        closed_ = true;
+        open_ = false;
+        teardown();
+        auto cb = std::move(on_close);
+        on_open = nullptr;
+        on_data = nullptr;
+        if (cb)
+            cb(why);
+    }
+
+    void teardown() noexcept
+    {
+        deadline_.cancel();
+        watch_.reset();
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+#if defined(MSG_NOSIGNAL)
+    static constexpr int MSG_NOSIGNAL_FLAG = MSG_NOSIGNAL;
+#else
+    static constexpr int MSG_NOSIGNAL_FLAG = 0;
+#endif
+
+    event_loop* loop_;
+    std::string host_, port_;
+    transport_factory factory_;
+    std::chrono::milliseconds connect_timeout_;
+    std::vector<candidate> addrs_;
+    std::size_t addr_at_ = 0;
+    int fd_ = -1;
+    std::unique_ptr<http::transport_delegate> transport_;
+    event_loop::fd_watch watch_;
+    event_loop::timer deadline_;
+    std::string in_, out_;
+    std::size_t sent_ = 0;
+    bool started_ = false, connecting_ = false, open_ = false, closed_ = false;
+    bool shutdown_after_flush_ = false;
+};
+
+} // namespace net
+} // namespace snicholls
+
+#endif // SNICHOLLS_HAS_EVENT_LOOP
+
+#endif // ts_moveables_net_outbound_hpp
+// end net/outbound.hpp
 // (inlined) #include "../net/url.hpp"
 // ----------------------------------------------------------------------
 // begin net/url.hpp
@@ -17766,27 +18177,10 @@ private:
         detail::ws_url url;
         std::string url_text;
 
-        // Every address the name resolved to, tried in order. A non-blocking
-        // connect() to a dead address returns EINPROGRESS, exactly like a live
-        // one - the refusal only surfaces later via SO_ERROR - so "use the
-        // first that did not fail immediately" silently commits to the wrong
-        // one. `localhost` resolving to ::1 ahead of 127.0.0.1 while only IPv4
-        // is listening is the everyday version of that, and it fails 100% of
-        // the time on a host that has both records.
-        struct candidate {
-            int family = 0, socktype = 0, protocol = 0;
-            sockaddr_storage addr{};
-            socklen_t len = 0;
-        };
-        std::vector<candidate> addrs;
-        std::size_t addr_at = 0;
-
-        int fd = -1;
-        // Null for plaintext. When present every byte in either direction goes
-        // through it, and `in`/`out` become wire buffers with the plaintext on
-        // the other side of the transform.
-        std::unique_ptr<transport_delegate> transport;
-        event_loop::fd_watch watch;
+        // The connection: resolution, every address in turn, TLS and the
+        // socket all live in net::outbound_connection, shared with
+        // http::client. Null while disconnected or waiting to retry.
+        std::shared_ptr<net::outbound_connection> link;
         event_loop::timer retry;
 
         // Written on the loop thread, read from the caller's: connected() and
@@ -17812,8 +18206,6 @@ private:
         // the batch. Same idiom as h2_stream::out_buf and the hub's queues.
         std::string in;                 // raw bytes from the socket
         std::size_t in_off = 0;         // how much of `in` is already consumed
-        std::string out;                // bytes awaiting the socket
-        std::size_t sent = 0;
         // Published so send() can bound itself from ANY thread without taking
         // the loop. Written on the loop, read anywhere.
         std::atomic<std::uint64_t> queued_bytes{0};   // appended, not yet on the wire
@@ -17866,89 +18258,41 @@ private:
         {
             if (stopped.load(std::memory_order_relaxed))
                 return;
-            addrinfo hints{};
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = SOCK_STREAM;
-            addrinfo* res = nullptr;
-            if (::getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &res) != 0 || !res)
-                return fail(ws_client_status::connect_failed);
-
-            addrs.clear();
-            addr_at = 0;
-            for (addrinfo* a = res; a; a = a->ai_next) {
-                if (a->ai_addrlen > sizeof(sockaddr_storage))
-                    continue;
-                candidate c;
-                c.family = a->ai_family;
-                c.socktype = a->ai_socktype;
-                c.protocol = a->ai_protocol;
-                c.len = a->ai_addrlen;
-                std::memcpy(&c.addr, a->ai_addr, a->ai_addrlen);
-                addrs.push_back(c);
-            }
-            ::freeaddrinfo(res);
-            if (addrs.empty())
-                return fail(ws_client_status::connect_failed);
-
-            try_next_address();
+            in.clear();
+            in_off = 0;
+            frag.clear();
+            fragmented = false;
+            event_loop* l = loop.load(std::memory_order_relaxed);
+            // No connect timeout: as before, the operating system's decides, and the backoff takes it from there
+            link = std::make_shared<net::outbound_connection>(*l, url.host, url.port, cfg.transport_factory,
+                                                              std::chrono::milliseconds{0});
+            auto self = this;
+            link->on_open = [self] { self->send_handshake(); };
+            link->on_data = [self](std::string& data) { self->on_data(data); };
+            link->on_close = [self](net::outbound_status why) { self->on_link_closed(why); };
+            link->start();
         }
 
-        // One attempt per resolved address, in order, until one completes the
-        // handshake or the list runs out.
-        void try_next_address()
+        void on_link_closed(net::outbound_status why)
         {
-            watch.reset();
-            if (fd >= 0) {
-                ::close(fd);
-                fd = -1;
+            switch (why) {
+            case net::outbound_status::closed_by_us:
+                return;                     // we closed it: shutdown() is already running
+            case net::outbound_status::closed_by_peer:
+                return fail(open.load(std::memory_order_relaxed) ? ws_client_status::closed_by_peer
+                                                                 : ws_client_status::handshake_failed);
+            case net::outbound_status::handshake_failed:
+                return fail(ws_client_status::handshake_failed);
+            case net::outbound_status::transport_error:
+                return fail(open.load(std::memory_order_relaxed) ? ws_client_status::transport_error
+                                                                 : ws_client_status::handshake_failed);
+            default:
+                return fail(ws_client_status::connect_failed);
             }
-            while (addr_at < addrs.size()) {
-                const candidate& c = addrs[addr_at++];
-                const int s = ::socket(c.family, c.socktype, c.protocol);
-                if (s < 0)
-                    continue;
-                ::fcntl(s, F_SETFL, O_NONBLOCK);
-                const int on = 1;
-                ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
-                const int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&c.addr), c.len);
-                if (rc != 0 && errno != EINPROGRESS) {
-                    ::close(s);
-                    continue;                   // refused outright; next address
-                }
-
-                fd = s;
-                in.clear();
-                in_off = 0;
-                out.clear();
-                sent = 0;
-                frag.clear();
-                fragmented = false;
-
-                // A fresh transport per attempt: TLS state cannot outlive the
-                // connection it belongs to, and a reconnect is a new session.
-                transport.reset();
-                if (cfg.transport_factory) {
-                    transport = cfg.transport_factory(url.host);
-                    if (!transport)
-                        return fail(ws_client_status::connect_failed);
-                }
-
-                watch = loop.load(std::memory_order_relaxed)->watch(fd, fd_interest::write);
-                auto self = this;
-                watch.on_writable([self] { self->on_connected(); });
-                watch.on_error([self] { self->try_next_address(); });
-                return;
-            }
-            fail(ws_client_status::connect_failed);   // every address exhausted
         }
 
-        void on_connected()
+        void send_handshake()
         {
-            int err = 0;
-            socklen_t len = sizeof err;
-            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0)
-                return try_next_address();      // this address refused; try the next
-
             // A 16-byte nonce, base64'd. The accept key we expect back is
             // derived from it now so the reply can be checked rather than
             // trusted.
@@ -17959,8 +18303,9 @@ private:
             const auto digest = detail::sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
             accept_expected = detail::base64(digest.data(), digest.size());
 
-            std::string req = "GET " + url.path + " HTTP/1.1\r\nHost: " + url.host;
-            if (url.port != "80")
+            const bool v6 = url.host.find(':') != std::string::npos;
+            std::string req = "GET " + url.path + " HTTP/1.1\r\nHost: " + (v6 ? "[" + url.host + "]" : url.host);
+            if (url.port != (url.secure ? "443" : "80"))
                 req += ":" + url.port;
             req += "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n";
             req += "Sec-WebSocket-Key: " + key + "\r\n";
@@ -17968,91 +18313,22 @@ private:
             for (const auto& h : cfg.headers)
                 req += h.first + ": " + h.second + "\r\n";
             req += "\r\n";
-
-            // TLS speaks first: the ClientHello has to be on the wire before
-            // the HTTP upgrade request, which then rides inside the session.
-            if (transport && !transport->start(out))
-                return fail(ws_client_status::transport_error);
+            handshaking = true;
             if (!write_app(req.data(), req.size()))
                 return fail(ws_client_status::transport_error);
-            handshaking = true;
-            watch.set_interest(fd_interest::read_write);
-            auto self = this;
-            watch.on_readable([self] { self->on_readable(); });
-            flush();
         }
 
         // --------------------------------------------------------- transport
 
-        // The one door out. Plaintext appends straight to the wire buffer; TLS
-        // hands the bytes to the engine and appends whatever ciphertext it
-        // produces. Nothing else in this class may touch `out` directly.
-        bool write_app(const char* data, std::size_t n)
-        {
-            if (!transport) {
-                out.append(data, n);
-                return true;
-            }
-            return transport->app_out(data, n, out);
-        }
+        // The one door out: plaintext to the connection, which encrypts and
+        // sends it. Nothing else in this class writes to the wire.
+        bool write_app(const char* data, std::size_t n) { return link && link->write(data, n); }
 
-        void flush()
+        void on_data(std::string& data)
         {
-            while (sent < out.size()) {
-                const ssize_t n = ::send(fd, out.data() + sent, out.size() - sent, 0);
-                if (n > 0) {
-                    sent += std::size_t(n);
-                    continue;
-                }
-                if (n < 0 && errno == EINTR)
-                    continue;
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    publish_backlog();          // the queue is real; say how deep
-                    watch.set_interest(fd_interest::read_write);
-                    return;
-                }
-                return fail(ws_client_status::transport_error);
-            }
-            out.clear();
-            sent = 0;
-            publish_backlog();
-            watch.set_interest(fd_interest::read);
-        }
-
-        void on_readable()
-        {
-            for (;;) {
-                char buf[16 * 1024];
-                const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
-                if (n > 0) {
-                    n_bytes_in.fetch_add(std::uint64_t(n), std::memory_order_relaxed);
-                    if (transport) {
-                        // Ciphertext in: plaintext lands in `in`, and anything
-                        // the handshake still owes the peer lands in `out`.
-                        if (!transport->wire_in(buf, std::size_t(n), in, out))
-                            return fail(open.load(std::memory_order_relaxed)
-                                            ? ws_client_status::transport_error
-                                            : ws_client_status::handshake_failed);
-                    } else {
-                        in.append(buf, std::size_t(n));
-                    }
-                    if (std::size_t(n) < sizeof buf)
-                        break;
-                    continue;
-                }
-                if (n == 0)
-                    return fail(open.load(std::memory_order_relaxed) ? ws_client_status::closed_by_peer
-                                     : ws_client_status::handshake_failed);
-                if (errno == EINTR)
-                    continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    break;
-                return fail(ws_client_status::transport_error);
-            }
-            // The TLS handshake produces bytes in response to bytes; without
-            // this the exchange stalls with both ends waiting to be spoken to.
-            if (transport && !out.empty())
-                flush();
+            n_bytes_in.fetch_add(std::uint64_t(data.size()), std::memory_order_relaxed);
+            in.append(data);
+            data.clear();
             if (handshaking && !finish_handshake())
                 return;
             if (open.load(std::memory_order_relaxed))
@@ -18221,12 +18497,12 @@ private:
 
         void publish_backlog()
         {
-            queued_bytes.store(out.size() - sent, std::memory_order_release);
+            queued_bytes.store(link ? link->backlog() : 0, std::memory_order_release);
         }
 
         void queue_out(ws_opcode op, std::string payload)
         {
-            if (fd < 0)
+            if (!link)
                 return;                     // reconnecting; the caller's message is dropped
             const std::string f =
                 detail::ws_frame_masked(op, payload.data(), payload.size(), mask_key());
@@ -18234,8 +18510,6 @@ private:
                 return fail(ws_client_status::transport_error);
             if (op == ws_opcode::text || op == ws_opcode::binary)
                 n_messages_out.fetch_add(1, std::memory_order_relaxed);
-            if (open.load(std::memory_order_relaxed) || handshaking)
-                flush();
             publish_backlog();
         }
 
@@ -18257,36 +18531,43 @@ private:
         // the peer reads Close, then EOF, in that order.
         void close_gracefully()
         {
-            if (fd >= 0 && open.load(std::memory_order_relaxed)) {
+            if (link && open.load(std::memory_order_relaxed)) {
                 std::string body;
                 body.push_back(char((ws_normal >> 8) & 0xff));
                 body.push_back(char(ws_normal & 0xff));
                 const std::string f = detail::ws_frame_masked(
                     ws_opcode::close, body.data(), body.size(), mask_key());
-                if (write_app(f.data(), f.size()))
-                    flush();
-                if (fd >= 0)
-                    ::shutdown(fd, SHUT_WR);
+                if (write_app(f.data(), f.size()) && link)
+                    link->shutdown_write();
             }
             shutdown(ws_client_status::closed_locally, true);
         }
 
         void fail(ws_client_status why) { shutdown(why, false); }
 
+        // Close the connection without hearing about it, and let it go. It may be
+        // the one calling us (its on_close), so it is released after this task
+        void drop_link()
+        {
+            if (!link)
+                return;
+            auto l = std::move(link);
+            l->on_open = nullptr;
+            l->on_data = nullptr;
+            l->on_close = nullptr;
+            l->close();
+            if (event_loop* lp = loop.load(std::memory_order_relaxed))
+                lp->post([l] {});
+        }
+
         void shutdown(ws_client_status why, bool final_)
         {
             const bool was_open = open.load(std::memory_order_relaxed);
             open.store(false, std::memory_order_relaxed);
             handshaking = false;
-            watch.reset();
-            if (fd >= 0) {
-                ::close(fd);
-                fd = -1;
-            }
+            drop_link();
             in.clear();
             in_off = 0;
-            out.clear();
-            sent = 0;
             queued_bytes.store(0, std::memory_order_release);
 
             if (final_)
@@ -18338,400 +18619,6 @@ private:
 #endif /* ts_moveables_websocket_client_hpp */
 // end http/websocket_client.hpp
 // (inlined) #include "net/outbound.hpp"                      // IWYU pragma: export (one outbound connection)
-// ----------------------------------------------------------------------
-// begin net/outbound.hpp
-// ----------------------------------------------------------------------
-//
-//  outbound.hpp
-//  TSMoveables
-//
-//  Copyright 2010-2026 Saxon Herschel Nicholls
-//
-//  Thread Safe Moveables - one outbound connection on an event loop: resolve,
-//  connect, optionally TLS, then bytes in and bytes out. The part of a client
-//  that is the same for every protocol, so it is written once:
-//
-//      auto c = std::make_shared<snicholls::net::outbound_connection>(loop, "example.com", "443", tls_factory);
-//      c->on_open  = [&] { c->write(request); };
-//      c->on_data  = [&](std::string& in) { /* consume from the front of in */ };
-//      c->on_close = [&](snicholls::net::outbound_status why) { ... };
-//      c->start();
-//
-//    - Every address the name resolves to is tried in order. A non-blocking
-//      connect() to a dead address returns EINPROGRESS exactly like a live
-//      one, so "the first that did not fail at once" silently commits to the
-//      wrong one; `localhost` resolving to ::1 first while only IPv4 listens
-//      is the everyday case.
-//    - A transport (TLS) gets every byte both ways when one is given: it
-//      speaks first (the ClientHello), and bytes it owes the peer in reply to
-//      bytes received are flushed at once, or the handshake stalls.
-//    - on_open fires when the transport is established, so the first write
-//      already rides inside TLS.
-//    - Loop thread only: start(), write() and close() are called there, and
-//      the callbacks run there. Own it by shared_ptr; the watch holds only
-//      a weak reference, so destroying the owner's pointer ends it.
-//
-//  Extracted from http::websocket_client's connection core so http::client
-//  shares it. POSIX, like the event loop.
-//
-
-#ifndef ts_moveables_net_outbound_hpp
-#define ts_moveables_net_outbound_hpp
-
-// (inlined) #include "../event/loop.hpp"
-
-#if SNICHOLLS_HAS_EVENT_LOOP
-
-#include <cerrno>
-#include <chrono>
-#include <cstdint>
-#include <cstring>
-#include <functional>
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
-
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-// (inlined) #include "../interfaces/transport_delegate.hpp"
-
-namespace snicholls {
-namespace net {
-
-enum class outbound_status : std::uint8_t {
-    closed_by_us,       // close() was called
-    closed_by_peer,     // orderly EOF
-    resolve_failed,     // the name did not resolve
-    connect_failed,     // every address refused or timed out
-    transport_error,    // the socket or the TLS engine failed after connecting
-    handshake_failed,   // the TLS handshake failed
-    timed_out,          // the connect timeout passed
-};
-
-inline const char* to_string(outbound_status s) noexcept
-{
-    switch (s) {
-    case outbound_status::closed_by_us: return "closed by us";
-    case outbound_status::closed_by_peer: return "closed by peer";
-    case outbound_status::resolve_failed: return "name did not resolve";
-    case outbound_status::connect_failed: return "connect failed";
-    case outbound_status::transport_error: return "transport error";
-    case outbound_status::handshake_failed: return "TLS handshake failed";
-    case outbound_status::timed_out: return "connect timed out";
-    }
-    return "?";
-}
-
-using transport_factory = std::function<std::unique_ptr<http::transport_delegate>(const std::string& host)>;
-
-class outbound_connection : public std::enable_shared_from_this<outbound_connection> {
-public:
-    outbound_connection(event_loop& loop, std::string host, std::string port, transport_factory factory = {},
-                        std::chrono::milliseconds connect_timeout = std::chrono::seconds{10})
-        : loop_(&loop), host_(std::move(host)), port_(std::move(port)), factory_(std::move(factory)),
-          connect_timeout_(connect_timeout)
-    {
-    }
-
-    outbound_connection(const outbound_connection&) = delete;
-    outbound_connection& operator=(const outbound_connection&) = delete;
-
-    ~outbound_connection() { teardown(); }
-
-    std::function<void()> on_open;
-    std::function<void(std::string& in)> on_data;         // plaintext appended; erase what you consume
-    std::function<void(outbound_status)> on_close;        // once, after which nothing else fires
-
-    void start()
-    {
-        if (started_)
-            return;
-        started_ = true;
-        addrinfo hints{};
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        addrinfo* res = nullptr;
-        if (::getaddrinfo(host_.c_str(), port_.c_str(), &hints, &res) != 0 || !res)
-            return finish(outbound_status::resolve_failed);
-        for (addrinfo* a = res; a; a = a->ai_next) {
-            if (a->ai_addrlen > sizeof(sockaddr_storage))
-                continue;
-            candidate c;
-            c.family = a->ai_family;
-            c.socktype = a->ai_socktype;
-            c.protocol = a->ai_protocol;
-            c.len = a->ai_addrlen;
-            std::memcpy(&c.addr, a->ai_addr, a->ai_addrlen);
-            addrs_.push_back(c);
-        }
-        ::freeaddrinfo(res);
-        if (addrs_.empty())
-            return finish(outbound_status::resolve_failed);
-        if (connect_timeout_.count() > 0) {
-            deadline_ = loop_->after(connect_timeout_);
-            std::weak_ptr<outbound_connection> weak = shared_from_this();
-            deadline_.on_fire([weak] {
-                if (auto self = weak.lock())
-                    if (!self->open_)
-                        self->finish(outbound_status::timed_out);
-            });
-        }
-        try_next_address();
-    }
-
-    // Queue `n` bytes of plaintext; false once the connection has failed
-    bool write(const char* data, std::size_t n)
-    {
-        if (closed_ || fd_ < 0)
-            return false;
-        const bool ok = transport_ ? transport_->app_out(data, n, out_) : (out_.append(data, n), true);
-        if (!ok) {
-            finish(outbound_status::transport_error);
-            return false;
-        }
-        if (open_)
-            flush();
-        return true;
-    }
-    bool write(const std::string& s) { return write(s.data(), s.size()); }
-
-    // Close now; on_close fires with closed_by_us
-    void close() { finish(outbound_status::closed_by_us); }
-
-    bool open() const noexcept { return open_; }
-    bool closed() const noexcept { return closed_; }
-    std::size_t backlog() const noexcept { return out_.size() - sent_; }
-    const std::string& host() const noexcept { return host_; }
-    const char* alpn() const noexcept { return transport_ ? transport_->alpn() : ""; }
-
-private:
-    struct candidate {
-        int family = 0, socktype = 0, protocol = 0;
-        sockaddr_storage addr{};
-        socklen_t len = 0;
-    };
-
-    void try_next_address()
-    {
-        watch_.reset();
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
-        while (addr_at_ < addrs_.size()) {
-            const candidate& c = addrs_[addr_at_++];
-            const int s = ::socket(c.family, c.socktype, c.protocol);
-            if (s < 0)
-                continue;
-            ::fcntl(s, F_SETFD, FD_CLOEXEC);
-            ::fcntl(s, F_SETFL, O_NONBLOCK);
-            const int on = 1;
-            ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
-#if defined(SO_NOSIGPIPE)
-            ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
-#endif
-            const int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&c.addr), c.len);
-            if (rc != 0 && errno != EINPROGRESS) {
-                ::close(s);
-                continue;                       // refused outright: the next address
-            }
-            fd_ = s;
-            in_.clear();
-            out_.clear();
-            sent_ = 0;
-            // A fresh transport per attempt: TLS state cannot outlive its connection
-            transport_.reset();
-            if (factory_) {
-                transport_ = factory_(host_);
-                if (!transport_)
-                    return finish(outbound_status::connect_failed);
-            }
-            watch_ = loop_->watch(fd_, fd_interest::write);
-            std::weak_ptr<outbound_connection> weak = shared_from_this();
-            watch_.on_writable([weak] {
-                if (auto self = weak.lock())
-                    self->on_writable();
-            });
-            watch_.on_readable([weak] {
-                if (auto self = weak.lock())
-                    self->on_readable();
-            });
-            watch_.on_error([weak] {
-                if (auto self = weak.lock()) {
-                    if (self->connecting_)
-                        self->try_next_address();
-                    else
-                        self->on_readable();     // EOF can arrive as an error event: read what is buffered
-                                                 // first, and recv() then says closed or the real error
-                }
-            });
-            connecting_ = true;
-            return;
-        }
-        finish(outbound_status::connect_failed);   // every address exhausted
-    }
-
-    void on_writable()
-    {
-        if (connecting_) {
-            int err = 0;
-            socklen_t len = sizeof err;
-            if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0)
-                return try_next_address();      // this address refused: the next
-            connecting_ = false;
-            if (transport_) {
-                // TLS speaks first: the ClientHello goes before any application byte
-                if (!transport_->start(out_))
-                    return finish(outbound_status::handshake_failed);
-                watch_.set_interest(fd_interest::read_write);
-                flush();
-                if (!closed_ && transport_->established())
-                    become_open();
-                return;
-            }
-            become_open();
-            return;
-        }
-        flush();
-    }
-
-    void become_open()
-    {
-        open_ = true;
-        deadline_.cancel();
-        watch_.set_interest(backlog() > 0 ? fd_interest::read_write : fd_interest::read);
-        auto keep = shared_from_this();     // a callback may drop the owner's pointer
-        if (on_open)
-            on_open();
-        if (!closed_ && !out_.empty())
-            flush();
-    }
-
-    void flush()
-    {
-        while (sent_ < out_.size()) {
-            const ssize_t n = ::send(fd_, out_.data() + sent_, out_.size() - sent_, MSG_NOSIGNAL_FLAG);
-            if (n > 0) {
-                sent_ += std::size_t(n);
-                continue;
-            }
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                watch_.set_interest(fd_interest::read_write);
-                return;
-            }
-            return finish(outbound_status::transport_error);
-        }
-        out_.clear();
-        sent_ = 0;
-        if (open_)
-            watch_.set_interest(fd_interest::read);
-    }
-
-    void on_readable()
-    {
-        auto keep = shared_from_this();
-        bool eof = false;
-        for (;;) {
-            char buf[16 * 1024];
-            const ssize_t n = ::recv(fd_, buf, sizeof buf, 0);
-            if (n > 0) {
-                if (transport_) {
-                    if (!transport_->wire_in(buf, std::size_t(n), in_, out_))
-                        return finish(open_ ? outbound_status::transport_error : outbound_status::handshake_failed);
-                } else {
-                    in_.append(buf, std::size_t(n));
-                }
-                if (std::size_t(n) < sizeof buf)
-                    break;
-                continue;
-            }
-            if (n == 0) {
-                eof = true;
-                break;
-            }
-            if (errno == EINTR)
-                continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;
-            return finish(outbound_status::transport_error);
-        }
-        // The TLS handshake answers bytes with bytes; without this both ends wait
-        if (transport_ && !out_.empty())
-            flush();
-        if (closed_)
-            return;
-        if (!open_ && transport_ && transport_->established())
-            become_open();
-        if (closed_)
-            return;
-        if (open_ && !in_.empty() && on_data)
-            on_data(in_);
-        if (closed_)
-            return;
-        if (eof)
-            finish(open_ ? outbound_status::closed_by_peer : outbound_status::handshake_failed);
-    }
-
-    void finish(outbound_status why)
-    {
-        if (closed_)
-            return;
-        closed_ = true;
-        open_ = false;
-        teardown();
-        auto cb = std::move(on_close);
-        on_open = nullptr;
-        on_data = nullptr;
-        if (cb)
-            cb(why);
-    }
-
-    void teardown() noexcept
-    {
-        deadline_.cancel();
-        watch_.reset();
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-        }
-    }
-
-#if defined(MSG_NOSIGNAL)
-    static constexpr int MSG_NOSIGNAL_FLAG = MSG_NOSIGNAL;
-#else
-    static constexpr int MSG_NOSIGNAL_FLAG = 0;
-#endif
-
-    event_loop* loop_;
-    std::string host_, port_;
-    transport_factory factory_;
-    std::chrono::milliseconds connect_timeout_;
-    std::vector<candidate> addrs_;
-    std::size_t addr_at_ = 0;
-    int fd_ = -1;
-    std::unique_ptr<http::transport_delegate> transport_;
-    event_loop::fd_watch watch_;
-    event_loop::timer deadline_;
-    std::string in_, out_;
-    std::size_t sent_ = 0;
-    bool started_ = false, connecting_ = false, open_ = false, closed_ = false;
-};
-
-} // namespace net
-} // namespace snicholls
-
-#endif // SNICHOLLS_HAS_EVENT_LOOP
-
-#endif // ts_moveables_net_outbound_hpp
-// end net/outbound.hpp
 // (inlined) #include "net/url.hpp"                           // IWYU pragma: export
 // (inlined) #include "concurrent/synchronized.hpp"                 // IWYU pragma: export
 // (inlined) #include "concurrent/synchronized_heterogeneous.hpp"   // IWYU pragma: export

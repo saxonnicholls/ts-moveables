@@ -7,6 +7,21 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Changed
+
+- **`websocket_client` runs on `net::outbound_connection`**, the connection `http::client` uses: resolution, each
+  address in turn, the TLS pump and buffered writes are written once. Behaviour is unchanged (no connect timeout,
+  Close then FIN on a deliberate close, the same backoff and bound); `Host` now brackets an IPv6 literal.
+  `outbound_connection::shutdown_write()` is new, for that Close-then-FIN.
+
+### Added
+
+- **An HTTPS test for `http::client`** in `make test-tls`: a GET and a 512 KiB POST on one verified TLS session,
+  an untrusted certificate refused as `tls_failed`, and `https://` without a transport refused as
+  `tls_unavailable`.
+
 ## [1.8.0] — 2026-11-18
 
 ### Added
