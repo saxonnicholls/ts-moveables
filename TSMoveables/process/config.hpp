@@ -46,6 +46,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <locale>
 #include <map>
 #include <optional>
 #include <set>
@@ -130,12 +131,32 @@ T parse_number(std::string_view text)
     if (s.empty())
         throw bad_config_value("expected a number, got an empty value");
     T value{};
-    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
-    if (ec == std::errc::result_out_of_range)
-        throw bad_config_value("number out of range");
-    if (ec != std::errc{} || end != s.data() + s.size())
-        throw bad_config_value(std::is_integral_v<T> ? "expected an integer" : "expected a number");
-    return value;
+    if constexpr (std::is_floating_point_v<T>)
+    {
+        // Not from_chars: older Apple libc++ deletes its floating-point overloads. A stream in the classic
+        // locale reads the same decimal and exponent forms, whatever locale the program has set
+        if (s.front() == ' ' || s.front() == '\t')         // a stream would skip it; from_chars would not
+            throw bad_config_value("expected a number");
+        std::istringstream in{std::string(s)};
+        in.imbue(std::locale::classic());
+        in >> value;
+        if (!in)
+            throw bad_config_value(in.eof() && std::isinf(value) ? "number out of range" : "expected a number");
+        if (in.peek() != std::char_traits<char>::eof())
+            throw bad_config_value("expected a number");
+        if (std::isinf(value))
+            throw bad_config_value("number out of range");
+        return value;
+    }
+    else
+    {
+        const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+        if (ec == std::errc::result_out_of_range)
+            throw bad_config_value("number out of range");
+        if (ec != std::errc{} || end != s.data() + s.size())
+            throw bad_config_value("expected an integer");
+        return value;
+    }
 }
 
 // "250ms" -> 250 milliseconds, converted to Duration exactly (a lossy conversion is an error).

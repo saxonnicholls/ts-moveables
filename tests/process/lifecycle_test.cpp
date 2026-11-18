@@ -189,13 +189,16 @@ TEST(BootMonitor, ReportsRegressionsAndRecoveriesAndStopsWhenDestroyed)
         db_up = false;
         const auto until = std::chrono::steady_clock::now() + 5s;
         while (changes.empty() && std::chrono::steady_clock::now() < until) loop.run_once(10ms);
-        EXPECT_EQ(changes, (std::vector<std::string>{"db failed"}));
+        const std::vector<std::string> first_change{"db failed"};   // named: GCC 15 misreads the temporary
+        EXPECT_EQ(changes, first_change);
         EXPECT_EQ(health->report().overall, snicholls::health_state::unhealthy);
         db_up = true;
         while (changes.size() < 2 && std::chrono::steady_clock::now() < until) loop.run_once(10ms);
-        EXPECT_EQ(changes, (std::vector<std::string>{"db failed", "db recovered"}));
+        const std::vector<std::string> both_changes{"db failed", "db recovered"};
+        EXPECT_EQ(changes, both_changes);
         EXPECT_EQ(health->report().overall, snicholls::health_state::ready);
-        EXPECT_TRUE(monitor.last().all_passed());
+        const snicholls::boot_report last = monitor.last();
+        EXPECT_TRUE(last.all_passed());
     }
     const int after = runs->load();
     for (int i = 0; i < 5; ++i) loop.run_once(10ms);
