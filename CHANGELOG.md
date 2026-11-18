@@ -7,7 +7,7 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
-## [Unreleased]
+## [1.8.0] — 2026-11-18
 
 ### Added
 
@@ -59,6 +59,7 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ### Changed
 
+- **The bundled snicholls-core is v0.9.0** (the minimum stays 0.8.0: nothing here needs 0.9.0's additions).
 - The tokenizer demos and the C++ baseline harness read their data with `read_file` instead of private copies.
 - **A request's trailer fields are now checked** like header fields (a malformed one is a 400) before being dropped.
   The parser's comment always said they were validated; no code did it.
@@ -1113,6 +1114,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.8.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.8.0
 [1.7.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.7.0
 [1.6.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.6.0
 [1.5.1]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.5.1

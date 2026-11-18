@@ -66,7 +66,7 @@
 #define ts_moveables_version_hpp
 
 #define SNICHOLLS_VERSION_MAJOR 1
-#define SNICHOLLS_VERSION_MINOR 7
+#define SNICHOLLS_VERSION_MINOR 8
 #define SNICHOLLS_VERSION_PATCH 0
 
 // Comparable in the preprocessor. Two decimal digits each for minor and patch,
