@@ -141,6 +141,11 @@ jobs:
       - name: HTTP client, HTTP/1.1 and HTTP/2 (tests against our servers and scripted ones, ASan)
         run: make test-client asan-client CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
 
+      # Collectives over TCP: 1 to 5 ranks as threads on 127.0.0.1 (one a forked process that
+      # is killed mid-allreduce), every sum checked bit for bit; the demo runs 4 ranks as processes
+      - name: Collectives over TCP - allreduce_sum, broadcast, barrier (tests, ASan, multi-process demo)
+        run: make test-collective asan-collective demo-collective CXX=${{ matrix.cxx }} EXTRA_FLAGS=-Werror
+
       # Autobahn|Testsuite: the external RFC 6455 grader. x86-64 Linux only -
       # it needs Docker with --network host to reach the echo server, and the
       # official image is published for amd64 only. Protocol conformance does
@@ -368,6 +373,10 @@ jobs:
       - name: ThreadSanitizer, remote execution demo
         if: ${{ matrix.tsan }}
         run: make tsan-remote CXX=${{ matrix.cxx }}
+
+      - name: ThreadSanitizer, collectives over TCP
+        if: ${{ matrix.tsan && runner.os == 'Linux' }}
+        run: make tsan-collective CXX=${{ matrix.cxx }}
 
       - name: Address + UB Sanitizers
         if: ${{ matrix.asan }}

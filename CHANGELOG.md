@@ -23,6 +23,17 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ### Added
 
+- **Collectives over TCP for data-parallel training** (`net/collective.hpp`, C++20 and POSIX, opt-in: not in the
+  single header). `collective::connect` builds a full mesh from every rank's `host:port`, with retries while peers
+  start and a handshake that refuses another job's world size, run id or byte order. `allreduce_sum(float*, n)`
+  leaves on every rank, per element, the sequential rank-order float sum `((x_0 + x_1) + ...) + x_{N-1}`, bit for
+  bit: chunk c is reduced by rank c from direct sends and gathered back, so each rank moves 2(N-1)/N of the buffer,
+  streamed in segments through one `poll()` loop in bounded memory. Also `broadcast` (the root sends the buffer
+  once) and `barrier`. Every failure is a `result<..., collective_error>` naming the rank at fault: a stall past
+  `io_timeout`, a closed peer, a mismatched call; a failing rank tells the others on a control connection, so all
+  blame the same one. 16 tests in `make test-collective` (and `asan-collective`, `tsan-collective`), a
+  multi-process demo (`make demo-collective`) and a loopback benchmark (`make bench-collective`); CI runs the tests,
+  ASan, the demo, and TSan on Linux.
 - **HTTP/2 in `http::client`** (`http/h2_client.hpp`). Over TLS, ALPN decides; in plaintext,
   `client_config::http2_prior_knowledge` speaks h2c. All requests to a destination share one connection as
   streams, up to the server's concurrency limit. Trailers land in `response::trailers`. A timeout cancels only its

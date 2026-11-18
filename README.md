@@ -664,6 +664,82 @@ graders, like h2spec and Autobahn, not dependencies.
 Not yet: request and response bodies streamed in chunks (an h2 response is buffered whole, up to `max_body`),
 redirects (follow them in the callback), compression.
 
+## Collectives over TCP (`net/collective.hpp`)
+
+The transport for data-parallel training on a handful of machines: N ranks, a full TCP mesh, and an
+allreduce whose sum is the same bits on every rank and the same bits as summing on one machine (C++20 and POSIX,
+opt-in):
+
+```cpp
+#include "net/collective.hpp"
+
+snicholls::net::collective_config cfg;
+cfg.rank   = 2;
+cfg.peers  = {"10.0.0.1:7100", "10.0.0.2:7100", "10.0.0.3:7100"};   // every rank, in rank order
+cfg.run_id = 0x5eed;                                                // the same on every rank of one job
+auto c = snicholls::net::collective::connect(cfg);                  // result<collective, collective_error>
+if (c.is_err()) die(c.unwrap_err_unchecked().what());               // names the rank and its endpoint
+
+c->broadcast(weights.data(), weights.size(), 0);    // rank 0's initial weights, everywhere
+c->allreduce_sum(grads.data(), grads.size());       // ((g_0 + g_1) + g_2) + ... in rank order, in float
+c->barrier();
+```
+
+- **One summation order, fixed.** `allreduce_sum` leaves, per element, `((x_0 + x_1) + x_2) + ... + x_{N-1}`, added
+  left to right in rank order in `float` - not pairwise, not in the order a ring visits the ranks. Float addition
+  is not associative, so a ring allreduce sums each chunk in a different order; this one sums every element in the
+  same order, which is what snicholls-core's `ml::ordered_sum` computes on one machine, so a training run can check
+  the two bit for bit. The header refuses to compile under `-ffast-math`.
+- **Ring bandwidth, two steps.** The buffer is cut into N chunks and rank c owns chunk c. Every rank sends its piece
+  of chunk c straight to rank c, the owner adds the N pieces in rank order (its own at its own position), and sends
+  the reduced chunk to everyone. Each rank sends and receives 2(N-1)/N of the buffer - what a ring moves - with
+  every link busy both ways at once. `n` need not divide by N; `n = 0` and N = 1 (no network) work.
+- **Bounded memory, no deadlock.** The owner reduces in segments (1 MiB by default) as pieces arrive, holding at
+  most two per peer, and forwards each reduced segment at once, so the two halves overlap. Sends go from the
+  caller's buffer and the gathered chunks land in it: a 0.5 GB allreduce on 10 ranks needs about 19 MiB more. One
+  thread runs one `poll()` loop over every socket, non-blocking both ways, so two ranks sending each other half a
+  gigabyte never wait on each other's full buffers.
+- **Broadcast sends the buffer once.** The root scatters N-1 pieces, and each rank forwards its piece to the others
+  as it arrives, rather than the root sending the whole buffer N-1 times.
+- **The mesh checks who it is talking to.** `connect` listens at `peers[rank]`, dials every lower rank and retries
+  while they start, within `connect_timeout`. The handshake carries the world size, both ranks, the run id and the
+  byte order; a mismatch is refused, so two jobs on the same ports never exchange a gradient. A stray connection is
+  refused and the wait goes on. Every collective then opens with a header (operation, `n`, root, sequence number),
+  so a rank that called something else, or with another `n`, is a `mismatched_call`, not corrupted weights.
+- **Nothing hangs.** Every collective fails with `timed_out` when a transfer that is waiting on a peer moves no byte
+  for `io_timeout` (30 s) - a stall deadline, since half a gigabyte at 1 Gbit/s takes seconds and a frozen peer
+  should not. A peer that dies is `peer_closed` as soon as its socket says so. **Every rank blames the same peer:**
+  each pair has a second, idle connection, and a rank whose collective fails sends every other rank one 8-byte
+  notice on it - the code and the rank at fault - before anything closes. Without it, when one rank dies, a third
+  rank often sees a second rank give up and close first, and blames the wrong one. After a failure the collective is
+  `broken`; destroy it (that closes the sockets) and connect again.
+
+`make test-collective` runs 16 tests: 1, 2, 3 and 5 ranks over 0, 1, N-1, N+1 and 10,000,007 floats whose sum
+provably depends on the order of addition, each rank's result compared bit for bit with the sequential reference;
+segments of one float, so the reduction ring wraps thousands of times; broadcast from every root; a barrier held by a late rank;
+fifteen collectives in a row; a different run id, a different world size and a stray connection; mismatched calls;
+a rank that never calls (`timed_out`, naming it, within `io_timeout`); and a rank in a forked process killed in the
+middle of an allreduce (every survivor names it, in milliseconds). `make demo-collective` runs four processes
+through a broadcast and five training steps; `collective_demo rank R host:port,...` runs one rank of a real job.
+
+`make bench-collective` moves 0.5 GB between processes on loopback (Xeon W-3245, macOS 26, `-O3`, 2026-11-19):
+
+| ranks | allreduce_sum | algbw GB/s | busbw GB/s | broadcast | algbw GB/s |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 0.734 s | 0.73 | 0.73 | 0.290 s | 1.85 |
+| 4 | 1.171 s | 0.46 | 0.69 | 0.541 s | 0.99 |
+
+algbw is the buffer over the time; busbw is what each rank sends (2(N-1)/N of the buffer) over the time. The
+machine was shared (load average near 100 on 32 threads), so these are floors; with 128 MiB on a quieter moment two
+ranks reached 1.4 GB/s.
+
+Loopback is not the network: it measures the implementation, over a "wire" of memory shared by every rank. On ten
+machines at 1 Gbit/s (about 117 MB/s of TCP payload each way per link) each rank sends 1.8 times the buffer per
+allreduce, so **GPT-2 small (124M floats, 0.5 GB) takes about 7.6 s per allreduce and GPT-2 medium (350M floats,
+1.4 GB) about 21 s**. The network, not this code, is the limit: even on the loaded machine above, loopback moved
+bytes four to six times faster than a 1 Gbit/s link can. Sending bfloat16
+gradients would halve both; that variant is not built.
+
 ## moveable_signal
 
 Thread-safe signal/slot for any object. Everything — connect, disconnect, emit, slot execution — may happen from any thread, and the classic failure modes are designed out:
@@ -915,6 +991,7 @@ Working programs, not snippets. Each builds and runs with one make target, and m
 | [persistent_index_demo](demos/text_index/persistent_index_demo.cpp) | `make demo-text-index` | a full-text index that is **built once and never rebuilt**: the BWT demo's parallel suffix array, written to [memory-mapped files](#memory-mapped-storage-mmap) with the text and a 2-byte prefix table. Building 8 million bases takes 2.5 s on 32 threads; every later run reopens the index in 0.3 ms (8,000×) and searches in about 2 µs, checked against a naive scan. A build killed in the middle resumes from its last completed round, and produces the same suffix array byte for byte. An index of other data, or one with a damaged header, is refused. Four reader processes search one copy in the page cache. `query PATTERN...` searches a kept index; `--file` indexes your own text. C++20 and POSIX |
 | [remote_compute_demo](demos/remote_compute/remote_compute_demo.cpp) | `make demo-remote` | remote `std::async` / `std::invoke` on named machines, over this library's TCP and thread pools: kernels dispatched by a compile-time perfect hash, a field-wise binary wire format refused on a signature mismatch, mutual HMAC-SHA256 authentication, long jobs with progress and cancel, health pings, sessions that survive a reconnect, and UDP discovery. The self-test puts the client and every worker in one process on 127.0.0.1, so CI runs the whole protocol on one runner. C++20 and POSIX (the library stays C++17); [details below](#remote-execution-demo) |
 | [tokenizer_bench](demos/tokenizer/tokenizer_bench.cpp) | `make bench-tokenizer` | byte-level BPE, the tokenizer of GPT-4 and its relatives, **token for token tiktoken's**: on GPT-4's vocabulary level with toktok, the fastest of the eleven encoders we raced, at 32 threads (1,922 MB/s) and on new text, second to it from 2 to 16 threads, and first on every measure with a vocabulary of your own. The split pattern written as code with an SSE2 fast path, a per-thread memo of short pieces, one long text cut at proved piece boundaries across [`parallel_for`](#parallel_for), on snicholls-core's merge. Checks every document against tiktoken before timing anything. C++20 (the library stays C++17); [details below](#bpe-tokenizer-demo) |
+| [collective_demo](demos/collective_demo.cpp) | `make demo-collective` | [collectives over TCP](#collectives-over-tcp-netcollectivehpp) as data-parallel training uses them: four processes connect a full mesh, broadcast rank 0's weights and run five steps of allreduce and SGD; every rank checks every sum against the sequential rank-order reference, bit for bit, and the weights stay identical everywhere. `collective_demo rank R host:port,...` runs one rank of a real job. C++20 and POSIX |
 | [time_master_demo](demos/time_master_demo.cpp) | `make demo-timemaster` | a production periodic-event scheduler (TimeMaster) rebuilt on [`event_loop`](#event_loop) in ~60 lines: closures at intervals, add-while-running from any thread, cancel by id, drift-free *and* burst-free cadence asserted, teardown measured in microseconds — and the whole scheduler is a moveable value, which its Boost.Asio ancestor never was |
 
 ### Remote execution demo
