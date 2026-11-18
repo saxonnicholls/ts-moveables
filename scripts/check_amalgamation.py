@@ -65,6 +65,8 @@ OPT_IN = {
     # the HTTP client returns core's result: C++20. Its HTTP/2 session goes with it
     "http/client.hpp",
     "http/h2_client.hpp",
+    # collectives over TCP: C++20, on core's result and backoff
+    "net/collective.hpp",
 }
 
 # (output, entry) - must match the `amalgamate` target in the Makefile
