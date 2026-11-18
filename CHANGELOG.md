@@ -11,6 +11,11 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ### Changed
 
+- **HPACK, the HTTP/2 frame layout and the field rules moved to `http/h2_wire.hpp`**, so the server and the
+  client share one copy. The server's behaviour is unchanged: h2spec still passes 147 of 147.
+- **On first contact with an `https://` destination, `http::client` waits for the first connection's handshake**
+  before opening more, so a server that picks h2 gets one multiplexed connection. One that picks HTTP/1.1 gets
+  the usual pool once that handshake ends.
 - **`websocket_client` runs on `net::outbound_connection`**, the connection `http::client` uses: resolution, each
   address in turn, the TLS pump and buffered writes are written once. Behaviour is unchanged (no connect timeout,
   Close then FIN on a deliberate close, the same backoff and bound); `Host` now brackets an IPv6 literal.
@@ -18,6 +23,16 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ### Added
 
+- **HTTP/2 in `http::client`** (`http/h2_client.hpp`). Over TLS, ALPN decides; in plaintext,
+  `client_config::http2_prior_knowledge` speaks h2c. All requests to a destination share one connection as
+  streams, up to the server's concurrency limit. Trailers land in `response::trailers`. A timeout cancels only its
+  own stream. `REFUSED_STREAM`, and streams above a `GOAWAY`'s last, are retried whatever the method. Also new:
+  `client_errc::stream_reset`, and `client_stats::http2_connections`.
+  `h2_client_session` is the protocol with no I/O, public so it can be driven directly. 11 new tests in
+  `make test-client`, and h2 by ALPN on both TLS backends in `make test-tls`.
+- **`make h2-client-interop`**: the client graded against Go's standard-library HTTP/2 server (h2c, and h2 over
+  TLS, with trailers and an aborted stream) and nghttpd. Six checks pass. In CI it runs on one job, with Go and
+  nghttpd as graders.
 - **An HTTPS test for `http::client`** in `make test-tls`: a GET and a 512 KiB POST on one verified TLS session,
   an untrusted certificate refused as `tls_failed`, and `https://` without a transport refused as
   `tls_unavailable`.

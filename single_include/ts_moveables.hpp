@@ -13126,6 +13126,10 @@ private:
 //  not extras: a multiplexed server without them is a DoS amplifier, because
 //  the client can make it do unbounded work for a bounded number of bytes.
 //
+//  HPACK, the frame layout and the field rules are in h2_wire.hpp, shared
+//  with the client (h2_client.hpp); this header is the server's state
+//  machine over them.
+//
 //  POSIX only, like everything downstream of the reactor; on Windows this
 //  header compiles to nothing and SNICHOLLS_HAS_HTTP2 is 0.
 //
@@ -13134,26 +13138,43 @@ private:
 #define http2_hpp
 
 // (inlined) #include "server.hpp"
+// (inlined) #include "h2_wire.hpp"
+// ----------------------------------------------------------------------
+// begin http/h2_wire.hpp
+// ----------------------------------------------------------------------
+//
+//  h2_wire.hpp
+//  TSMoveables
+//
+//  Copyright 2010-2026 Saxon Herschel Nicholls
+//
+//  Thread Safe Moveables - what both ends of an HTTP/2 connection share:
+//  HPACK (RFC 7541), the frame types, flags, error codes and settings of RFC
+//  9113, the frame header, the field-validity rules, and the token bucket the
+//  control-frame limits use. The server (http2.hpp) and the client
+//  (h2_client.hpp) are each a state machine over these; nothing here knows
+//  which side it is on, does I/O, or needs more than the standard library.
+//
+//  Split out of http2.hpp when the client arrived, so the codec the RFC 7541
+//  Appendix C vectors grade is the one code both directions run.
+//
 
-#if !SNICHOLLS_HAS_HTTP_SERVER
-#define SNICHOLLS_HAS_HTTP2 0
-#else
-#define SNICHOLLS_HAS_HTTP2 1
+#ifndef ts_moveables_http_h2_wire_hpp
+#define ts_moveables_http_h2_wire_hpp
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <deque>
-#include <map>
-#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+// (inlined) #include "message.hpp"
+
 namespace snicholls {
 namespace http {
-
 // ============================================================== HPACK (7541)
 //
 // Header compression, in its own namespace because it is a self-contained
@@ -13963,6 +13984,227 @@ enum : std::uint16_t {
     h2_settings_max_header_list_size = 0x6
 };
 
+// ------------------------------------------------------------ frame plumbing
+
+namespace detail {
+
+// RFC 9113 §4.1: the nine-octet header every frame starts with
+struct h2_frame_header {
+    std::uint32_t length = 0;
+    std::uint8_t type = 0;
+    std::uint8_t flags = 0;
+    std::uint32_t stream = 0;
+};
+
+// The reserved high bit of the stream id is ignored on receipt, not
+// validated: §4.1 is explicit about it
+inline h2_frame_header h2_read_header(const unsigned char* p) noexcept
+{
+    h2_frame_header h;
+    h.length = (std::uint32_t(p[0]) << 16) | (std::uint32_t(p[1]) << 8) | std::uint32_t(p[2]);
+    h.type = p[3];
+    h.flags = p[4];
+    h.stream = ((std::uint32_t(p[5]) & 0x7fu) << 24) | (std::uint32_t(p[6]) << 16) |
+               (std::uint32_t(p[7]) << 8) | std::uint32_t(p[8]);
+    return h;
+}
+
+inline void h2_put_header(std::string& o, std::uint32_t len, h2_frame type, std::uint8_t flags,
+                          std::uint32_t sid)
+{
+    o.push_back(char((len >> 16) & 0xff));
+    o.push_back(char((len >> 8) & 0xff));
+    o.push_back(char(len & 0xff));
+    o.push_back(char(std::uint8_t(type)));
+    o.push_back(char(flags));
+    o.push_back(char((sid >> 24) & 0x7f));
+    o.push_back(char((sid >> 16) & 0xff));
+    o.push_back(char((sid >> 8) & 0xff));
+    o.push_back(char(sid & 0xff));
+}
+
+inline void h2_put32(std::string& o, std::uint32_t v)
+{
+    o.push_back(char((v >> 24) & 0xff));
+    o.push_back(char((v >> 16) & 0xff));
+    o.push_back(char((v >> 8) & 0xff));
+    o.push_back(char(v & 0xff));
+}
+
+inline std::uint32_t h2_get32(const unsigned char* p) noexcept
+{
+    return (std::uint32_t(p[0]) << 24) | (std::uint32_t(p[1]) << 16) |
+           (std::uint32_t(p[2]) << 8) | std::uint32_t(p[3]);
+}
+
+inline void h2_put_window_update(std::string& o, std::uint32_t sid, std::uint32_t inc)
+{
+    h2_put_header(o, 4, h2_frame::window_update, 0, sid);
+    h2_put32(o, inc);
+}
+
+inline void h2_put_rst(std::string& o, std::uint32_t sid, h2_error code)
+{
+    h2_put_header(o, 4, h2_frame::rst_stream, 0, sid);
+    h2_put32(o, std::uint32_t(code));
+}
+
+inline void h2_put_goaway(std::string& o, std::uint32_t last_stream, h2_error code, const char* why)
+{
+    const std::size_t why_len = why ? std::strlen(why) : 0;
+    h2_put_header(o, std::uint32_t(8 + why_len), h2_frame::goaway, 0, 0);
+    h2_put32(o, last_stream);
+    h2_put32(o, std::uint32_t(code));
+    if (why_len)
+        o.append(why, why_len);
+}
+
+// A header block as HEADERS plus CONTINUATIONs, cut at the peer's own
+// SETTINGS_MAX_FRAME_SIZE; nothing may be interleaved between them (§6.10)
+inline void h2_put_header_block(std::string& o, const std::string& block, std::size_t max_frame,
+                                bool end_stream, std::uint32_t sid)
+{
+    const std::size_t first = std::min(max_frame, block.size());
+    const bool one_frame = (first == block.size());
+    h2_put_header(o, std::uint32_t(first), h2_frame::headers,
+                  std::uint8_t((one_frame ? h2_flag_end_headers : 0) | (end_stream ? h2_flag_end_stream : 0)), sid);
+    o.append(block, 0, first);
+    std::size_t sent = first;
+    while (sent < block.size()) {
+        const std::size_t n = std::min(max_frame, block.size() - sent);
+        const bool last = (sent + n == block.size());
+        h2_put_header(o, std::uint32_t(n), h2_frame::continuation, std::uint8_t(last ? h2_flag_end_headers : 0), sid);
+        o.append(block, sent, n);
+        sent += n;
+    }
+}
+
+// ------------------------------------------------------------- field rules
+
+// §8.2.1: field names are lowercase tokens on the wire
+inline bool h2_valid_name(const std::string& n) noexcept
+{
+    for (char c : n) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u >= 'A' && u <= 'Z')
+            return false;
+        if (u <= 0x20 || u == 0x7f || u == ':')
+            return false;
+        if (!is_token_char(c))
+            return false;
+    }
+    return !n.empty();
+}
+
+// §8.2.1: no NUL, CR or LF anywhere, and no whitespace at either end
+inline bool h2_valid_value(const std::string& v) noexcept
+{
+    for (char c : v) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u == 0x00 || u == 0x0a || u == 0x0d)
+            return false;
+    }
+    if (!v.empty() && (v.front() == ' ' || v.front() == '\t' || v.back() == ' ' || v.back() == '\t'))
+        return false;
+    return true;
+}
+
+// §8.2.2: fields with no meaning without HTTP/1.1's connection model, which
+// neither side may send; tolerating them is how a desync gets built
+inline bool h2_connection_specific(const std::string& lower_name) noexcept
+{
+    return lower_name == "connection" || lower_name == "keep-alive" || lower_name == "proxy-connection" ||
+           lower_name == "transfer-encoding" || lower_name == "upgrade";
+}
+
+inline bool h2_parse_uint(const std::string& v, unsigned long long& out) noexcept
+{
+    if (v.empty())
+        return false;
+    unsigned long long n = 0;
+    for (char c : v) {
+        if (!is_digit(c))
+            return false;
+        if (n > (~0ull - 9) / 10)
+            return false;
+        n = n * 10 + unsigned(c - '0');
+    }
+    out = n;
+    return true;
+}
+
+// A value made safe to send: CR, LF and NUL become spaces, and the ends are
+// trimmed, since a leading or trailing space makes the field malformed
+inline std::string h2_sanitise(const std::string& v)
+{
+    std::string o;
+    o.reserve(v.size());
+    for (char c : v)
+        o.push_back((c == '\r' || c == '\n' || c == '\0') ? ' ' : c);
+    std::size_t b = 0, e = o.size();
+    while (b < e && (o[b] == ' ' || o[b] == '\t')) ++b;
+    while (e > b && (o[e - 1] == ' ' || o[e - 1] == '\t')) --e;
+    return o.substr(b, e - b);
+}
+
+// A leaky bucket over steady_clock. Cheap enough to consult per frame: one
+// clock read and two multiplies, on a path that is already doing IO.
+class h2_bucket {
+public:
+    void configure(double burst, double per_second) noexcept
+    {
+        burst_ = burst;
+        rate_ = per_second;
+        tokens_ = burst;
+    }
+
+    bool take(std::chrono::steady_clock::time_point now) noexcept
+    {
+        if (last_.time_since_epoch().count() == 0)
+            last_ = now;
+        const double dt = std::chrono::duration<double>(now - last_).count();
+        last_ = now;
+        tokens_ = std::min(burst_, tokens_ + dt * rate_);
+        if (tokens_ < 1.0)
+            return false;
+        tokens_ -= 1.0;
+        return true;
+    }
+
+private:
+    double burst_ = 200.0;
+    double rate_ = 20.0;
+    double tokens_ = 200.0;
+    std::chrono::steady_clock::time_point last_{};
+};
+
+} // namespace detail
+
+} // namespace http
+} // namespace snicholls
+
+#endif // ts_moveables_http_h2_wire_hpp
+// end http/h2_wire.hpp
+
+#if !SNICHOLLS_HAS_HTTP_SERVER
+#define SNICHOLLS_HAS_HTTP2 0
+#else
+#define SNICHOLLS_HAS_HTTP2 1
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace snicholls {
+namespace http {
+
 // Everything a connection is allowed to cost us. The defaults are deliberately
 // conservative: an HTTP/2 server's whole risk profile is that one connection
 // can ask for unbounded work, and every field here is a place someone has
@@ -14010,36 +14252,6 @@ struct h2_config {
 
 namespace detail {
 
-// A leaky bucket over steady_clock. Cheap enough to consult per frame: one
-// clock read and two multiplies, on a path that is already doing IO.
-class h2_bucket {
-public:
-    void configure(double burst, double per_second) noexcept
-    {
-        burst_ = burst;
-        rate_ = per_second;
-        tokens_ = burst;
-    }
-
-    bool take(std::chrono::steady_clock::time_point now) noexcept
-    {
-        if (last_.time_since_epoch().count() == 0)
-            last_ = now;
-        const double dt = std::chrono::duration<double>(now - last_).count();
-        last_ = now;
-        tokens_ = std::min(burst_, tokens_ + dt * rate_);
-        if (tokens_ < 1.0)
-            return false;
-        tokens_ -= 1.0;
-        return true;
-    }
-
-private:
-    double burst_ = 200.0;
-    double rate_ = 20.0;
-    double tokens_ = 200.0;
-    std::chrono::steady_clock::time_point last_{};
-};
 
 // RFC 9113 §5.1. `idle` never appears in the map - a stream that has not been
 // opened has no state to store - and `reserved` never appears at all, because
@@ -14140,15 +14352,11 @@ public:
             if (in.size() - off < 9)
                 break;
             const unsigned char* p = reinterpret_cast<const unsigned char*>(in.data()) + off;
-            const std::uint32_t len = (std::uint32_t(p[0]) << 16) |
-                                      (std::uint32_t(p[1]) << 8) | std::uint32_t(p[2]);
-            const std::uint8_t type = p[3];
-            const std::uint8_t flags = p[4];
-            // The reserved high bit of the stream id is ignored on receipt,
-            // not validated: RFC 9113 §4.1 is explicit about it
-            const std::uint32_t sid = ((std::uint32_t(p[5]) & 0x7fu) << 24) |
-                                      (std::uint32_t(p[6]) << 16) |
-                                      (std::uint32_t(p[7]) << 8) | std::uint32_t(p[8]);
+            const detail::h2_frame_header fh = detail::h2_read_header(p);
+            const std::uint32_t len = fh.length;
+            const std::uint8_t type = fh.type;
+            const std::uint8_t flags = fh.flags;
+            const std::uint32_t sid = fh.stream;
 
             if (len > cfg_.max_frame_size) {
                 connection_error(host, h2_error::frame_size_error, "frame exceeds SETTINGS_MAX_FRAME_SIZE");
@@ -14297,34 +14505,6 @@ public:
 private:
     // ------------------------------------------------------------- emitting
 
-    void put(std::string& o, std::uint32_t len, h2_frame type, std::uint8_t flags,
-             std::uint32_t sid) const
-    {
-        o.push_back(char((len >> 16) & 0xff));
-        o.push_back(char((len >> 8) & 0xff));
-        o.push_back(char(len & 0xff));
-        o.push_back(char(std::uint8_t(type)));
-        o.push_back(char(flags));
-        o.push_back(char((sid >> 24) & 0x7f));
-        o.push_back(char((sid >> 16) & 0xff));
-        o.push_back(char((sid >> 8) & 0xff));
-        o.push_back(char(sid & 0xff));
-    }
-
-    static void put32(std::string& o, std::uint32_t v)
-    {
-        o.push_back(char((v >> 24) & 0xff));
-        o.push_back(char((v >> 16) & 0xff));
-        o.push_back(char((v >> 8) & 0xff));
-        o.push_back(char(v & 0xff));
-    }
-
-    static std::uint32_t get32(const unsigned char* p) noexcept
-    {
-        return (std::uint32_t(p[0]) << 24) | (std::uint32_t(p[1]) << 16) |
-               (std::uint32_t(p[2]) << 8) | std::uint32_t(p[3]);
-    }
-
     void emit(connection_host& host, const std::string& frame)
     {
         host.write_app(frame.data(), frame.size());
@@ -14341,31 +14521,24 @@ private:
         const std::uint32_t vals[6] = {
             cfg_.header_table_size, 0u, cfg_.max_concurrent_streams,
             cfg_.initial_window_size, cfg_.max_frame_size, cfg_.max_header_list_size};
-        put(o, 36, h2_frame::settings, 0, 0);
+        detail::h2_put_header(o, 36, h2_frame::settings, 0, 0);
         for (int i = 0; i < 6; ++i) {
             o.push_back(char((ids[i] >> 8) & 0xff));
             o.push_back(char(ids[i] & 0xff));
-            put32(o, vals[i]);
+            detail::h2_put32(o, vals[i]);
         }
         // The connection receive window starts at 65535 whatever SETTINGS
         // says; raising it takes a WINDOW_UPDATE on stream 0
         const std::int64_t want = std::int64_t(std::max<std::uint32_t>(cfg_.connection_window, 65535));
         if (want > 65535)
-            put_window_update(o, 0, std::uint32_t(want - 65535));
+            detail::h2_put_window_update(o, 0, std::uint32_t(want - 65535));
         emit(host, o);
-    }
-
-    void put_window_update(std::string& o, std::uint32_t sid, std::uint32_t inc) const
-    {
-        put(o, 4, h2_frame::window_update, 0, sid);
-        put32(o, inc);
     }
 
     void send_rst(connection_host& host, std::uint32_t sid, h2_error code)
     {
         std::string o;
-        put(o, 4, h2_frame::rst_stream, 0, sid);
-        put32(o, std::uint32_t(code));
+        detail::h2_put_rst(o, sid, code);
         emit(host, o);
     }
 
@@ -14376,13 +14549,8 @@ private:
         goaway_sent_ = true;
         close_ = true;
         last_error_ = code;
-        const std::size_t why_len = why ? std::strlen(why) : 0;
         std::string o;
-        put(o, std::uint32_t(8 + why_len), h2_frame::goaway, 0, 0);
-        put32(o, last_peer_stream_);
-        put32(o, std::uint32_t(code));
-        if (why_len)
-            o.append(why, why_len);
+        detail::h2_put_goaway(o, last_peer_stream_, code, why);
         emit(host, o);
     }
 
@@ -14497,7 +14665,7 @@ private:
             return;
         std::string o;
         if (conn_pending_update_) {
-            put_window_update(o, 0, conn_pending_update_);
+            detail::h2_put_window_update(o, 0, conn_pending_update_);
             conn_recv_window_ += std::int64_t(conn_pending_update_);
             conn_pending_update_ = 0;
         }
@@ -14505,7 +14673,7 @@ private:
             auto it = streams_.find(kv.first);
             if (it == streams_.end() || kv.second == 0)
                 continue;
-            put_window_update(o, kv.first, kv.second);
+            detail::h2_put_window_update(o, kv.first, kv.second);
             it->second->recv_window += std::int64_t(kv.second);
         }
         stream_updates_.clear();
@@ -14533,7 +14701,7 @@ private:
                 if (left == 0) {
                     if (!s.out_end)
                         break;                  // a streaming producer has more to come
-                    put(o, 0, h2_frame::data, h2_flag_end_stream, s.id);
+                    detail::h2_put_header(o, 0, h2_frame::data, h2_flag_end_stream, s.id);
                     s.end_sent = true;
                     break;
                 }
@@ -14543,7 +14711,7 @@ private:
                 std::size_t n = std::min<std::size_t>(left, std::size_t(window));
                 n = std::min<std::size_t>(n, peer_max_frame_);
                 const bool last = (n == left) && s.out_end;
-                put(o, std::uint32_t(n), h2_frame::data, last ? h2_flag_end_stream : 0, s.id);
+                detail::h2_put_header(o, std::uint32_t(n), h2_frame::data, last ? h2_flag_end_stream : 0, s.id);
                 o.append(s.out_buf, s.out_off, n);
                 s.out_off += n;
                 conn_send_window_ -= std::int64_t(n);
@@ -14681,7 +14849,7 @@ private:
                 connection_error(host, h2_error::frame_size_error, "HEADERS priority block truncated");
                 return;
             }
-            const std::uint32_t dep = get32(p + off) & 0x7fffffffu;
+            const std::uint32_t dep = detail::h2_get32(p + off) & 0x7fffffffu;
             off += 5;
             if (dep == sid) {
                 // §5.3.1 in RFC 7540; priority is deprecated by RFC 9113 but a
@@ -14788,7 +14956,7 @@ private:
             stream_error(host, sid, h2_error::frame_size_error);
             return;
         }
-        if ((get32(p) & 0x7fffffffu) == sid) {
+        if ((detail::h2_get32(p) & 0x7fffffffu) == sid) {
             stream_error(host, sid, h2_error::protocol_error);
             return;
         }
@@ -14849,7 +15017,7 @@ private:
 
         for (std::uint32_t i = 0; i + 6 <= len; i += 6) {
             const std::uint16_t id = std::uint16_t((std::uint32_t(p[i]) << 8) | p[i + 1]);
-            const std::uint32_t v = get32(p + i + 2);
+            const std::uint32_t v = detail::h2_get32(p + i + 2);
             switch (id) {
             case h2_settings_header_table_size:
                 enc_.peer_table_size(v);
@@ -14899,7 +15067,7 @@ private:
         }
 
         std::string o;
-        put(o, 0, h2_frame::settings, h2_flag_ack, 0);
+        detail::h2_put_header(o, 0, h2_frame::settings, h2_flag_ack, 0);
         emit(host, o);
         pump(host);
     }
@@ -14922,7 +15090,7 @@ private:
             return;
         }
         std::string o;
-        put(o, 8, h2_frame::ping, h2_flag_ack, 0);
+        detail::h2_put_header(o, 8, h2_frame::ping, h2_flag_ack, 0);
         o.append(reinterpret_cast<const char*>(p), 8);
         emit(host, o);
     }
@@ -14950,7 +15118,7 @@ private:
             connection_error(host, h2_error::frame_size_error, "WINDOW_UPDATE length is not 4");
             return;
         }
-        const std::uint32_t inc = get32(p) & 0x7fffffffu;
+        const std::uint32_t inc = detail::h2_get32(p) & 0x7fffffffu;
         if (sid == 0) {
             if (inc == 0) {
                 connection_error(host, h2_error::protocol_error, "WINDOW_UPDATE increment of 0");
@@ -15047,7 +15215,7 @@ private:
             const std::string& v = f.second;
             if (n.empty())
                 return false;
-            if (!valid_value(v))
+            if (!detail::h2_valid_value(v))
                 return false;
 
             if (n[0] == ':') {
@@ -15076,12 +15244,11 @@ private:
             }
 
             seen_regular = true;
-            if (!valid_name(n))
+            if (!detail::h2_valid_name(n))
                 return false;
             // §8.2.2: these have no meaning without HTTP/1.1's connection
             // model, and tolerating them is how a desync gets built
-            if (n == "connection" || n == "keep-alive" || n == "proxy-connection" ||
-                n == "transfer-encoding" || n == "upgrade")
+            if (detail::h2_connection_specific(n))
                 return false;
             if (n == "te" && v != "trailers")
                 return false;
@@ -15095,7 +15262,7 @@ private:
             }
             if (n == "content-length") {
                 unsigned long long declared = 0;
-                if (!parse_uint(v, declared))
+                if (!detail::h2_parse_uint(v, declared))
                     return false;
                 if (s.has_content_length && s.content_length != declared)
                     return false;
@@ -15143,49 +15310,6 @@ private:
         // information under a new name, so give them both
         if (have_authority && !authority.empty() && !req.headers.has("host"))
             req.headers.add("host", authority);
-        return true;
-    }
-
-    static bool valid_name(const std::string& n) noexcept
-    {
-        for (char c : n) {
-            const unsigned char u = static_cast<unsigned char>(c);
-            if (u >= 'A' && u <= 'Z')           // §8.2.1: field names are lowercase on the wire
-                return false;
-            if (u <= 0x20 || u == 0x7f || u == ':')
-                return false;
-            if (!detail::is_token_char(c))
-                return false;
-        }
-        return !n.empty();
-    }
-
-    static bool valid_value(const std::string& v) noexcept
-    {
-        for (char c : v) {
-            const unsigned char u = static_cast<unsigned char>(c);
-            if (u == 0x00 || u == 0x0a || u == 0x0d)
-                return false;
-        }
-        if (!v.empty() && (v.front() == ' ' || v.front() == '\t' ||
-                           v.back() == ' ' || v.back() == '\t'))
-            return false;
-        return true;
-    }
-
-    static bool parse_uint(const std::string& v, unsigned long long& out) noexcept
-    {
-        if (v.empty())
-            return false;
-        unsigned long long n = 0;
-        for (char c : v) {
-            if (!detail::is_digit(c))
-                return false;
-            if (n > (~0ull - 9) / 10)
-                return false;
-            n = n * 10 + unsigned(c - '0');
-        }
-        out = n;
         return true;
     }
 
@@ -15249,56 +15373,25 @@ private:
             detail::ascii_lower(n);
             // Connection-specific fields have no meaning here and RFC 9113
             // §8.2.2 forbids sending them
-            if (n == "connection" || n == "keep-alive" || n == "proxy-connection" ||
-                n == "transfer-encoding" || n == "upgrade")
+            if (detail::h2_connection_specific(n))
                 continue;
             if (n == "date") have_date = true;
             if (n == "server") have_server = true;
-            fields_out_.emplace_back(std::move(n), sanitise(h.second));
+            fields_out_.emplace_back(std::move(n), detail::h2_sanitise(h.second));
         }
         if (!have_date)
             fields_out_.emplace_back("date", host.http_date());
         if (!have_server)
-            fields_out_.emplace_back("server", sanitise(host.config().server_name));
+            fields_out_.emplace_back("server", detail::h2_sanitise(host.config().server_name));
 
         std::string block;
         enc_.encode(fields_out_, block);
 
         // A header block larger than one frame becomes HEADERS plus
-        // CONTINUATIONs; the peer's own max_frame_size decides where the cuts
-        // fall, and nothing may be interleaved between them
+        // CONTINUATIONs, cut where the peer's own max_frame_size says
         std::string o;
-        const std::size_t chunk = peer_max_frame_;
-        const std::size_t first = std::min(chunk, block.size());
-        const bool one_frame = (first == block.size());
-        put(o, std::uint32_t(first), h2_frame::headers,
-            std::uint8_t((one_frame ? h2_flag_end_headers : 0) |
-                         (end_stream ? h2_flag_end_stream : 0)),
-            s.id);
-        o.append(block, 0, first);
-        std::size_t sent = first;
-        while (sent < block.size()) {
-            const std::size_t n = std::min(chunk, block.size() - sent);
-            const bool last = (sent + n == block.size());
-            put(o, std::uint32_t(n), h2_frame::continuation,
-                std::uint8_t(last ? h2_flag_end_headers : 0), s.id);
-            o.append(block, sent, n);
-            sent += n;
-        }
+        detail::h2_put_header_block(o, block, peer_max_frame_, end_stream, s.id);
         emit(host, o);
-    }
-
-    static std::string sanitise(const std::string& v)
-    {
-        std::string o;
-        o.reserve(v.size());
-        for (char c : v)
-            o.push_back((c == '\r' || c == '\n' || c == '\0') ? ' ' : c);
-        // A leading or trailing space makes the field malformed on the wire
-        std::size_t b = 0, e = o.size();
-        while (b < e && (o[b] == ' ' || o[b] == '\t')) ++b;
-        while (e > b && (o[e - 1] == ' ' || o[e - 1] == '\t')) --e;
-        return o.substr(b, e - b);
     }
 
     // ---------------------------------------------------------------- state

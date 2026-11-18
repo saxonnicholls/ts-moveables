@@ -360,20 +360,35 @@ test-process: build/tests_process
 asan-process: build/tests_process_asan
 	./build/tests_process_asan
 
-# HTTP/1.1 client (TSMoveables/http/client.hpp): C++20, like process/. Its
-# tests run against http::server and a scripted raw-socket server.
-CLIENT_HDRS := TSMoveables/http/client.hpp TSMoveables/net/outbound.hpp TSMoveables/net/url.hpp
+# HTTP client (TSMoveables/http/client.hpp, HTTP/1.1 and HTTP/2): C++20, like
+# process/. Its tests run against http::server, our h2 server, and scripted
+# raw-socket servers.
+CLIENT_HDRS := TSMoveables/http/client.hpp TSMoveables/http/h2_client.hpp TSMoveables/http/h2_wire.hpp \
+    TSMoveables/net/outbound.hpp TSMoveables/net/url.hpp
+CLIENT_SRC := tests/client/tests_http_client.cpp tests/client/tests_h2_client.cpp
+CLIENT_TESTS := $(CLIENT_SRC) tests/client/client_harness.hpp
 
-build/tests_http_client: tests/client/tests_http_client.cpp $(CLIENT_HDRS) $(HEADERS) | build
+build/tests_http_client: $(CLIENT_TESTS) $(CLIENT_HDRS) $(HEADERS) | build
 	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) -pthread \
-	    tests/client/tests_http_client.cpp -o $@ $(LDLIBS)
+	    $(CLIENT_SRC) -o $@ $(LDLIBS)
 
-build/tests_http_client_asan: tests/client/tests_http_client.cpp $(CLIENT_HDRS) $(HEADERS) | build
+build/tests_http_client_asan: $(CLIENT_TESTS) $(CLIENT_HDRS) $(HEADERS) | build
 	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O1 -g -pthread -fsanitize=address,undefined \
-	    -fno-sanitize-recover=all tests/client/tests_http_client.cpp -o $@ $(LDLIBS)
+	    -fno-sanitize-recover=all $(CLIENT_SRC) -o $@ $(LDLIBS)
 
 test-client: build/tests_http_client
 	./build/tests_http_client
+
+# The client's HTTP/2 against servers that are not ours: Go's standard library
+# (h2c, and h2 over TLS by ALPN) and nghttpd when present. Graders, not
+# dependencies - the same footing as h2spec and Autobahn.
+build/h2_client_interop: tests/client/h2_interop/interop.cpp $(CLIENT_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) -pthread \
+	    -I$(OPENSSL_PREFIX)/include tests/client/h2_interop/interop.cpp -o $@ \
+	    -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto $(LDLIBS)
+
+h2-client-interop: build/h2_client_interop
+	./scripts/h2_client_interop.sh
 
 asan-client: build/tests_http_client_asan
 	./build/tests_http_client_asan
@@ -522,4 +537,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap test-fs asan-fs test-process asan-process test-client asan-client demo-text-index amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap test-fs asan-fs test-process asan-process test-client asan-client h2-client-interop demo-text-index amalgamate check-amalgamate clean

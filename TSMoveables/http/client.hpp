@@ -37,13 +37,23 @@
 //      connections, and a body limit.
 //    - https:// needs a transport_factory (TLS), the same one websocket_client
 //      takes; without one it is an error, never a silent downgrade.
+//    - HTTP/2 (h2_client.hpp) when the server agrees: over TLS, ALPN decides -
+//      offer {"h2", "http/1.1"} on the TLS context and a server that picks h2
+//      gets it; in plaintext, http2_prior_knowledge speaks h2c from the first
+//      byte. Every request to that destination then shares the one
+//      connection, up to the server's concurrent-stream limit, instead of
+//      queueing for a pooled one. Trailers land in response::trailers. A
+//      stream the server refused (REFUSED_STREAM, or above a GOAWAY's last
+//      stream) is retried on another connection whatever its method, since
+//      the server says it never acted on it; a timeout cancels just its own
+//      stream.
 //
 //  Threads: request() and its helpers may be called from any thread - the
 //  work is posted to the loop - and the callback runs on the loop's thread.
 //  Destroy the client on the loop's thread or after the loop has stopped;
 //  requests still outstanding then get client_errc::cancelled.
 //
-//  Not here yet: HTTP/2, request bodies streamed in chunks, redirects
+//  Not here yet: request and response bodies streamed in chunks, redirects
 //  (follow them in the callback), cookies, compression. POSIX only, following
 //  the event loop; SNICHOLLS_HAS_HTTP_CLIENT says which. C++20 (it returns
 //  core's result).
@@ -76,6 +86,7 @@
 
 #include <snicholls/core/result.hpp>
 
+#include "h2_client.hpp"
 #include "message.hpp"
 #include "parser.hpp"
 
@@ -94,6 +105,7 @@ enum class client_errc : std::uint8_t {
     protocol_error,      // the response did not parse
     body_too_large,
     cancelled,           // the client was destroyed or close()d first
+    stream_reset,        // HTTP/2: the server reset the request's stream
 };
 
 inline const char* to_string(client_errc e) noexcept
@@ -110,6 +122,7 @@ inline const char* to_string(client_errc e) noexcept
     case client_errc::protocol_error: return "malformed response";
     case client_errc::body_too_large: return "response body too large";
     case client_errc::cancelled: return "cancelled";
+    case client_errc::stream_reset: return "stream reset by the server";
     }
     return "?";
 }
@@ -150,11 +163,16 @@ struct client_config {
         return l;
     }();
     std::vector<std::pair<std::string, std::string>> headers{{"User-Agent", "ts-moveables"}};   // on every request
+    // h2c: speak HTTP/2 to plaintext http:// destinations without asking (there is no negotiation without TLS;
+    // a server that only speaks HTTP/1.1 then fails the request). Over TLS, ALPN decides instead.
+    bool http2_prior_knowledge = false;
+    h2_client_config http2;                       // its max_body is replaced by limits.max_body
 };
 
 struct client_stats {
     std::uint64_t requests = 0, responses = 0, failures = 0;
     std::uint64_t connections_opened = 0, reused = 0, retries = 0;
+    std::uint64_t http2_connections = 0;          // of connections_opened, those that spoke HTTP/2
 };
 
 class client {
@@ -200,8 +218,12 @@ public:
     std::size_t idle_connections() const
     {
         std::size_t n = 0;
-        for (const auto& [key, p] : c_->pools)
+        for (const auto& [key, p] : c_->pools) {
             n += p.idle.size();
+            for (const auto& c : p.h2)
+                if (c->streams.empty())
+                    ++n;
+        }
         return n;
     }
 
@@ -215,6 +237,7 @@ private:
         int attempts = 0;
         std::shared_ptr<bool> live = std::make_shared<bool>(true);   // false once answered
         event_loop::timer deadline;    // owned here, so answering or dropping the request cancels it
+        std::uint32_t h2_stream = 0;   // its stream, while it rides an HTTP/2 connection
     };
 
     struct connection {
@@ -224,12 +247,23 @@ private:
         bool reused = false;           // has carried a request before this one
         bool got_bytes = false;        // any byte of the current response
         event_loop::timer idle;
+        std::string key;               // its pool
+        bool secure = false;
+        bool opened = false;
+        std::unique_ptr<h2_client_session> h2;                     // set when it speaks HTTP/2
+        std::map<std::uint32_t, std::shared_ptr<pending>> streams; // HTTP/2: the requests in flight on it
     };
 
     struct pool {
         std::vector<std::shared_ptr<connection>> idle;
         std::size_t active = 0;        // connections open or opening, idle ones included
+        std::size_t opening = 0;       // of those, the ones not open yet
         std::deque<std::shared_ptr<pending>> queue;
+        std::vector<std::shared_ptr<connection>> h2;   // open HTTP/2 connections, each shared by many requests
+        // What the destination speaks. Until the first connection says (ALPN, over TLS), more requests wait for
+        // it rather than each opening a connection that would turn out to be one more h2 session
+        enum class speaks : std::uint8_t { unknown, http1, http2 } proto = speaks::unknown;
+        bool wait_for_opening() const noexcept { return proto != speaks::http1 && opening > 0; }
     };
 
     struct core : std::enable_shared_from_this<core> {
@@ -336,6 +370,16 @@ private:
         void enqueue(const std::shared_ptr<pending>& p)
         {
             pool& pl = pools[key_of(p->url)];
+            if (!p->url.secure)   // nothing to negotiate in plaintext: the configuration says
+                pl.proto = cfg.http2_prior_knowledge ? pool::speaks::http2 : pool::speaks::http1;
+            for (const auto& c : pl.h2)
+                if (c->h2->can_open()) {
+                    const auto conn = c;   // service_h2 may remove it from pl.h2
+                    submit_h2(conn, p);
+                    return service_h2(conn);
+                }
+            if (pl.wait_for_opening())
+                return pl.queue.push_back(p);   // the connection on its way may multiplex this one too
             while (!pl.idle.empty()) {
                 auto conn = pl.idle.back();
                 pl.idle.pop_back();
@@ -354,8 +398,11 @@ private:
         {
             pool& pl = pools[key_of(p->url)];
             ++pl.active;
+            ++pl.opening;
             ++stats.connections_opened;
             auto conn = std::make_shared<connection>();
+            conn->key = key_of(p->url);
+            conn->secure = p->url.secure;
             all_connections.push_back(conn);
             if (all_connections.size() > 64)       // prune the dead now and then
                 all_connections.erase(std::remove_if(all_connections.begin(), all_connections.end(),
@@ -372,8 +419,8 @@ private:
             conn->link->on_open = [weak, wc] {
                 auto self = weak.lock();
                 auto c = wc.lock();
-                if (self && c && c->current)
-                    self->send(c);
+                if (self && c)
+                    self->opened(c);
             };
             conn->link->on_data = [weak, wc, key](std::string& in) {
                 auto self = weak.lock();
@@ -388,6 +435,154 @@ private:
             };
             conn->link->start();
         }
+
+        void opened(const std::shared_ptr<connection>& conn)
+        {
+            conn->opened = true;
+            pool& pl = pools[conn->key];
+            if (pl.opening > 0)
+                --pl.opening;
+            const bool h2 = conn->secure ? std::strcmp(conn->link->alpn(), "h2") == 0 : cfg.http2_prior_knowledge;
+            if (h2)
+                return become_h2(conn);
+            const bool learned = pl.proto != pool::speaks::http1;
+            pl.proto = pool::speaks::http1;
+            if (conn->current)
+                send(conn);
+            else
+                release(conn->key, conn);
+            // Requests that waited to see whether this would be h2: it is not, so they get connections of their own
+            if (learned)
+                open_for_queue(pl);
+        }
+
+        // ------------------------------------------------------------ HTTP/2
+
+        void become_h2(const std::shared_ptr<connection>& conn)
+        {
+            pool& pl = pools[conn->key];
+            pl.proto = pool::speaks::http2;
+            pl.h2.push_back(conn);
+            ++stats.http2_connections;
+            h2_client_config hc = cfg.http2;
+            hc.max_body = cfg.limits.max_body;
+            conn->h2 = std::make_unique<h2_client_session>(hc);
+            conn->h2->start();
+            if (auto p = std::move(conn->current); p && *p->live)
+                submit_h2(conn, p);
+            conn->current.reset();
+            service_h2(conn);
+        }
+
+        void submit_h2(const std::shared_ptr<connection>& conn, const std::shared_ptr<pending>& p)
+        {
+            std::vector<std::pair<std::string, std::string>> headers;
+            headers.reserve(cfg.headers.size() + p->req.headers.size());
+            for (const auto& h : cfg.headers)
+                if (!has_header(*p, h.first))
+                    headers.push_back(h);
+            for (const auto& h : p->req.headers)
+                headers.push_back(h);
+            const std::uint32_t sid = conn->h2->submit(p->req.method, p->url.scheme, p->url.authority(),
+                                                       p->url.target, headers, p->req.body);
+            if (sid == 0)   // the connection stopped taking streams just now: queue it for the next
+                return pools[conn->key].queue.push_front(p);
+            ++p->attempts;
+            p->h2_stream = sid;
+            conn->streams[sid] = p;
+            by_request[p.get()] = conn;
+            conn->idle.cancel();
+        }
+
+        // After anything that touched the session: write what it produced, settle the exchanges it finished,
+        // feed it queued requests, and close or park the connection when it is done
+        void service_h2(const std::shared_ptr<connection>& conn)
+        {
+            pool& pl = pools[conn->key];
+            for (;;) {
+                // Always taken, written only while the link is up: output left in the session would keep this
+                // loop going for ever once the link has closed
+                const std::string out = conn->h2->take_output();
+                if (!out.empty() && conn->link && !conn->link->closed())
+                    conn->link->write(out);
+                auto done = conn->h2->take_completions();
+                for (auto& c : done)
+                    settle_h2(conn, c, net::outbound_status::transport_error);
+                while (!pl.queue.empty() && conn->h2->can_open() && !stopped) {
+                    auto next = pl.queue.front();
+                    pl.queue.pop_front();
+                    if (*next->live)
+                        submit_h2(conn, next);
+                }
+                if (done.empty() && !conn->h2->has_output())
+                    break;
+            }
+            if (conn->h2->finished()) {
+                conn->link->close();             // on_closed does the rest
+                return;
+            }
+            if (conn->streams.empty() && cfg.idle_timeout.count() > 0 && !conn->idle.active()) {
+                conn->idle = loop->after(cfg.idle_timeout);
+                std::weak_ptr<connection> wc = conn;
+                conn->idle.on_fire([wc] {
+                    if (auto c = wc.lock())
+                        if (c->streams.empty())
+                            c->link->close();
+                });
+            }
+        }
+
+        void settle_h2(const std::shared_ptr<connection>& conn, h2_completion& c, net::outbound_status why)
+        {
+            auto it = conn->streams.find(c.stream);
+            if (it == conn->streams.end())
+                return;
+            auto p = it->second;
+            conn->streams.erase(it);
+            by_request.erase(p.get());
+            p->h2_stream = 0;
+            if (!*p->live)
+                return;
+            switch (c.outcome) {
+            case h2_outcome::response:
+                return answer(p, ok(std::move(c.res)));
+            case h2_outcome::refused:
+                // The server says it never acted on it, so even a POST may go again (RFC 9113 §8.7)
+                if (p->attempts < 3 && !stopped) {
+                    ++stats.retries;
+                    return enqueue(p);
+                }
+                return answer(p, err(client_error(client_errc::connection_closed, "refused by the server")));
+            case h2_outcome::reset:
+                return answer(p, err(client_error(client_errc::stream_reset, c.detail)));
+            case h2_outcome::malformed:
+                return answer(p, err(client_error(client_errc::protocol_error, c.detail)));
+            case h2_outcome::too_large:
+                return answer(p, err(client_error(client_errc::body_too_large, c.detail)));
+            case h2_outcome::connection_failed:
+                if (why == net::outbound_status::closed_by_us && stopped)
+                    return answer(p, err(client_error(client_errc::cancelled, "")));
+                // A connection that simply went away before any of the answer came: the same retry as a dead
+                // pooled HTTP/1.1 connection. One that failed on a protocol error is not retried
+                if (c.code == h2_error::no_error && !c.started && p->idempotent && p->attempts < 2 && !stopped) {
+                    ++stats.retries;
+                    return enqueue(p);
+                }
+                return answer(p, err(client_error(c.code == h2_error::no_error ? client_errc::connection_closed
+                                                                               : client_errc::protocol_error,
+                                                  c.detail)));
+            }
+        }
+
+        bool has_header(const pending& p, const std::string& name) const
+        {
+            for (const auto& h : p.req.headers)
+                if (detail::iequals(h.first.data(), h.first.size(), name.data(), name.size()))
+                    return true;
+            return false;
+        }
+
+        // ------------------------------------------------------------ HTTP/1.1
 
         void dispatch(const std::shared_ptr<connection>& conn, const std::shared_ptr<pending>& p)
         {
@@ -409,6 +604,10 @@ private:
 
         void on_data(const std::string& key, const std::shared_ptr<connection>& conn, std::string& in)
         {
+            if (conn->h2) {
+                conn->h2->consume(in);
+                return service_h2(conn);
+            }
             if (!conn->current) {
                 // Bytes nobody asked for on an idle connection: it cannot be trusted with the next request
                 in.clear();
@@ -486,6 +685,14 @@ private:
             pool& pl = pools[key];
             if (pl.active > 0)
                 --pl.active;
+            if (!conn->opened && pl.opening > 0)
+                --pl.opening;
+            if (conn->h2) {
+                pl.h2.erase(std::remove(pl.h2.begin(), pl.h2.end(), conn), pl.h2.end());
+                conn->h2->connection_lost(net::to_string(why));
+                for (auto& c : conn->h2->take_completions())
+                    settle_h2(conn, c, why);
+            }
             for (auto it = pl.idle.begin(); it != pl.idle.end(); ++it)
                 if (*it == conn) {
                     pl.idle.erase(it);
@@ -507,8 +714,14 @@ private:
                     answer(p, err(client_error(map(why), net::to_string(why))));
                 }
             }
-            // A slot opened: the next queued request gets a fresh connection
-            while (!pl.queue.empty() && pl.active < cfg.max_connections_per_host && !stopped) {
+            // A slot opened: the next queued request gets a fresh connection - or, for a destination that speaks
+            // HTTP/2 (or may), one connection that the rest of the queue then shares
+            open_for_queue(pl);
+        }
+
+        void open_for_queue(pool& pl)
+        {
+            while (!pl.queue.empty() && pl.active < cfg.max_connections_per_host && !stopped && !pl.wait_for_opening()) {
                 auto next = pl.queue.front();
                 pl.queue.pop_front();
                 if (*next->live)
@@ -542,6 +755,13 @@ private:
             if (auto it = by_request.find(p.get()); it != by_request.end())
                 carrier = it->second.lock();
             answer(p, err(client_error(client_errc::timed_out, "")));
+            if (carrier && carrier->h2 && p->h2_stream) {
+                // Only its own stream: the connection and the requests beside it carry on
+                carrier->h2->cancel(p->h2_stream);
+                carrier->streams.erase(p->h2_stream);
+                p->h2_stream = 0;
+                return service_h2(carrier);
+            }
             if (carrier && carrier->current == p) {
                 carrier->current.reset();
                 carrier->link->close();

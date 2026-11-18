@@ -62,8 +62,9 @@ OPT_IN = {
     "process/health.hpp",
     "process/http_health.hpp",
     "process/signals.hpp",
-    # the HTTP client returns core's result: C++20
+    # the HTTP client returns core's result: C++20. Its HTTP/2 session goes with it
     "http/client.hpp",
+    "http/h2_client.hpp",
 }
 
 # (output, entry) - must match the `amalgamate` target in the Makefile

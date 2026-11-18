@@ -649,6 +649,16 @@ grpc/grpc interop matrix is the honest first gate.
 `net::outbound_connection` and a `response_parser` that is the server's parser pointed the other way, with
 trailers kept in `response::trailers`. The h2 client is still the gap.
 
+**Update (after 1.8.0):** the h2 client exists. `http::client` speaks HTTP/2 by ALPN, or by prior knowledge in
+plaintext, with trailers in `response::trailers`. `h2_client_session` is the protocol with no I/O, so a gRPC
+layer can drive streams directly. It is graded against Go's standard library and nghttpd (`make
+h2-client-interop`). What gRPC still needs from the transport:
+
+- **Trailers on the server side.** `http2.hpp` cannot send trailers yet, and incoming request trailers are
+  decoded and discarded.
+- **Streamed bodies on the client side.** Responses are buffered whole, which is enough for unary calls but not
+  for server streaming.
+
 ## Non-goals
 
 Written down so nobody — including us — spends a busy week on them:

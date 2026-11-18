@@ -618,8 +618,51 @@ auto r = snicholls::http::fetch({.url = "http://127.0.0.1:8080/health"});   // o
   are errors with a code. Requests may be made from any thread; the callback runs on the loop's.
 - `https://` uses the same `transport_factory` as `websocket_client`; without one it is an error, never plain text.
 
-`make test-client` runs it against `http::server` and a scripted server that misbehaves on purpose. Not yet: HTTP/2
-(gRPC needs it), streamed request bodies, redirects (follow them in the callback), compression.
+### HTTP/2
+
+The same client speaks HTTP/2 when the server agrees, with no change to how requests are made:
+
+```cpp
+snicholls::http::openssl_client_config tls_cfg;
+tls_cfg.alpn = {"h2", "http/1.1"};                        // offer h2; the server chooses
+auto tls = std::make_shared<snicholls::http::openssl_client_context>(tls_cfg);
+
+snicholls::http::client_config cfg;
+cfg.transport_factory = [tls](const std::string& host) {
+    return std::unique_ptr<snicholls::http::transport_delegate>(tls->connect(host).release());
+};
+cfg.http2_prior_knowledge = true;                         // and h2c to plaintext http:// destinations
+snicholls::http::client http(loop, cfg);
+```
+
+- **Over TLS, ALPN decides.** Offer `h2` on the TLS context and a server that picks it gets HTTP/2; one that picks
+  `http/1.1` gets the HTTP/1.1 client above. Plaintext has nothing to negotiate, so h2c is spoken only when
+  `http2_prior_knowledge` says so.
+- **One connection per destination, multiplexed.** Every request to that destination becomes a stream on the
+  same connection, up to the server's `SETTINGS_MAX_CONCURRENT_STREAMS`, and completes in whatever order the
+  server answers. On first contact over TLS, further requests wait for the first handshake rather than each
+  opening a connection that would turn out to be one more h2 session. If it settles on HTTP/1.1 they fan out
+  as before.
+- **Trailers**, where gRPC puts its status, land in `response::trailers`, as they do for a chunked HTTP/1.1 body.
+- **Failures stay as narrow as the protocol allows.** A timeout cancels its own stream (`RST_STREAM CANCEL`) and
+  leaves the connection alone. A stream the server reset fails as `stream_reset`, and a malformed head resets
+  only its own stream. A stream the server never processed (`REFUSED_STREAM`, or above a `GOAWAY`'s last stream)
+  is retried, even a POST, because RFC 9113 §8.7 says the server did not act on it.
+- **The server's codec, both ways.** `http/h2_wire.hpp` holds HPACK, the frame layout and the field rules,
+  shared by the server (`http2.hpp`) and the client (`h2_client.hpp`), so the decoder the RFC 7541 Appendix C
+  vectors grade is the one both directions run. `h2_client_session` is the client's protocol as a state
+  machine with no I/O: bytes in, bytes and completed exchanges out. That is how it is tested frame by frame,
+  and how a protocol on top of h2 (gRPC) can drive it directly.
+
+`make test-client` runs 20 tests against `http::server`, the library's h2 server, and scripted servers that
+misbehave on purpose: trailers, interim heads, `REFUSED_STREAM`, `GOAWAY`, resets, malformed heads, `PUSH_PROMISE`,
+and a cancelled stream whose header block must still be decoded. `make test-tls` covers h2 by ALPN on both TLS
+backends. **`make h2-client-interop` grades it against servers that are not ours:** Go's standard library (h2c, and
+h2 over TLS by ALPN, with trailers and an aborted stream) and nghttp2's `nghttpd`. In CI, Go and nghttpd are
+graders, like h2spec and Autobahn, not dependencies.
+
+Not yet: request and response bodies streamed in chunks (an h2 response is buffered whole, up to `max_body`),
+redirects (follow them in the callback), compression.
 
 ## moveable_signal
 
@@ -1649,6 +1692,9 @@ Two things worth pulling out.
 **A stalled window cannot make us buffer without bound.** A client may legally open a stream, ask for a large response, and then simply never send a `WINDOW_UPDATE` — nothing in RFC 9113 obliges it to, and staying silent costs the client nothing while the server holds everything it was told to send. `h2_config::max_outbound_buffer` is a budget for the whole connection (8 MiB by default, not per stream — a per-stream limit multiplies by `max_concurrent_streams`, and 100 × 8 MiB is not a bound anyone wanted). The stream whose write crosses the line is reset with `ENHANCE_YOUR_CALM`; streams already inside the budget are untouched, because one greedy exchange is not grounds to punish the rest of the connection.
 
 That limit is the backstop. The signal that should stop a well-behaved producer first is `response_stream::pending()`, which now reports the socket backlog **plus whatever the protocol is holding because flow control will not let it out**. On HTTP/2 the second part is usually the larger one, and it used to be invisible — `pending()` read zero precisely when the flow-control backlog was biggest, so a producer checking it against a budget was told the stalled peer was idle. Both halves are covered by tests that were checked to fail with the fix disabled, because a test that passes either way proves nothing.
+
+The client side shares this codec: HPACK, framing and the field rules live in `http/h2_wire.hpp`, and the
+[HTTP client](#http-client-httpclienthpp) speaks h2 on top of it.
 
 Deliberately not done, and said plainly: `Upgrade: h2c` (RFC 9113 removed it), server push (we advertise `ENABLE_PUSH=0`), CONNECT, and PRIORITY beyond parse-and-ignore (RFC 9113 deprecates the scheme). A whole-body `respond()` is still bounded only by what the application chose to allocate — the same argument the inbound side makes for `max_body`: the ceiling is a configuration decision the application already made, and the server never multiplies it.
 

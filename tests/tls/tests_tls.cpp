@@ -53,6 +53,7 @@
 #include "../../TSMoveables/http/websocket_client.hpp"
 #if __cplusplus >= 202002L
 #include "../../TSMoveables/http/client.hpp"
+#include "../../TSMoveables/http/http2.hpp"
 #endif
 #include "../../TSMoveables/moveable/mutex.hpp"
 
@@ -407,10 +408,16 @@ private:
 template <class Backend>
 class https_server {
 public:
-    explicit https_server(const self_signed& cred)
+    // h2: offer HTTP/2 by ALPN too, and let the protocol follow what was agreed
+    explicit https_server(const self_signed& cred, bool h2 = false)
     {
         Backend::configure(tls, cred);
-        tls.set_alpn({"http/1.1"});
+        if (h2) {
+            tls.set_alpn({"h2", "http/1.1"});
+            snicholls::http::enable_http2(srv);
+        } else {
+            tls.set_alpn({"http/1.1"});
+        }
         srv.transport_factory(tls.factory());
 
         srv.get("/hello", [](const request&, responder r) {
@@ -822,6 +829,61 @@ void test_https_client(const self_signed& cred)
     pass("https: http::client over TLS - GET and a 512 KiB POST on one verified session; untrusted refused; "
          "no transport, no request");
 }
+
+// HTTP/2 by ALPN: a client offering h2 to a server offering h2 multiplexes on one TLS session; a client offering
+// only http/1.1 to the same server gets HTTP/1.1
+template <class Backend>
+void test_https_client_h2(const self_signed& cred, const char* backend)
+{
+    https_server<Backend> s(cred, true);
+    wss_fixture fx(cred);
+    const std::string base = "https://localhost:" + std::to_string(s.port);
+    auto client_for = [&](std::vector<std::string> alpn) {
+        openssl_client_config ccfg;
+        ccfg.ca_file = fx.ca_path;
+        ccfg.alpn = std::move(alpn);
+        auto tls = std::make_shared<openssl_client_context>(ccfg);
+        snicholls::http::client_config cfg;
+        cfg.transport_factory = [tls](const std::string& host) {
+            return std::unique_ptr<transport_delegate>(tls->connect(host).release());
+        };
+        return cfg;
+    };
+
+    event_loop loop;
+    snicholls::http::client http(loop, client_for({"h2", "http/1.1"}));
+    std::vector<snicholls::http::client_result> got;
+    const std::string big(512 * 1024, 'z');
+    for (int i = 0; i < 8; ++i)
+        http.get(base + "/hello", [&](snicholls::http::client_result r) { got.push_back(std::move(r)); });
+    http.request({"POST", base + "/echo", {}, big, {}},
+                 [&](snicholls::http::client_result r) { got.push_back(std::move(r)); });
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (got.size() < 9 && std::chrono::steady_clock::now() < until) loop.run_once(std::chrono::milliseconds(10));
+    assert(got.size() == 9);
+    for (auto& r : got) assert(r.is_ok() && r->status == 200 && r->http_major == 2);
+    assert(got.back()->body == big);
+    assert(http.stats().connections_opened == 1 && http.stats().http2_connections == 1);
+
+    const auto old = snicholls::http::fetch({"GET", base + "/hello", {}, {}, {}}, client_for({"http/1.1"}));
+    assert(old.is_ok() && old->http_major == 1 && old->body == "secure hello");
+
+    // Offering h2 to a server that only speaks HTTP/1.1: requests that waited on the first handshake fan out to
+    // connections of their own once it says http/1.1, as they would have without the wait
+    https_server<Backend> h1(cred);
+    event_loop loop1;
+    snicholls::http::client c1(loop1, client_for({"h2", "http/1.1"}));
+    std::vector<snicholls::http::client_result> got1;
+    const std::string base1 = "https://localhost:" + std::to_string(h1.port);
+    for (int i = 0; i < 6; ++i)
+        c1.get(base1 + "/hello", [&](snicholls::http::client_result r) { got1.push_back(std::move(r)); });
+    const auto until1 = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (got1.size() < 6 && std::chrono::steady_clock::now() < until1) loop1.run_once(std::chrono::milliseconds(10));
+    assert(got1.size() == 6);
+    for (auto& r : got1) assert(r.is_ok() && r->http_major == 1);
+    assert(c1.stats().http2_connections == 0 && c1.stats().connections_opened >= 1);
+    pass(tagged(backend, "https: ALPN agrees h2 - nine requests share one TLS session; a server without h2 gets HTTP/1.1").c_str());
+}
 #endif
 
 void test_wss_without_a_transport_is_refused_not_downgraded()
@@ -851,10 +913,14 @@ int main()
     test_wss_without_a_transport_is_refused_not_downgraded();
 #if __cplusplus >= 202002L && SNICHOLLS_HAS_HTTP_CLIENT
     test_https_client(cred);
+    test_https_client_h2<openssl_backend>(cred, "openssl");
 #endif
 
 #if defined(SNICHOLLS_TEST_MBEDTLS)
     run_backend<mbedtls_backend>(cred);
+#if __cplusplus >= 202002L && SNICHOLLS_HAS_HTTP_CLIENT
+    test_https_client_h2<mbedtls_backend>(cred, "mbedtls");
+#endif
 #else
     std::cout << "\n-- backend: mbedtls - not installed, skipped\n";
 #endif
