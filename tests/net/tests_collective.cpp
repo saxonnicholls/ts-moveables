@@ -425,7 +425,9 @@ void test_silent_peer_times_out()
 void test_killed_peer()
 {
     auto j = make_job(3);
-    for (auto& c : j.cfgs) c.io_timeout = 10s;     // the error must come from the socket, not the clock
+    // The error must come from the socket, not the clock: the stall deadline is far beyond the bound asserted below,
+    // which also covers the child allocating its buffer before it dies (seconds on a slow shared CI runner)
+    for (auto& c : j.cfgs) c.io_timeout = 60s;
     const pid_t child = ::fork();
     assert(child >= 0);
     if (child == 0) {
@@ -454,7 +456,7 @@ void test_killed_peer()
             const auto res = c->allreduce_sum(v.data(), v.size());
             took[std::size_t(r)] = std::chrono::duration<double>(clock_type::now() - t0).count();
             assert(res.is_err());
-            std::cout << "      rank " << r << ": " << res.unwrap_err_unchecked().what() << "\n";
+            std::cout << "      rank " << r << " after " << took[std::size_t(r)] << " s: " << res.unwrap_err_unchecked().what() << "\n";
             code[std::size_t(r)] = res.unwrap_err_unchecked().code();
             peer[std::size_t(r)] = res.unwrap_err_unchecked().peer();
         });
@@ -465,7 +467,7 @@ void test_killed_peer()
     for (int r = 0; r < 2; ++r) {
         assert(code[std::size_t(r)] == collective_errc::peer_closed || code[std::size_t(r)] == collective_errc::io_error);
         assert(peer[std::size_t(r)] == 2);
-        assert(took[std::size_t(r)] < 5.0);
+        assert(took[std::size_t(r)] < 30.0);   // half the stall deadline: the socket, not io_timeout, ended it
     }
     pass("collective: a killed peer process is an error naming it, not a hang");
 }
