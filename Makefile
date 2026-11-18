@@ -8,6 +8,7 @@
 #   make asan    build and run the unit tests under Address+UB Sanitizers
 #   make demo    build and run the demo (same code as the Xcode target)
 #   make demo-remote  remote execution: client and workers over loopback (C++20, POSIX)
+#   make test-collective  allreduce, broadcast and barrier over TCP (C++20, POSIX)
 #   make clean
 #
 #   make test STD=c++17    any target can be built against a different standard
@@ -393,6 +394,48 @@ h2-client-interop: build/h2_client_interop
 asan-client: build/tests_http_client_asan
 	./build/tests_http_client_asan
 
+# Collectives over TCP (TSMoveables/net/collective.hpp): a full mesh, allreduce_sum in rank
+# order, broadcast and barrier. C++20 and POSIX, like http::client, so a program of its own.
+# The tests run 1 to 5 ranks as threads on 127.0.0.1 (one is a forked process, killed);
+# the demo runs ranks as processes; the benchmark moves 0.5 GB on 2 and 4 processes.
+COLL_HDRS := TSMoveables/net/collective.hpp TSMoveables/net/tcp.hpp
+
+build/tests_collective: tests/net/tests_collective.cpp $(COLL_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) -pthread \
+	    tests/net/tests_collective.cpp -o $@ $(LDLIBS)
+
+build/tests_collective_asan: tests/net/tests_collective.cpp $(COLL_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O1 -g -pthread -fsanitize=address,undefined \
+	    -fno-sanitize-recover=all tests/net/tests_collective.cpp -o $@ $(LDLIBS)
+
+build/tests_collective_tsan: tests/net/tests_collective.cpp $(COLL_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O1 -g -pthread -fsanitize=thread \
+	    tests/net/tests_collective.cpp -o $@ $(LDLIBS)
+
+build/collective_demo: demos/collective_demo.cpp $(COLL_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O2 -g $(EXTRA_FLAGS) -pthread \
+	    demos/collective_demo.cpp -o $@ $(LDLIBS)
+
+build/collective_bench: benchmarks/collective_bench.cpp $(COLL_HDRS) $(HEADERS) | build
+	$(CXX) $(MMAP_INC) -std=$(REMOTE_STD) -Wall -Wextra -pedantic -O3 -DNDEBUG $(EXTRA_FLAGS) -pthread \
+	    benchmarks/collective_bench.cpp -o $@ $(LDLIBS)
+
+test-collective: build/tests_collective
+	./build/tests_collective
+
+asan-collective: build/tests_collective_asan
+	./build/tests_collective_asan
+
+# Linux evidence: on a macOS 26 host Apple's TSan runtime traps before main
+tsan-collective: build/tests_collective_tsan
+	TSAN_OPTIONS="suppressions=tests/tsan.supp halt_on_error=1" ./build/tests_collective_tsan
+
+demo-collective: build/collective_demo
+	./build/collective_demo selftest
+
+bench-collective: build/collective_bench
+	./build/collective_bench
+
 # The persistent full-text index (demos/text_index): a suffix array in
 # mapped files, built once and reopened in microseconds. Self-verifying.
 build/persistent_index_demo: demos/text_index/persistent_index_demo.cpp demos/text_index/suffix_array.hpp $(MMAP_HDRS) $(HEADERS) | build
@@ -537,4 +580,4 @@ check-amalgamate: amalgamate | build
 clean:
 	rm -rf build
 
-.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap test-fs asan-fs test-process asan-process test-client asan-client h2-client-interop demo-text-index amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap test-fs asan-fs test-process asan-process test-client asan-client test-collective asan-collective tsan-collective demo-collective bench-collective h2-client-interop demo-text-index amalgamate check-amalgamate clean
