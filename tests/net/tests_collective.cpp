@@ -49,6 +49,8 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -528,6 +530,10 @@ void test_silent_peer_times_out()
     std::vector<collective_errc> code(3);
     std::vector<int> peer(3, -1);
     std::vector<double> took(3);
+    // Timed from the first rank's call: the rank that sees the silence first tells the other, whose own call may
+    // have started later, so its own clock can show less than io_timeout
+    std::mutex m;
+    std::optional<clock_type::time_point> first;
     run_ranks(j, [&](int r, collective_result<collective>& c) {
         assert(c.is_ok());
         if (r == 2) {                    // alive, connected, never calls
@@ -535,9 +541,12 @@ void test_silent_peer_times_out()
             return;
         }
         std::vector<float> v(1'000'000, 1.0f);
-        const auto t0 = clock_type::now();
+        {
+            std::lock_guard g(m);
+            if (!first) first = clock_type::now();
+        }
         const auto res = c->allreduce_sum(v.data(), v.size());
-        took[std::size_t(r)] = std::chrono::duration<double>(clock_type::now() - t0).count();
+        took[std::size_t(r)] = std::chrono::duration<double>(clock_type::now() - *first).count();
         assert(res.is_err());
         code[std::size_t(r)] = res.unwrap_err_unchecked().code();
         peer[std::size_t(r)] = res.unwrap_err_unchecked().peer();
@@ -689,16 +698,23 @@ void test_slow_link_is_not_a_stall()
     j.cfgs[1].peers[0] = "127.0.0.1:" + std::to_string(t.front.port());
     for (auto& c : j.cfgs) c.io_timeout = 400ms;
     const std::size_t n = 1'000'000;                         // 2 MB a direction a collective: about 1 s on the link
+    // Inputs and references made before the ranks start, so they call their collectives back to back: the time a
+    // rank spends between two calls counts against io_timeout like any silence (a sanitizer build is slow at it)
+    std::vector<std::vector<std::vector<float>>> xs;
+    std::vector<std::vector<float>> want;
+    for (std::uint64_t round = 0; round < 2; ++round) {
+        xs.push_back({values(0, n, round), values(1, n, round)});
+        want.push_back(rank_order_sum(xs.back()));
+    }
     std::vector<int> good(2, 0);
     run_ranks(j, [&](int r, collective_result<collective>& c) {
         assert(c.is_ok());
         bool ok = true;
         for (std::uint64_t round = 0; round < 2 && ok; ++round) {
-            std::vector<std::vector<float>> xs{values(0, n, round), values(1, n, round)};
-            auto mine = xs[std::size_t(r)];
+            auto mine = xs[round][std::size_t(r)];
             const auto res = c->allreduce_sum(mine.data(), mine.size());
             if (res.is_err()) std::cerr << "      rank " << r << ": " << res.unwrap_err_unchecked().what() << "\n";
-            ok = res.is_ok() && same_bits(mine, rank_order_sum(xs));
+            ok = res.is_ok() && same_bits(mine, want[round]);
             const auto b = c->barrier();
             if (b.is_err()) std::cerr << "      rank " << r << " barrier: " << b.unwrap_err_unchecked().what() << "\n";
             ok = ok && b.is_ok();
@@ -1303,14 +1319,20 @@ void test_all_to_all_v_slow_link()
     j.cfgs[1].peers[0] = "127.0.0.1:" + std::to_string(t.front.port());
     for (auto& c : j.cfgs) c.io_timeout = 400ms;
     const a2a_plan plan({{5, 1'000'000}, {1'000'000, 7}}, 1);
+    // Inputs and references made before the ranks start (see test_slow_link_is_not_a_stall)
+    std::vector<std::vector<std::vector<float>>> sends, expects;
+    for (std::uint64_t round = 0; round < 2; ++round) {
+        sends.push_back({values(0, plan.sent(0), round), values(1, plan.sent(1), round)});
+        expects.push_back(moe_all_to_all_reference(sends.back(), plan.row_offsets, 1));
+    }
     std::vector<int> good(2, 0);
     run_ranks(j, [&](int r, collective_result<collective>& c) {
         assert(c.is_ok());
         const std::size_t k = std::size_t(r);
         bool ok = true;
         for (std::uint64_t round = 0; round < 2 && ok; ++round) {
-            std::vector<std::vector<float>> send_f{values(0, plan.sent(0), round), values(1, plan.sent(1), round)};
-            const auto expect = moe_all_to_all_reference(send_f, plan.row_offsets, 1);
+            const auto& send_f = sends[round];
+            const auto& expect = expects[round];
             std::vector<float> got(expect[k].size());
             const auto res = c->all_to_all_v(send_f[k].data(), plan.send_counts(k), plan.send_offsets(k), got.data(),
                                              plan.recv_counts(k), plan.recv_offsets(k));
