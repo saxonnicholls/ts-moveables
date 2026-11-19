@@ -7,6 +7,43 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Added
+
+- **`collective::all_to_all_v`**, the all-to-all with a count for every pair (MPI's Alltoallv), for expert
+  parallelism's dispatch and combine: this rank's segment `[send_offsets[q], + send_counts[q])` goes to rank `q`, and
+  rank `q`'s segment for this rank lands at `[recv_offsets[q], + recv_counts[q])`. Over `float`, bfloat16 bits
+  (`std::uint16_t`) or any element size (`const void*`, `element_size`). With `recv_offsets` the prefix sums of
+  `recv_counts` every rank receives the segments for it in source order, which is snicholls-core's
+  `ml::moe_all_to_all` bit for bit. Each pair's header carries the count for its receiver, which checks it against
+  the count it expects before any element lands: counts that disagree, another element type or size, or another
+  collective are a `mismatched_call` naming the peer. Segments go straight between the caller's buffers both ways at
+  once (no staging, no deadlock), with the stall deadline, progress notices, abort notices and elastic epochs of the
+  other collectives. `exchange_counts(send_counts, recv_counts)` tells each rank what the others will send it, and an
+  overload taking `std::vector`s exchanges the counts first and packs what arrives in source order.
+- **`collective::allreduce_sum_bf16(std::uint16_t*, n)`**: the all-reduce over bfloat16 bits. Every rank ends with
+  `bf16(((f(x_0) + f(x_1)) + ...) + f(x_{N-1}))`: exact decoding, a float sum in rank order, one rounding to
+  nearest even at the chunk's owner (snicholls-core's `ml::ordered_sum_bf16` and `ml::to_bfloat16`). It moves exactly
+  half the bytes of `allreduce_sum`, because bfloat16 travels both ways. A float call against a bfloat16 call is a
+  `mismatched_call`.
+- **Elastic membership** (`collective_config::elastic`). `reform()` forms a new collective among the survivors of a
+  failure: the lowest live slot coordinates, the epoch goes up by one, and ranks are renumbered densely in slot
+  order. `join()` lets a restarted rank find the group's rendezvous. `admit()` lets joiners in at a round boundary.
+  `poll()` sees a failure between collectives and takes joiners' requests. New accessors `slot()`, `epoch()`,
+  `members()` and `failure()`; a new error code `excluded`; new deadlines `probe_timeout`, `gather_window`,
+  `reform_timeout` and `join_timeout`; and `min_members`.
+
+### Changed
+
+- **Progress notices**: a rank moving bytes in a collective tells every other rank so on the control connection, at
+  most every `io_timeout / 4`, and the stall deadline restarts for a peer that is heard from. Before this, a healthy
+  run over a slow, buffering link (an ssh tunnel at 0.1 Mbit/s) failed with `timed_out`: a rank that had finished a
+  collective waited in the next one while its peer was still receiving.
+- **Handshake version 2** (56 bytes: the epoch and a digest of the members) and a 40-byte op header (with the
+  epoch). Ranks of 1.9.0 and of this release do not mesh together. `sequence()` counts the collectives of the
+  current epoch.
+
 ## [1.9.0] — 2026-11-19
 
 ### Changed

@@ -17,6 +17,9 @@
 //
 //      c->broadcast(weights.data(), weights.size(), 0);       // rank 0's initial weights everywhere
 //      c->allreduce_sum(grads.data(), grads.size());          // every rank: the same sum, bit for bit
+//      c->allreduce_sum_bf16(bits.data(), bits.size());       // the same over bfloat16, half the bytes
+//      c->all_to_all_v(rows, send_counts, send_offsets,      // rank r's segment for each rank,
+//                      got, recv_counts, recv_offsets);      // and each rank's for r, in rank order
 //      c->barrier();
 //
 //  ------------------------------------------------------------- the sum
@@ -32,6 +35,20 @@
 //  same thing) can check it bit for bit. Floating-point addition is not
 //  associative, so this is a real constraint: a ring allreduce gives each
 //  element a different summation order depending on which rank owns its chunk.
+//
+//  allreduce_sum_bf16(bits, n) is the same over bfloat16 values (the 16-bit
+//  patterns of snicholls-core's ml::bfloat16): every rank ends with, per element,
+//
+//      bf16( ((f(x_0) + f(x_1)) + f(x_2)) + ... + f(x_{N-1}) )
+//
+//  where f decodes a bfloat16 to float exactly, the sum is in float in rank
+//  order (core's ml::ordered_sum_bf16), and bf16 rounds it to nearest even
+//  (core's ml::to_bfloat16) once, at the rank that owns the chunk. bfloat16
+//  travels both ways - the pieces to the owner and the reduced chunks back - so
+//  each rank moves exactly half the bytes of allreduce_sum for the same n (the
+//  40-byte headers aside). The sum's one rounding is the price; a caller that
+//  divides by N for a mean does so after (core's ml::ordered_mean_bf16 is that
+//  mean). NaN comes back quiet; infinities add as float adds them.
 //
 //  ------------------------------------------------------------ the algorithm
 //
@@ -51,6 +68,17 @@
 //  all-gather lands straight in it. One thread, one poll() loop over every peer's
 //  socket, non-blocking in both directions: two ranks sending each other half a
 //  gigabyte cannot deadlock on full socket buffers.
+//
+//  all_to_all_v(send, send_counts, send_offsets, recv, recv_counts,
+//  recv_offsets) sends every rank its own segment of the caller's buffer and
+//  receives one from each (MPI's Alltoallv): expert parallelism's dispatch and
+//  combine. Each pair's segments go directly between the caller's buffers in
+//  both directions at once, with no staging, so memory does not grow with the
+//  sizes; each header carries the count for its receiver, which checks it
+//  against the count it expects (exchange_counts() tells it) before any
+//  element lands. With recv_offsets the prefix sums of recv_counts, rank r
+//  receives the segments for r in source order, which is snicholls-core's
+//  ml::moe_all_to_all bit for bit. Float, bfloat16 bits, or any element size.
 //
 //  broadcast(data, n, root) scatters the buffer from the root in N-1 pieces, one
 //  to each other rank, which forward their piece to everyone but the root as it
@@ -89,7 +117,61 @@
 //
 //  After any failure the collective is broken: the streams may be mid-message,
 //  so every later call returns `broken`. Destroy it (that closes the sockets)
-//  and connect again.
+//  and connect again - or, in an elastic collective, reform() (below).
+//
+//  A slow link is not a stall. A rank whose last bytes sit in its socket and
+//  tunnel buffers finishes a collective and waits in the next one while its
+//  peer is still receiving the last; over a slow, buffering link (an ssh tunnel
+//  at 0.1 Mbit/s) that wait can outlast io_timeout with nothing wrong. So a
+//  rank moving bytes in a collective sends every other rank an 8-byte progress
+//  notice on the control connection, at most every io_timeout / 4, and a rank
+//  that hears one restarts its stall clock for that peer. A frozen or dead peer
+//  sends none, and is still named at io_timeout.
+//
+//  ---------------------------------------------------------- re-formation
+//
+//  With cfg.elastic, a failure need not end the job. cfg.rank is then the
+//  rank's slot, its fixed place in cfg.peers; the membership is a list of
+//  slots and an epoch (0 at connect), and rank() is the slot's position in the
+//  list. Every rank listens, the last too, and keeps its listener.
+//
+//  - reform(), on every survivor after a failure: each dials the members of the
+//    old epoch below its own slot, lowest first, and registers with the first
+//    that answers (naming the rank its failure blamed). One that finds no lower
+//    member alive is the coordinator. It waits until every old member has
+//    registered or has been blamed by a registered one - at once, usually: the
+//    abort notices make every survivor blame the same rank - or until
+//    gather_window, then sends each registered survivor the new membership:
+//    the survivors in slot order, epoch + 1. Ranks are dense again, in the old
+//    order. A survivor too late for that is told it is excluded, and joins.
+//  - join(), on a restarted rank: it dials the other slots, lowest first, with
+//    the run id, until the rendezvous - rank 0 of the current epoch, the lowest
+//    live slot - holds it. Another run id is refused. It waits there.
+//  - admit(), collective, on every member at a round boundary: rank 0 says which
+//    joiners it holds (a small broadcast, so it is a barrier too). With any, the
+//    members and the joiners move to epoch + 1 together. Joiners enter only
+//    here, never in the middle of a collective.
+//  - poll(), between collectives (each training step): sees a failure without
+//    waiting for the next collective (a notice, a closed connection, a survivor
+//    registering) and lets the rendezvous take joiners' requests; a group
+//    re-forming waits for every survivor's next poll().
+//
+//  Every mesh connection's handshake carries the epoch and a digest of the
+//  members, and every op header the epoch, so two ranks holding different
+//  memberships never connect, let alone run a collective together: every
+//  collective in an epoch is the reference over that epoch's members. What is
+//  agreed is the membership, not the data: when a rank dies at the very end of
+//  a collective, some survivors may have completed it and others not. The
+//  caller settles which rounds count (ts-moveables cannot: it does not know what
+//  a round is) - for example with a small allreduce after the re-formation, in
+//  which each member says what it holds.
+//
+//  Limits: the coordinator is chosen by who answers, so a network partition
+//  (not a death) can split the group in two, each re-forming on its own;
+//  min_members (a majority, say) refuses the smaller side. A coordinator that
+//  dies during a re-formation leaves its registrants with an error (they call
+//  reform() again). Deadlines: probe_timeout to dial one rank, gather_window,
+//  reform_timeout for the whole of reform(), join_timeout for join().
 //
 //  Results are snicholls::result<T, collective_error>, as in fs/ and
 //  http::client; collective_error is a std::runtime_error whose what() names
@@ -102,6 +184,8 @@
 //    compile: it may reassociate the sum.
 //  - One thread at a time per collective. Ranks are processes (or threads)
 //    each with their own collective.
+//  - The handshake is version 2 (56 bytes, with the epoch and the members'
+//    digest), so ranks of 1.9.0 and later releases do not mesh together.
 //  - No encryption or authentication beyond the run id: run it on a network
 //    you trust.
 //
@@ -125,8 +209,10 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -136,6 +222,7 @@
 #include <sys/socket.h>
 
 #include <snicholls/core/backoff.hpp>
+#include <snicholls/core/ml/minifloat.hpp>
 #include <snicholls/core/result.hpp>
 
 #include "tcp.hpp"
@@ -162,7 +249,8 @@ enum class collective_errc : std::uint8_t {
     peer_closed,          // the peer's end of the connection went away
     io_error,             // a socket error other than the peer closing
     mismatched_call,      // the peer called a different collective, or with a different n or root
-    broken,               // an earlier call failed; connect again
+    broken,               // an earlier call failed; reform() (elastic) or connect again
+    excluded,             // the group re-formed without this rank, or refused it: join() again
 };
 
 inline const char* to_string(collective_errc e) noexcept
@@ -177,6 +265,7 @@ inline const char* to_string(collective_errc e) noexcept
     case collective_errc::io_error: return "socket error";
     case collective_errc::mismatched_call: return "mismatched collective call";
     case collective_errc::broken: return "collective broken by an earlier failure";
+    case collective_errc::excluded: return "not a member of the group";
     }
     return "?";
 }
@@ -211,6 +300,19 @@ struct collective_config {
     std::chrono::milliseconds io_timeout{30'000};         // a collective fails after this long with no progress
     std::size_t segment_bytes = std::size_t{1} << 20;     // the reduction's streaming unit; memory is ~2(N-1) of these
     int socket_buffer_bytes = 0;          // SO_SNDBUF and SO_RCVBUF; 0 leaves the kernel's autotuning alone
+
+    // Elastic membership (see "re-formation" in the header comment). Off: a failure breaks the
+    // collective for good, as before. On: every rank listens (the last too), a broken collective
+    // can reform() among the survivors, a restarted rank can join() a running group, and the group
+    // admits joiners at admit(). `rank` is then the rank's slot: its fixed place in `peers`.
+    bool elastic = false;
+    std::chrono::milliseconds probe_timeout{2'000};      // dialling one rank that may be gone
+    std::chrono::milliseconds gather_window{120'000};    // how long a coordinator waits for a member neither
+                                                         // registered nor blamed; longer than the time between
+                                                         // two poll()s (an inner step of training)
+    std::chrono::milliseconds reform_timeout{300'000};   // the whole of reform()
+    std::chrono::milliseconds join_timeout{3'600'000};   // the whole of join(): finding the group and being admitted
+    std::size_t min_members = 1;                         // reform() fails below this many survivors
 };
 
 namespace detail {
@@ -278,15 +380,25 @@ inline std::uint64_t get64(const unsigned char* p)
 
 // ------------------------------------------------------------- the handshake
 //
-// 36 bytes each way, little-endian except the byte-order probe, which is the
+// 56 bytes each way, little-endian except the byte-order probe, which is the
 // sender's native 0x01020304 so a peer of the other byte order reads it wrong.
 // `channel` says which of the pair's two connections this is: 0 carries the
-// data, 1 only ever carries an abort notice.
+// data, 1 only ever carries an abort notice. `from` and `to` are slots (a rank's
+// fixed place in the peers list); `epoch` and `digest` name the membership the
+// sender holds, and a mesh connection between two different views is refused.
+//
+// The same frame carries the elastic requests on a rank's listener: register
+// (a survivor to the rank it takes for the coordinator; `to` is the slot it
+// blames), join (a restarted rank to the one it takes for the rendezvous), and
+// the answers wait (held until the next admit) and view (the new membership,
+// followed by `world` slots, 4 bytes each).
 inline constexpr std::uint32_t hello_magic = 0x48534d54;   // "TMSH"
-inline constexpr std::uint16_t hello_version = 1;
-inline constexpr std::size_t hello_size = 36;
-enum : unsigned char { hello_kind = 0, accept_kind = 1, reject_kind = 2 };
-enum : unsigned char { ok_reason = 0, bad_magic, bad_world, bad_rank, duplicate_rank, bad_run_id, bad_byte_order };
+inline constexpr std::uint16_t hello_version = 2;
+inline constexpr std::size_t hello_size = 56;
+enum : unsigned char { hello_kind = 0, accept_kind = 1, reject_kind = 2, register_kind = 3, join_kind = 4,
+                       wait_kind = 5, view_kind = 6 };
+enum : unsigned char { ok_reason = 0, bad_magic, bad_world, bad_rank, duplicate_rank, bad_run_id, bad_byte_order,
+                       bad_view, not_coordinator, stale_epoch, too_few };
 
 inline const char* reason_text(unsigned r)
 {
@@ -297,6 +409,10 @@ inline const char* reason_text(unsigned r)
     case duplicate_rank: return "rank already connected";
     case bad_run_id: return "run id differs";
     case bad_byte_order: return "byte order differs";
+    case bad_view: return "a different membership (epoch or members)";
+    case not_coordinator: return "not the group's coordinator";
+    case stale_epoch: return "the group has re-formed without this rank";
+    case too_few: return "too few members survived";
     default: return "refused";
     }
 }
@@ -307,6 +423,7 @@ struct hello {
     unsigned char channel = 0;
     std::uint32_t world = 0, from = 0, to = 0;
     std::uint64_t run_id = 0;
+    std::uint64_t epoch = 0, digest = 0;
     bool native_order = true;
     bool magic_ok = true;
 };
@@ -326,6 +443,8 @@ inline std::array<unsigned char, hello_size> encode(const hello& h)
     const std::uint32_t probe = 0x01020304;
     std::memcpy(b.data() + 28, &probe, 4);
     b[32] = h.channel;
+    put64(b.data() + 36, h.epoch);
+    put64(b.data() + 44, h.digest);
     return b;
 }
 
@@ -343,6 +462,26 @@ inline hello decode(const unsigned char* b)
     std::memcpy(&probe, b + 28, 4);
     h.native_order = probe == 0x01020304;
     h.channel = b[32];
+    h.epoch = get64(b + 36);
+    h.digest = get64(b + 44);
+    return h;
+}
+
+// A membership's name: FNV-1a over the run id, the epoch and the slots in rank order
+inline std::uint64_t view_digest(std::uint64_t run_id, std::uint64_t epoch, const std::vector<std::uint32_t>& slots)
+{
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    auto mix = [&h](std::uint64_t v, int bytes) {
+        for (int i = 0; i < bytes; ++i) {
+            h ^= (v >> (8 * i)) & 0xff;
+            h *= 0x100000001b3ull;
+        }
+    };
+    mix(run_id, 8);
+    mix(epoch, 8);
+    mix(slots.size(), 4);
+    for (const auto s : slots)
+        mix(s, 4);
     return h;
 }
 
@@ -355,16 +494,23 @@ inline hello decode(const unsigned char* b)
 // sockets and blaming it - which is what happens without this when one rank
 // dies and another gives up first.
 inline constexpr std::uint16_t abort_magic = 0x4154;          // "TA"
+// The same 8 bytes with this magic is a progress notice: "I am moving bytes", sent by a rank in a
+// collective to every other rank at most every io_timeout / 4 while bytes move. A rank waiting on
+// that one restarts its stall clock: a peer still draining an earlier collective over a slow,
+// buffering link is busy, not stalled.
+inline constexpr std::uint16_t progress_magic = 0x5054;       // "TP"
 inline constexpr std::size_t abort_size = 8;
 inline constexpr std::uint32_t nobody = 0xffffffff;
 
 // ----------------------------------------------------------- the op header
 //
-// 32 bytes to every peer at the start of every collective, little-endian.
+// 40 bytes to every peer at the start of every collective, little-endian: the
+// operation, the element type, the root, the world, the sequence number within
+// the epoch, the element count and the epoch.
 inline constexpr std::uint32_t op_magic = 0x4f4d5354;      // "TSMO"
-inline constexpr std::size_t op_header_size = 32;
-enum : unsigned char { op_allreduce_sum = 1, op_broadcast = 2, op_barrier = 3 };
-enum : unsigned char { dtype_none = 0, dtype_f32 = 1 };
+inline constexpr std::size_t op_header_size = 40;
+enum : unsigned char { op_allreduce_sum = 1, op_broadcast = 2, op_barrier = 3, op_all_to_all_v = 4 };
+enum : unsigned char { dtype_none = 0, dtype_f32 = 1, dtype_bf16 = 2, dtype_bytes = 3 };
 
 inline const char* op_name(unsigned op)
 {
@@ -372,6 +518,7 @@ inline const char* op_name(unsigned op)
     case op_allreduce_sum: return "allreduce_sum";
     case op_broadcast: return "broadcast";
     case op_barrier: return "barrier";
+    case op_all_to_all_v: return "all_to_all_v";
     default: return "an unknown operation";
     }
 }
@@ -379,7 +526,7 @@ inline const char* op_name(unsigned op)
 struct op_header {
     unsigned op = 0, dtype = 0;
     std::uint32_t root = 0, world = 0;
-    std::uint64_t seq = 0, n = 0;
+    std::uint64_t seq = 0, n = 0, epoch = 0;
 };
 
 inline std::array<unsigned char, op_header_size> encode(const op_header& h)
@@ -392,6 +539,7 @@ inline std::array<unsigned char, op_header_size> encode(const op_header& h)
     put32(b.data() + 12, h.world);
     put64(b.data() + 16, h.seq);
     put64(b.data() + 24, h.n);
+    put64(b.data() + 32, h.epoch);
     return b;
 }
 
@@ -400,7 +548,14 @@ inline std::string describe(const unsigned char* b)
     if (get32(b) != op_magic)
         return "bytes that are not a collective header";
     std::string s = op_name(b[4]);
+    if (b[4] == op_allreduce_sum)
+        s += b[5] == dtype_bf16 ? " (bfloat16)" : " (float)";
+    if (b[4] == op_all_to_all_v)
+        s += b[5] == dtype_bf16 ? " (bfloat16)" : b[5] == dtype_f32 ? " (float)" : " (" + std::to_string(get32(b + 8)) + "-byte elements)";
     s += " #" + std::to_string(get64(b + 16)) + " of " + std::to_string(get64(b + 24)) + " elements";
+    if (b[4] == op_all_to_all_v)
+        s += " for the receiving rank";
+    s += " in epoch " + std::to_string(get64(b + 32));
     if (b[4] == op_broadcast)
         s += " from root " + std::to_string(get32(b + 8));
     return s;
@@ -454,6 +609,13 @@ inline ssize_t send_some(int fd, const char* p, std::size_t n)
 #endif
 }
 
+// The reduction's element types: what is summed (always float) and what is sent. bfloat16 is
+// snicholls-core's (ml/minifloat.hpp): decoding is exact, encoding rounds to nearest even.
+inline float widen(float x) noexcept { return x; }
+inline float widen(std::uint16_t bits) noexcept { return ml::to_float(ml::bfloat16::from_bits(bits)); }
+inline void narrow(float x, float& out) noexcept { out = x; }
+inline void narrow(float x, std::uint16_t& out) noexcept { out = ml::to_bfloat16(x).bits; }
+
 } // namespace collective
 } // namespace detail
 
@@ -476,105 +638,334 @@ public:
     }
 
     /// The same, with this rank's listener already bound (a test binds port 0
-    /// and hands the ports round). Ignored on the last rank, which only dials.
+    /// and hands the ports round). Ignored on the last rank, which only dials,
+    /// unless cfg.elastic.
     static collective_result<collective> connect(const collective_config& cfg, tcp_listener listener)
     {
         return connect_impl(cfg, &listener);
     }
 
+    /// Elastic: join a running group as slot cfg.rank (a restarted rank). Dials
+    /// the other slots in order for the group's rendezvous (its rank 0), is held
+    /// there until the group's next admit(), then builds the mesh of the new
+    /// epoch with every member. Bounded by cfg.join_timeout. A rendezvous of
+    /// another run id refuses it (handshake_rejected).
+    static collective_result<collective> join(const collective_config& cfg)
+    {
+        return join_impl(cfg, nullptr);
+    }
+
+    /// The same over a listener already bound at this slot's endpoint.
+    static collective_result<collective> join(const collective_config& cfg, tcp_listener listener)
+    {
+        return join_impl(cfg, &listener);
+    }
+
+    /// This rank's place in the current membership, 0 <= rank() < size(): its
+    /// slot's position among the members' slots in ascending order.
     int rank() const noexcept { return rank_; }
     int size() const noexcept { return size_; }
 
-    /// The endpoint of a rank, as configured.
-    const std::string& endpoint(int r) const { return endpoints_.at(std::size_t(r)); }
+    /// This rank's slot: its fixed index in cfg.peers (cfg.rank), which re-formation never changes.
+    int slot() const noexcept { return int(slot_); }
+
+    /// The membership's number: 0 at connect(), one more at each re-formation or admission.
+    std::uint64_t epoch() const noexcept { return epoch_; }
+
+    /// The members' slots in rank order.
+    const std::vector<std::uint32_t>& members() const noexcept { return members_; }
+
+    /// The endpoint of a rank of the current membership, as configured.
+    const std::string& endpoint(int r) const { return endpoints_.at(members_.at(std::size_t(r))); }
 
     /// True after a failure: every call then returns collective_errc::broken.
     bool broken() const noexcept { return broken_.has_value(); }
 
-    /// Collectives completed so far (each one's sequence number is checked
-    /// against every peer's).
+    /// The failure that broke the collective, if it is broken.
+    const std::optional<collective_error>& failure() const noexcept { return broken_; }
+
+    /// Collectives completed in this epoch (each one's sequence number is
+    /// checked against every peer's); 0 again after a re-formation.
     std::uint64_t sequence() const noexcept { return seq_; }
 
     /// In place: every rank ends with, per element, ((x_0 + x_1) + ...) + x_{N-1}
     /// in rank order, in float. Bit-identical on every rank.
     collective_result<void> allreduce_sum(float* data, std::size_t n)
     {
-        if (auto e = precheck(data, n); e.is_err())
-            return e;
-        namespace d = detail::collective;
-        const std::size_t N = std::size_t(size_), r = std::size_t(rank_);
-        if (N == 1) {
-            ++seq_;
+        return allreduce(data, n, detail::collective::dtype_f32, rings_);
+    }
+
+    /// In place over bfloat16 bits (snicholls-core's ml::bfloat16::bits): every
+    /// rank ends with, per element, bf16(((f(x_0) + f(x_1)) + ...) + f(x_{N-1})),
+    /// where f decodes a bfloat16 to float exactly and the sum is in float in
+    /// rank order (core's ml::ordered_sum_bf16), rounded once to bfloat16 to
+    /// nearest even (core's ml::to_bfloat16) by the rank that owns the chunk.
+    /// Bit-identical on every rank. Half the bytes of allreduce_sum on the wire:
+    /// both the pieces and the reduced chunks travel as bfloat16.
+    collective_result<void> allreduce_sum_bf16(std::uint16_t* data, std::size_t n)
+    {
+        return allreduce(data, n, detail::collective::dtype_bf16, rings16_);
+    }
+
+    /// Elastic, between collectives: a look without blocking for a failure the
+    /// collective has not run into yet (an abort notice, a peer's connection
+    /// gone, a survivor asking to re-form), and the rank's share of joining:
+    /// the rendezvous (rank 0) takes joiners' requests and holds them for the
+    /// next admit(); other ranks turn them away. Call it often between
+    /// collectives (every training step): a group re-forming waits for every
+    /// survivor's next poll(). An error means: reform().
+    collective_result<void> poll()
+    {
+        if (broken_)
+            return err(collective_error(collective_errc::broken, broken_->peer(), broken_->what()));
+        if (!elastic_ || size_ <= 1) {
+            if (elastic_)
+                serve_listener();
             return ok();
         }
-        auto lanes = start(d::op_allreduce_sum, d::dtype_f32, 0, n);
-
-        const std::size_t seg = segment_bytes_;
-        const std::size_t K = 2;                                // segments of ring per peer
-        const std::size_t mine = chunk_len(n, N, r) * sizeof(float);
-        const std::size_t nseg = (mine + seg - 1) / seg;
-        std::size_t reduced = 0;                                 // segments reduced
-        std::size_t reduced_bytes = 0;
-        std::size_t ring_limit = std::min(mine, K * seg);
-        rings_.resize(N);
-        for (std::size_t p = 0; p < N; ++p)
-            if (p != r)
-                rings_[p].resize(K * seg / sizeof(float));
-        acc_.resize(seg / sizeof(float));
-
-        char* bytes = reinterpret_cast<char*>(data);
-        for (std::size_t p = 0; p < N; ++p) {
-            if (p == r)
+        serve_listener();
+        if (reform_asked_)
+            return finish(err(collective_error(collective_errc::peer_closed, -1,
+                                               "a member is re-forming the group (a failure this rank has not seen)")));
+        for (int q = 0; q < size_; ++q) {
+            if (q == rank_)
                 continue;
-            auto& l = lanes[p];
-            l.out.push_back({bytes + chunk_begin(n, N, p) * sizeof(float), chunk_len(n, N, p) * sizeof(float)});
-            l.out.push_back({bytes + chunk_begin(n, N, r) * sizeof(float), mine, 0, &reduced_bytes});
-            l.in.push_back({reinterpret_cast<char*>(rings_[p].data()), mine, 0, &ring_limit, K * seg});
-            l.in.push_back({bytes + chunk_begin(n, N, p) * sizeof(float), chunk_len(n, N, p) * sizeof(float)});
+            const std::size_t i = std::size_t(q);
+            if (ctrl_open_[i]) {
+                if (auto e = read_notice(q); e.is_err())
+                    return finish(std::move(e));
+                if (!ctrl_open_[i])
+                    return finish(fail(collective_errc::peer_closed, q, "its control connection closed"));
+            }
+            char c = 0;
+            const ssize_t got = ::recv(links_[i].fd(), &c, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (got == 0)
+                return finish(fail(collective_errc::peer_closed, q, "connection closed between collectives"));
+            if (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                return finish(fail(errno == ECONNRESET ? collective_errc::peer_closed : collective_errc::io_error, q,
+                                   std::string("connection lost: ") + std::strerror(errno)));
+        }
+        return ok();
+    }
+
+    /// Elastic, collective, at a round boundary: every member calls it. Rank 0
+    /// says which joiners it holds; with none, nothing changes (one small
+    /// broadcast). With some, the group moves to a new epoch whose members are
+    /// the old ones and the joiners in slot order, and every member and joiner
+    /// builds its mesh. Returns how many were admitted. A failure (also while
+    /// building the new mesh) breaks the collective: reform().
+    collective_result<std::size_t> admit()
+    {
+        namespace d = detail::collective;
+        if (!elastic_)
+            return err(collective_error(collective_errc::bad_config, -1, "admit() needs an elastic collective"));
+        if (auto e = precheck(nullptr, 0, 1); e.is_err())
+            return err(e.unwrap_err_unchecked());
+        std::vector<float> decision(endpoints_.size() + 1, 0.0f);   // the count, then the slots
+        std::vector<std::uint32_t> joiners;
+        if (rank_ == 0) {
+            serve_listener();
+            for (auto& h : held_)
+                if (h.kind == d::join_kind && h.s.valid() && !is_member(h.slot) &&
+                    std::find(joiners.begin(), joiners.end(), h.slot) == joiners.end()) {
+                    char c = 0;   // still there: a joiner that gave up has closed
+                    const ssize_t got = ::recv(h.s.fd(), &c, 1, MSG_PEEK | MSG_DONTWAIT);
+                    if (got == 0 || (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                        h.s.close();
+                        continue;
+                    }
+                    joiners.push_back(h.slot);
+                }
+            decision[0] = float(joiners.size());
+            for (std::size_t k = 0; k < joiners.size(); ++k)
+                decision[k + 1] = float(joiners[k]);
+        }
+        if (size_ > 1)
+            if (auto e = broadcast(decision.data(), decision.size(), 0); e.is_err())
+                return err(e.unwrap_err_unchecked());
+        if (size_ == 1)
+            ++seq_;
+        const std::size_t count = std::size_t(decision[0]);
+        if (count == 0)
+            return ok(std::size_t{0});
+        joiners.clear();
+        for (std::size_t k = 0; k < count; ++k)
+            joiners.push_back(std::uint32_t(decision[k + 1]));
+        std::vector<std::uint32_t> next = members_;
+        next.insert(next.end(), joiners.begin(), joiners.end());
+        std::sort(next.begin(), next.end());
+        const std::uint64_t epoch = epoch_ + 1;
+        if (rank_ == 0)
+            for (auto& h : held_)
+                if (h.kind == d::join_kind && h.s.valid() &&
+                    std::find(joiners.begin(), joiners.end(), h.slot) != joiners.end()) {
+                    send_view(h.s, epoch, next);
+                    h.s.close();
+                }
+        adopt(epoch, next);
+        const auto dl = d::clock::now() + connect_timeout_;
+        if (auto e = build_mesh(dl); e.is_err()) {
+            broken_ = e.unwrap_err_unchecked();
+            return err(e.unwrap_err_unchecked());
+        }
+        return ok(count);
+    }
+
+    /// Elastic: after a failure (or a failed poll()), form a new collective
+    /// among the survivors. Every survivor calls it. The coordinator is the
+    /// lowest slot of the old membership that answers: each survivor dials the
+    /// lower slots in order and registers with the first that does, and the
+    /// one that finds none below it is the coordinator. It waits until every
+    /// old member has registered or been blamed by a registered one (or
+    /// gather_window passes), then sends every registered survivor the new
+    /// membership - the survivors in slot order, epoch one more - and they
+    /// build its mesh, whose handshake checks the epoch and the members. On
+    /// success rank() and size() are the new ones and sequence() is 0. A rank
+    /// the group re-formed without gets excluded: it must join(). Bounded by
+    /// reform_timeout; on any other error it may be called again.
+    collective_result<void> reform()
+    {
+        namespace d = detail::collective;
+        using d::clock;
+        if (!elastic_)
+            return err(collective_error(collective_errc::bad_config, -1, "reform() needs an elastic collective"));
+        const auto dl = clock::now() + reform_timeout_;
+        const std::uint32_t blamed =
+            broken_ && broken_->peer() >= 0 && broken_->peer() < size_ ? members_[std::size_t(broken_->peer())] : d::nobody;
+        const std::vector<std::uint32_t> old = members_;
+        const std::uint64_t e = epoch_, od = digest_;
+        drop_mesh();
+        broken_ = collective_error(collective_errc::broken, -1, "re-forming the group");
+
+        // 1. Register with the lowest old member below this one that answers
+        for (const std::uint32_t c : old) {
+            if (c >= slot_)
+                break;
+            if (left_until(dl).count() == 0)
+                return err(collective_error(collective_errc::timed_out, -1, "re-forming: no coordinator within reform_timeout"));
+            auto s = tcp_stream::connect(eps_[c].host, eps_[c].port, std::min(probe_timeout_, left_until(dl)));
+            if (!s.valid())
+                continue;
+            d::hello h;
+            h.kind = d::register_kind;
+            h.world = std::uint32_t(old.size());
+            h.from = slot_;
+            h.to = blamed;
+            h.run_id = run_id_;
+            h.epoch = e;
+            h.digest = od;
+            const auto b = d::encode(h);
+            if (!s.write_all(reinterpret_cast<const char*>(b.data()), b.size(), std::max(left_until(dl), std::chrono::milliseconds(1))))
+                continue;
+            std::vector<std::uint32_t> view;
+            std::uint64_t epoch = 0;
+            unsigned reason = 0;
+            int got = read_view(s, dl, view, epoch, reason);
+            while (got == 2)
+                got = read_view(s, dl, view, epoch, reason);
+            if (got == 0)
+                continue;                                   // gone or silent: the next one down
+            if (got < 0) {
+                if (reason == d::not_coordinator)
+                    continue;
+                return err(collective_error(reason == d::stale_epoch || reason == d::too_few ? collective_errc::excluded
+                                                                                             : collective_errc::handshake_rejected,
+                                            int(c), "slot " + std::to_string(c) + " (" + endpoints_[c] + "): " + d::reason_text(reason)));
+            }
+            if (std::find(view.begin(), view.end(), slot_) == view.end())
+                return err(collective_error(collective_errc::excluded, int(c), "the new membership leaves this rank out"));
+            adopt(epoch, view);
+            return settle_mesh(build_mesh(std::min(dl, clock::now() + connect_timeout_)));
         }
 
-        float* own = data + chunk_begin(n, N, r);
-        auto reduce = [&]() -> bool {
-            while (reduced < nseg) {
-                const std::size_t end = std::min(mine, (reduced + 1) * seg);
-                for (std::size_t p = 0; p < N; ++p)
-                    if (p != r && lanes[p].in[1].done < end)
-                        return false;
-                const std::size_t first = reduced * seg / sizeof(float);
-                const std::size_t count = (end - reduced * seg) / sizeof(float);
-                const std::size_t slot = (reduced % K) * seg / sizeof(float);
-                auto src = [&](std::size_t k) -> const float* {
-                    return k == r ? own + first : rings_[k].data() + slot;
-                };
-                // Rank order, one rank per pass: acc = x0 + x1, then acc += x2, ...
-                const float* a = src(0);
-                const float* b = src(1);
-                float* acc = acc_.data();
-                for (std::size_t i = 0; i < count; ++i)
-                    acc[i] = a[i] + b[i];
-                for (std::size_t k = 2; k < N; ++k) {
-                    const float* x = src(k);
-                    for (std::size_t i = 0; i < count; ++i)
-                        acc[i] += x[i];
+        // 2. None below answered: this rank coordinates
+        struct reg {
+            std::uint32_t slot;
+            tcp_stream s;
+        };
+        std::vector<reg> regs;
+        std::vector<std::uint32_t> dead;
+        if (blamed != d::nobody)
+            dead.push_back(blamed);
+        auto take = [&](tcp_stream s, const d::hello& h) {
+            if (h.kind != d::register_kind) {
+                serve(std::move(s), h);
+                return;
+            }
+            if (!h.magic_ok || h.run_id != run_id_)
+                return reject(s, h, d::bad_run_id);
+            if (h.epoch < e)
+                return reject(s, h, d::stale_epoch);
+            if (h.epoch > e || h.digest != od || std::find(old.begin(), old.end(), h.from) == old.end() || h.from == slot_)
+                return reject(s, h, d::not_coordinator);
+            for (auto& r : regs)
+                if (r.slot == h.from) {
+                    r.s = std::move(s);                     // a second try: the newer connection
+                    return;
                 }
-                std::memcpy(own + first, acc, count * sizeof(float));
-                ++reduced;
-                reduced_bytes = end;
-                ring_limit = std::min(mine, (reduced + K) * seg);
+            if (h.to != d::nobody && h.to != slot_)
+                dead.push_back(h.to);
+            regs.push_back({h.from, std::move(s)});
+        };
+        auto pending = std::move(held_);
+        held_.clear();
+        for (auto& h : pending) {
+            if (!h.s.valid())
+                continue;
+            if (h.kind == d::register_kind)
+                take(std::move(h.s), h.h);
+            else
+                held_.push_back(std::move(h));
+        }
+        auto complete = [&] {
+            for (const std::uint32_t m : old) {
+                if (m == slot_ || std::find(dead.begin(), dead.end(), m) != dead.end())
+                    continue;
+                bool in = false;
+                for (const auto& r : regs)
+                    in = in || r.slot == m;
+                if (!in)
+                    return false;
             }
             return true;
         };
-        return finish(run(lanes, reduce));
+        const auto window = std::min(dl, clock::now() + gather_window_);
+        while (!complete() && clock::now() < window) {
+            auto s = listener_.accept(left_until(window));
+            if (!s.valid())
+                continue;
+            d::hello h;
+            if (!read_hello(s, std::min(window, clock::now() + handshake_timeout_), h))
+                continue;
+            take(std::move(s), h);
+        }
+        if (regs.size() + 1 < min_members_) {
+            for (auto& r : regs)
+                reject_slot(r.s, r.slot, d::too_few);
+            return err(collective_error(collective_errc::excluded, -1,
+                                        std::to_string(regs.size() + 1) + " survivors, fewer than min_members " + std::to_string(min_members_)));
+        }
+        std::vector<std::uint32_t> next{slot_};
+        for (const auto& r : regs)
+            next.push_back(r.slot);
+        std::sort(next.begin(), next.end());
+        for (auto& r : regs) {
+            send_view(r.s, e + 1, next);
+            r.s.close();
+        }
+        adopt(e + 1, next);
+        return settle_mesh(build_mesh(std::min(dl, clock::now() + connect_timeout_)));
     }
 
     /// In place: every rank ends with root's n floats. The root sends the
     /// buffer once, in N-1 pieces; each other rank forwards its piece.
+    /// (In an elastic group the root is a rank of the current membership.)
     collective_result<void> broadcast(float* data, std::size_t n, int root)
     {
         if (root < 0 || root >= size_)
             return err(collective_error(collective_errc::bad_config, -1,
                                         "broadcast root " + std::to_string(root) + " is not a rank"));
-        if (auto e = precheck(data, n); e.is_err())
+        if (auto e = precheck(data, n, sizeof(float)); e.is_err())
             return e;
         namespace d = detail::collective;
         const std::size_t N = std::size_t(size_), r = std::size_t(rank_), R = std::size_t(root);
@@ -613,7 +1004,7 @@ public:
     /// Returns once every rank has entered the barrier.
     collective_result<void> barrier()
     {
-        if (auto e = precheck(nullptr, 0); e.is_err())
+        if (auto e = precheck(nullptr, 0, 1); e.is_err())
             return e;
         if (size_ == 1) {
             ++seq_;
@@ -621,6 +1012,104 @@ public:
         }
         auto lanes = start(detail::collective::op_barrier, detail::collective::dtype_none, 0, 0);
         return finish(run(lanes, [] { return true; }));
+    }
+
+    /// All-to-all with a count for every pair (MPI's Alltoallv), for the dispatch
+    /// and combine of expert parallelism. This rank's elements
+    /// [send_offsets[q], send_offsets[q] + send_counts[q]) of send go to rank q,
+    /// and rank q's elements for this rank land at [recv_offsets[q],
+    /// recv_offsets[q] + recv_counts[q]) of recv. Counts and offsets are in
+    /// elements, one per rank, in rank order; recv_counts[q] must be what rank q
+    /// passes as send_counts[this rank] (exchange_counts() tells it), and a
+    /// difference is a mismatched_call naming q, found from the op header before
+    /// any of q's elements land. With recv_offsets the prefix sums of recv_counts,
+    /// rank r receives every rank's segment for r in rank (source) order: the
+    /// reference order of snicholls-core's ml::moe_all_to_all, bit for bit (the
+    /// bytes are copied, never converted).
+    ///
+    /// Sends go straight from send and receives land straight in recv: no
+    /// staging, whatever the sizes. Every pair's two directions move at once in
+    /// the one poll() loop, so two ranks sending each other gigabytes cannot
+    /// deadlock; progress notices, the stall deadline, abort notices and the
+    /// elastic epoch are those of every collective. This rank's own segment is
+    /// copied in memory. send and recv must not overlap.
+    collective_result<void> all_to_all_v(const float* send, std::span<const std::size_t> send_counts,
+                                         std::span<const std::size_t> send_offsets, float* recv,
+                                         std::span<const std::size_t> recv_counts, std::span<const std::size_t> recv_offsets)
+    {
+        return all_to_all(reinterpret_cast<const char*>(send), send_counts, send_offsets, reinterpret_cast<char*>(recv),
+                          recv_counts, recv_offsets, sizeof(float), detail::collective::dtype_f32);
+    }
+
+    /// The same over bfloat16 bits (snicholls-core's ml::bfloat16::bits): half
+    /// the bytes of float rows. A float call against a bfloat16 call is a
+    /// mismatched_call.
+    collective_result<void> all_to_all_v(const std::uint16_t* send, std::span<const std::size_t> send_counts,
+                                         std::span<const std::size_t> send_offsets, std::uint16_t* recv,
+                                         std::span<const std::size_t> recv_counts, std::span<const std::size_t> recv_offsets)
+    {
+        return all_to_all(reinterpret_cast<const char*>(send), send_counts, send_offsets, reinterpret_cast<char*>(recv),
+                          recv_counts, recv_offsets, sizeof(std::uint16_t), detail::collective::dtype_bf16);
+    }
+
+    /// The same over elements of element_size bytes each, copied as they are
+    /// (every rank has the same byte order: the handshake checks it). Every rank
+    /// passes the same element_size, or it is a mismatched_call.
+    collective_result<void> all_to_all_v(const void* send, std::span<const std::size_t> send_counts,
+                                         std::span<const std::size_t> send_offsets, void* recv,
+                                         std::span<const std::size_t> recv_counts, std::span<const std::size_t> recv_offsets,
+                                         std::size_t element_size)
+    {
+        return all_to_all(static_cast<const char*>(send), send_counts, send_offsets, static_cast<char*>(recv), recv_counts,
+                          recv_offsets, element_size, detail::collective::dtype_bytes);
+    }
+
+    /// The counts of an all_to_all_v, exchanged: recv_counts[q] becomes what rank
+    /// q passed as send_counts[this rank]. One collective of 8 bytes per pair.
+    collective_result<void> exchange_counts(std::span<const std::size_t> send_counts, std::span<std::size_t> recv_counts)
+    {
+        const std::size_t N = std::size_t(size_ < 1 ? 1 : size_);
+        if (send_counts.size() != N || recv_counts.size() != N)
+            return err(collective_error(collective_errc::bad_config, -1, "exchange_counts needs one count per rank"));
+        std::vector<std::uint64_t> out(N), in(N);
+        std::vector<std::size_t> ones(N, 1), at(N);
+        for (std::size_t q = 0; q < N; ++q) {
+            out[q] = send_counts[q];
+            at[q] = q;
+        }
+        if (auto e = all_to_all(reinterpret_cast<const char*>(out.data()), ones, at, reinterpret_cast<char*>(in.data()), ones,
+                                at, sizeof(std::uint64_t), detail::collective::dtype_bytes);
+            e.is_err())
+            return e;
+        for (std::size_t q = 0; q < N; ++q) {
+            if (in[q] > std::numeric_limits<std::size_t>::max())
+                return finish(fail(collective_errc::io_error, int(q), "a count too large for this rank"));
+            recv_counts[q] = std::size_t(in[q]);
+        }
+        return ok();
+    }
+
+    /// Counts exchanged first, then the elements: recv is resized to what this
+    /// rank receives, packed in rank (source) order, and recv_counts /
+    /// recv_offsets say where each rank's segment is. Two collectives.
+    template <class T>
+        requires(std::is_same_v<T, float> || std::is_same_v<T, std::uint16_t>)
+    collective_result<void> all_to_all_v(const T* send, std::span<const std::size_t> send_counts,
+                                         std::span<const std::size_t> send_offsets, std::vector<T>& recv,
+                                         std::vector<std::size_t>& recv_counts, std::vector<std::size_t>& recv_offsets)
+    {
+        recv_counts.assign(send_counts.size(), 0);
+        if (auto e = exchange_counts(send_counts, recv_counts); e.is_err())
+            return e;
+        recv_offsets.assign(recv_counts.size(), 0);
+        std::size_t total = 0;
+        for (std::size_t q = 0; q < recv_counts.size(); ++q) {
+            recv_offsets[q] = total;
+            total += recv_counts[q];
+        }
+        recv.resize(total);
+        return all_to_all_v(send, send_counts, send_offsets, recv.data(), std::span<const std::size_t>(recv_counts),
+                            std::span<const std::size_t>(recv_offsets));
     }
 
     /// Element range of chunk c when n elements are cut into parts chunks: the
@@ -638,8 +1127,28 @@ public:
 private:
     using lanes_t = std::vector<detail::collective::lane>;
 
+    // A request held on the listener: a joiner waiting for admit(), or a survivor's registration
+    struct held_request {
+        tcp_stream s;
+        std::uint32_t slot = 0;
+        unsigned kind = 0;
+        detail::collective::hello h;
+    };
+
     int rank_ = 0;
     int size_ = 1;
+    std::uint32_t slot_ = 0;
+    std::vector<std::uint32_t> members_;             // slots in rank order
+    std::uint64_t epoch_ = 0, digest_ = 0, run_id_ = 0;
+    bool elastic_ = false;
+    bool reform_asked_ = false;                      // a survivor registered with this rank: the group is failing
+    tcp_listener listener_;                          // elastic: kept for re-formation and joiners
+    std::vector<held_request> held_;
+    std::vector<detail::collective::endpoint> eps_;
+    std::chrono::milliseconds connect_timeout_{60'000}, handshake_timeout_{5'000}, probe_timeout_{2'000},
+        gather_window_{120'000}, reform_timeout_{300'000};
+    std::size_t min_members_ = 1;
+    int socket_buffer_bytes_ = 0;
     std::vector<std::string> endpoints_;
     std::vector<tcp_stream> links_;                  // links_[p]: the data connection to rank p (none to itself)
     std::vector<tcp_stream> ctrl_;                   // ctrl_[p]: the control connection, for abort notices
@@ -647,21 +1156,31 @@ private:
     std::vector<std::size_t> notice_got_;
     std::vector<char> ctrl_open_;                    // still worth reading
     bool adopted_ = false;                           // the failure in hand came from another rank's notice
+    std::vector<char> heard_;                        // a progress notice arrived from this rank
+    bool moved_ = false;                             // bytes moved since the last progress notice
+    detail::collective::clock::time_point noted_{};  // when this rank last sent its progress notices
     std::chrono::milliseconds io_timeout_{30'000};
     std::size_t segment_bytes_ = std::size_t{1} << 20;
     std::uint64_t seq_ = 0;
     std::optional<collective_error> broken_;
     std::array<unsigned char, detail::collective::op_header_size> header_out_{};
     std::vector<std::array<unsigned char, detail::collective::op_header_size>> header_in_;
+    std::vector<std::array<unsigned char, detail::collective::op_header_size>> header_v_;   // all_to_all_v: to each peer
+    std::vector<std::array<unsigned char, detail::collective::op_header_size>> expect_;     // all_to_all_v: from each peer
     std::vector<std::vector<float>> rings_;
+    std::vector<std::vector<std::uint16_t>> rings16_;
     std::vector<float> acc_;
 
     std::string who(int p) const
     {
-        return "rank " + std::to_string(p) + " (" + endpoints_[std::size_t(p)] + ")";
+        const std::uint32_t s = p >= 0 && std::size_t(p) < members_.size() ? members_[std::size_t(p)] : std::uint32_t(p);
+        const std::string& ep = s < endpoints_.size() ? endpoints_[s] : endpoints_.at(0);
+        return "rank " + std::to_string(p) + (s == std::uint32_t(p) ? "" : " (slot " + std::to_string(s) + ")") + " (" + ep + ")";
     }
 
-    collective_result<void> precheck(const float* data, std::size_t n)
+    bool is_member(std::uint32_t s) const { return std::find(members_.begin(), members_.end(), s) != members_.end(); }
+
+    collective_result<void> precheck(const void* data, std::size_t n, std::size_t elem)
     {
         if (broken_)
             return err(collective_error(collective_errc::broken, broken_->peer(), broken_->what()));
@@ -669,17 +1188,151 @@ private:
             return err(collective_error(collective_errc::bad_config, -1, "not connected"));
         if (n != 0 && data == nullptr)
             return err(collective_error(collective_errc::bad_config, -1, "null buffer"));
-        if (n > std::numeric_limits<std::size_t>::max() / sizeof(float))
+        if (n > std::numeric_limits<std::size_t>::max() / elem)
             return err(collective_error(collective_errc::bad_config, -1, "buffer too large"));
+        if (reform_asked_)
+            return finish(err(collective_error(collective_errc::peer_closed, -1,
+                                               "a member is re-forming the group (a failure this rank has not seen)")));
         return ok();
+    }
+
+    // The all-reduce over float or bfloat16 elements T: pieces of T sent to the chunk's owner, which
+    // decodes them to float, sums in rank order in float and encodes its chunk back to T in place,
+    // then sends the reduced chunk of T to every other rank.
+    template <class T>
+    collective_result<void> allreduce(T* data, std::size_t n, unsigned dtype, std::vector<std::vector<T>>& rings)
+    {
+        namespace d = detail::collective;
+        constexpr std::size_t E = sizeof(T);
+        if (auto e = precheck(data, n, E); e.is_err())
+            return e;
+        const std::size_t N = std::size_t(size_), r = std::size_t(rank_);
+        if (N == 1) {
+            for (std::size_t i = 0; i < n; ++i)   // a bfloat16 NaN is quieted, as the reduction would
+                d::narrow(d::widen(data[i]), data[i]);
+            ++seq_;
+            return ok();
+        }
+        auto lanes = start(d::op_allreduce_sum, dtype, 0, n);
+
+        const std::size_t seg = segment_bytes_;                  // a multiple of 4, so of E
+        const std::size_t K = 2;                                // segments of ring per peer
+        const std::size_t mine = chunk_len(n, N, r) * E;
+        const std::size_t nseg = (mine + seg - 1) / seg;
+        std::size_t reduced = 0;                                 // segments reduced
+        std::size_t reduced_bytes = 0;
+        std::size_t ring_limit = std::min(mine, K * seg);
+        rings.resize(N);
+        for (std::size_t p = 0; p < N; ++p)
+            if (p != r)
+                rings[p].resize(K * seg / E);
+        acc_.resize(seg / E);
+
+        char* bytes = reinterpret_cast<char*>(data);
+        for (std::size_t p = 0; p < N; ++p) {
+            if (p == r)
+                continue;
+            auto& l = lanes[p];
+            l.out.push_back({bytes + chunk_begin(n, N, p) * E, chunk_len(n, N, p) * E});
+            l.out.push_back({bytes + chunk_begin(n, N, r) * E, mine, 0, &reduced_bytes});
+            l.in.push_back({reinterpret_cast<char*>(rings[p].data()), mine, 0, &ring_limit, K * seg});
+            l.in.push_back({bytes + chunk_begin(n, N, p) * E, chunk_len(n, N, p) * E});
+        }
+
+        T* own = data + chunk_begin(n, N, r);
+        auto reduce = [&]() -> bool {
+            while (reduced < nseg) {
+                const std::size_t end = std::min(mine, (reduced + 1) * seg);
+                for (std::size_t p = 0; p < N; ++p)
+                    if (p != r && lanes[p].in[1].done < end)
+                        return false;
+                const std::size_t first = reduced * seg / E;
+                const std::size_t count = (end - reduced * seg) / E;
+                const std::size_t slot = (reduced % K) * seg / E;
+                auto src = [&](std::size_t k) -> const T* {
+                    return k == r ? own + first : rings[k].data() + slot;
+                };
+                // Rank order, one rank per pass, in float: acc = x0 + x1, then acc += x2, ...
+                const T* a = src(0);
+                const T* b = src(1);
+                float* acc = acc_.data();
+                for (std::size_t i = 0; i < count; ++i)
+                    acc[i] = d::widen(a[i]) + d::widen(b[i]);
+                for (std::size_t k = 2; k < N; ++k) {
+                    const T* x = src(k);
+                    for (std::size_t i = 0; i < count; ++i)
+                        acc[i] = acc[i] + d::widen(x[i]);
+                }
+                for (std::size_t i = 0; i < count; ++i)
+                    d::narrow(acc[i], own[first + i]);
+                ++reduced;
+                reduced_bytes = end;
+                ring_limit = std::min(mine, (reduced + K) * seg);
+            }
+            return true;
+        };
+        return finish(run(lanes, reduce));
+    }
+
+    // The all-to-all over elements of E bytes: per peer, a header whose n is the elements sent to
+    // that peer, checked against one whose n is the elements this rank expects from it; then the
+    // segment out of send and the segment into recv, both in place.
+    collective_result<void> all_to_all(const char* send, std::span<const std::size_t> send_counts,
+                                       std::span<const std::size_t> send_offsets, char* recv,
+                                       std::span<const std::size_t> recv_counts, std::span<const std::size_t> recv_offsets,
+                                       std::size_t E, unsigned dtype)
+    {
+        namespace d = detail::collective;
+        if (auto e = precheck(nullptr, 0, 1); e.is_err())
+            return e;
+        const std::size_t N = std::size_t(size_), r = std::size_t(rank_);
+        auto bad = [](const std::string& why) { return err(collective_error(collective_errc::bad_config, -1, why)); };
+        if (send_counts.size() != N || send_offsets.size() != N || recv_counts.size() != N || recv_offsets.size() != N)
+            return bad("all_to_all_v needs one count and one offset per rank, each way");
+        if (E == 0 || E > 0xffffffffu)
+            return bad("all_to_all_v needs an element size from 1 to 2^32 - 1 bytes");
+        const std::size_t most = std::numeric_limits<std::size_t>::max() / E;
+        for (std::size_t q = 0; q < N; ++q) {
+            if (send_counts[q] > most || send_offsets[q] > most - send_counts[q] || recv_counts[q] > most ||
+                recv_offsets[q] > most - recv_counts[q])
+                return bad("all_to_all_v: a segment too large");
+            if ((send_counts[q] != 0 && send == nullptr) || (recv_counts[q] != 0 && recv == nullptr))
+                return bad("null buffer");
+        }
+        if (send_counts[r] != recv_counts[r])
+            return bad("all_to_all_v: this rank sends itself " + std::to_string(send_counts[r]) + " elements and expects " +
+                       std::to_string(recv_counts[r]));
+        if (send_counts[r] != 0)
+            std::memcpy(recv + recv_offsets[r] * E, send + send_offsets[r] * E, send_counts[r] * E);
+        if (N == 1) {
+            ++seq_;
+            return ok();
+        }
+        auto lanes = start(d::op_all_to_all_v, dtype, std::uint32_t(E), 0);
+        header_v_.assign(N, {});
+        expect_.assign(N, {});
+        for (std::size_t p = 0; p < N; ++p) {
+            if (p == r)
+                continue;
+            header_v_[p] = d::encode(d::op_header{d::op_all_to_all_v, dtype, std::uint32_t(E), std::uint32_t(size_), seq_,
+                                                  std::uint64_t(send_counts[p]), epoch_});
+            expect_[p] = d::encode(d::op_header{d::op_all_to_all_v, dtype, std::uint32_t(E), std::uint32_t(size_), seq_,
+                                                std::uint64_t(recv_counts[p]), epoch_});
+            auto& l = lanes[p];
+            l.out[0].base = reinterpret_cast<char*>(header_v_[p].data());
+            l.out.push_back({const_cast<char*>(send) + send_offsets[p] * E, send_counts[p] * E});
+            l.in.push_back({recv + recv_offsets[p] * E, recv_counts[p] * E});
+        }
+        return finish(run(lanes, [] { return true; }));
     }
 
     // Every lane starts by sending this rank's header and receiving the peer's
     lanes_t start(unsigned op, unsigned dtype, std::uint32_t root, std::size_t n)
     {
         namespace d = detail::collective;
-        header_out_ = d::encode(d::op_header{op, dtype, root, std::uint32_t(size_), seq_, std::uint64_t(n)});
+        header_out_ = d::encode(d::op_header{op, dtype, root, std::uint32_t(size_), seq_, std::uint64_t(n), epoch_});
         header_in_.assign(std::size_t(size_), {});
+        expect_.clear();
         lanes_t lanes(static_cast<std::size_t>(size_));
         for (std::size_t p = 0; p < lanes.size(); ++p) {
             if (int(p) == rank_)
@@ -727,26 +1380,32 @@ private:
     {
         namespace d = detail::collective;
         const std::size_t i = std::size_t(q);
-        while (ctrl_open_[i] && notice_got_[i] < d::abort_size) {
-            const ssize_t got = ::recv(ctrl_[i].fd(), notice_[i].data() + notice_got_[i],
-                                       d::abort_size - notice_got_[i], MSG_DONTWAIT);
-            if (got > 0) {
-                notice_got_[i] += std::size_t(got);
-                continue;
+        for (;;) {
+            while (ctrl_open_[i] && notice_got_[i] < d::abort_size) {
+                const ssize_t got = ::recv(ctrl_[i].fd(), notice_[i].data() + notice_got_[i],
+                                           d::abort_size - notice_got_[i], MSG_DONTWAIT);
+                if (got > 0) {
+                    notice_got_[i] += std::size_t(got);
+                    continue;
+                }
+                if (got < 0 && errno == EINTR)
+                    continue;
+                if (got == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+                    ctrl_open_[i] = 0;
+                return ok();
             }
-            if (got < 0 && errno == EINTR)
-                continue;
-            if (got == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
-                ctrl_open_[i] = 0;
-            return ok();
+            if (notice_got_[i] < d::abort_size)
+                return ok();
+            if ((unsigned(notice_[i][0]) | unsigned(notice_[i][1]) << 8) != d::progress_magic)
+                break;
+            notice_got_[i] = 0;                          // progress: note it, read on
+            heard_[i] = 1;
         }
-        if (notice_got_[i] < d::abort_size)
-            return ok();
         const auto& b = notice_[i];
         const unsigned code = b[2];
         const std::uint32_t culprit = d::get32(b.data() + 4);
         if ((unsigned(b[0]) | unsigned(b[1]) << 8) != d::abort_magic || code < 1 ||
-            code > unsigned(collective_errc::broken)) {
+            code > unsigned(collective_errc::excluded)) {
             ctrl_open_[i] = 0;
             return fail(collective_errc::io_error, q, "garbage on the control connection");
         }
@@ -862,6 +1521,12 @@ private:
                 if (pfds[i].revents != 0)
                     if (auto e = read_notice(int(owner[i])); e.is_err())
                         return e;
+            // A rank that says it is moving bytes is not stalled, whatever it owes this one
+            for (std::size_t q = 0; q < heard_.size(); ++q)
+                if (heard_[q]) {
+                    heard_[q] = 0;
+                    lanes[q].last = lanes[q].last_rx = clock::now();
+                }
 
             for (std::size_t i = 0; rc > 0 && i < data_fds; ++i) {
                 const std::size_t p = owner[i];
@@ -890,6 +1555,22 @@ private:
                                   fail(collective_errc::peer_closed, int(p),
                                        se ? std::string(std::strerror(se)) : "connection closed mid-operation"));
                 }
+            }
+
+            // This rank's own progress, told to every other rank now and then (see progress_magic)
+            if (moved_ && clock::now() - noted_ >= io_timeout_ / 4) {
+                moved_ = false;
+                noted_ = clock::now();
+                std::array<unsigned char, d::abort_size> note{};
+                note[0] = static_cast<unsigned char>(d::progress_magic & 0xff);
+                note[1] = static_cast<unsigned char>(d::progress_magic >> 8);
+                for (std::size_t q = 0; q < ctrl_.size(); ++q)
+                    if (int(q) != rank_ && ctrl_[q].valid())
+                        (void)::send(ctrl_[q].fd(), note.data(), note.size(), MSG_DONTWAIT
+#if defined(MSG_NOSIGNAL)
+                                                                                  | MSG_NOSIGNAL
+#endif
+                        );
             }
 
             // Stall check. When any peer with work possible has moved no byte for io_timeout, the
@@ -969,12 +1650,15 @@ private:
                             std::string("recv: ") + std::strerror(errno));
             }
             pt.done += std::size_t(got);
+            moved_ = true;
             l.last = l.last_rx = d::clock::now();
             if (pt.done == pt.len) {
-                if (l.ii == 0 && std::memcmp(pt.base, header_out_.data(), d::op_header_size) != 0)
+                // The header this rank expects from p: its own, or for all_to_all_v one with p's count
+                const unsigned char* want = expect_.empty() ? header_out_.data() : expect_[std::size_t(p)].data();
+                if (l.ii == 0 && std::memcmp(pt.base, want, d::op_header_size) != 0)
                     return fail(collective_errc::mismatched_call, p,
                                 "it called " + d::describe(reinterpret_cast<const unsigned char*>(pt.base)) +
-                                    ", this rank " + d::describe(header_out_.data()));
+                                    ", this rank " + d::describe(want));
                 ++l.ii;
                 while (l.ii < l.in.size() && l.in[l.ii].len == 0)
                     ++l.ii;
@@ -1000,6 +1684,7 @@ private:
                             p, std::string("send: ") + std::strerror(errno));
             }
             pt.done += std::size_t(sent);
+            moved_ = true;
             l.last = d::clock::now();
             if (pt.done == pt.len) {
                 ++l.oi;
@@ -1037,11 +1722,10 @@ private:
         return l.count() < 0 ? std::chrono::milliseconds(0) : l;
     }
 
-    static collective_result<collective> connect_impl(const collective_config& cfg, tcp_listener* given)
+    // Check the configuration and set up this rank's object, its listener bound; no connection yet
+    static collective_result<collective> setup(const collective_config& cfg, tcp_listener* given, bool listen_always)
     {
         namespace d = detail::collective;
-        using d::clock;
-        const auto dl = clock::now() + cfg.connect_timeout;
         auto bad = [](const std::string& s) { return err(collective_error(collective_errc::bad_config, -1, s)); };
 
         const std::size_t N = cfg.peers.size();
@@ -1051,116 +1735,304 @@ private:
             return bad("rank " + std::to_string(cfg.rank) + " is not in 0.." + std::to_string(N - 1));
         if (cfg.io_timeout.count() <= 0 || cfg.connect_timeout.count() <= 0 || cfg.handshake_timeout.count() <= 0)
             return bad("timeouts must be positive");
+        if (cfg.elastic && (cfg.probe_timeout.count() <= 0 || cfg.gather_window.count() <= 0 || cfg.reform_timeout.count() <= 0 ||
+                            cfg.join_timeout.count() <= 0))
+            return bad("timeouts must be positive");
         if (cfg.segment_bytes < sizeof(float) || cfg.segment_bytes > (std::size_t{1} << 30))
             return bad("segment_bytes must be between 4 bytes and 1 GiB");
 
-        std::vector<d::endpoint> eps;
+        collective c;
         for (const auto& s : cfg.peers) {
             auto e = d::parse_endpoint(s);
             if (!e)
                 return bad("\"" + s + "\" is not host:port");
-            eps.push_back(*e);
+            c.eps_.push_back(*e);
         }
-
-        collective c;
-        c.rank_ = cfg.rank;
-        c.size_ = int(N);
+        c.slot_ = std::uint32_t(cfg.rank);
+        c.run_id_ = cfg.run_id;
+        c.elastic_ = cfg.elastic;
         c.endpoints_ = cfg.peers;
         c.io_timeout_ = cfg.io_timeout;
+        c.connect_timeout_ = cfg.connect_timeout;
+        c.handshake_timeout_ = cfg.handshake_timeout;
+        c.probe_timeout_ = cfg.probe_timeout;
+        c.gather_window_ = cfg.gather_window;
+        c.reform_timeout_ = cfg.reform_timeout;
+        c.min_members_ = cfg.min_members;
+        c.socket_buffer_bytes_ = cfg.socket_buffer_bytes;
         c.segment_bytes_ = cfg.segment_bytes / sizeof(float) * sizeof(float);
-        c.links_.resize(N);
-        c.ctrl_.resize(N);
-        c.notice_.assign(N, {});
-        c.notice_got_.assign(N, 0);
-        c.ctrl_open_.assign(N, 0);
-        if (N == 1)
-            return ok(std::move(c));
-
-        const std::size_t r = std::size_t(cfg.rank);
-        tcp_listener listener;
-        if (r + 1 < N) {
+        if (N > 1 && (listen_always || std::size_t(cfg.rank) + 1 < N)) {
             if (given && given->valid())
-                listener = std::move(*given);
+                c.listener_ = std::move(*given);
             else {
                 std::string e;
-                listener = tcp_listener::bind(cfg.listen_host, eps[r].port, 128, &e);
-                if (!listener.valid())
-                    return err(collective_error(collective_errc::bind_failed, int(r),
-                                                c.who(int(r)) + ": " + e));
+                c.listener_ = tcp_listener::bind(cfg.listen_host, c.eps_[c.slot_].port, 128, &e);
+                if (!c.listener_.valid())
+                    return err(collective_error(collective_errc::bind_failed, cfg.rank,
+                                                "slot " + std::to_string(cfg.rank) + " (" + cfg.peers[c.slot_] + "): " + e));
             }
         }
+        return ok(std::move(c));
+    }
 
-        auto mine = [&](std::size_t to, unsigned char channel, unsigned char kind, unsigned char reason) {
+    static collective_result<collective> connect_impl(const collective_config& cfg, tcp_listener* given)
+    {
+        auto made = setup(cfg, given, cfg.elastic);
+        if (made.is_err())
+            return made;
+        collective c = std::move(made).unwrap();
+        std::vector<std::uint32_t> all(cfg.peers.size());
+        for (std::size_t i = 0; i < all.size(); ++i)
+            all[i] = std::uint32_t(i);
+        c.adopt(0, all);
+        if (auto e = c.build_mesh(detail::collective::clock::now() + cfg.connect_timeout); e.is_err())
+            return err(e.unwrap_err_unchecked());
+        if (!c.elastic_)
+            c.listener_.close();
+        return ok(std::move(c));
+    }
+
+    // Take a membership as this rank's: its epoch, digest, rank and size, and a clean slate
+    void adopt(std::uint64_t epoch, std::vector<std::uint32_t> slots)
+    {
+        members_ = std::move(slots);
+        epoch_ = epoch;
+        digest_ = detail::collective::view_digest(run_id_, epoch_, members_);
+        size_ = int(members_.size());
+        rank_ = int(std::find(members_.begin(), members_.end(), slot_) - members_.begin());
+        seq_ = 0;
+        adopted_ = false;
+        reform_asked_ = false;
+        drop_mesh();
+        links_.resize(members_.size());
+        ctrl_.resize(members_.size());
+        notice_.assign(members_.size(), {});
+        notice_got_.assign(members_.size(), 0);
+        ctrl_open_.assign(members_.size(), 0);
+        heard_.assign(members_.size(), 0);
+    }
+
+    void drop_mesh()
+    {
+        links_.clear();
+        ctrl_.clear();
+        ctrl_open_.assign(ctrl_open_.size(), 0);
+    }
+
+    collective_result<void> settle_mesh(collective_result<void> r)
+    {
+        if (r.is_err()) {
+            broken_ = r.unwrap_err_unchecked();
+            return r;
+        }
+        broken_.reset();
+        return r;
+    }
+
+    // Read one frame before the deadline; false if it did not come whole
+    static bool read_hello(tcp_stream& s, detail::collective::clock::time_point dl, detail::collective::hello& h)
+    {
+        std::array<unsigned char, detail::collective::hello_size> buf{};
+        std::string e;
+        if (read_exact(s, buf.data(), buf.size(), dl, &e) != 1)
+            return false;
+        h = detail::collective::decode(buf.data());
+        return true;
+    }
+
+    detail::collective::hello frame(unsigned char kind, unsigned char reason, std::uint32_t to) const
+    {
+        detail::collective::hello h;
+        h.kind = kind;
+        h.reason = reason;
+        h.world = std::uint32_t(members_.size());
+        h.from = slot_;
+        h.to = to;
+        h.run_id = run_id_;
+        h.epoch = epoch_;
+        h.digest = digest_;
+        return h;
+    }
+
+    void reject_slot(tcp_stream& s, std::uint32_t to, unsigned char why) const
+    {
+        const auto b = detail::collective::encode(frame(detail::collective::reject_kind, why, to));
+        (void)s.write_all(reinterpret_cast<const char*>(b.data()), b.size(), std::chrono::milliseconds(200));
+        s.close();
+    }
+    void reject(tcp_stream& s, const detail::collective::hello& h, unsigned char why) const { reject_slot(s, h.from, why); }
+
+    // The new membership to a registered survivor or an admitted joiner: the frame, then the slots
+    void send_view(tcp_stream& s, std::uint64_t epoch, const std::vector<std::uint32_t>& slots) const
+    {
+        namespace d = detail::collective;
+        d::hello h = frame(d::view_kind, d::ok_reason, 0);
+        h.epoch = epoch;
+        h.world = std::uint32_t(slots.size());
+        h.digest = d::view_digest(run_id_, epoch, slots);
+        std::vector<unsigned char> b(d::hello_size + 4 * slots.size());
+        const auto f = d::encode(h);
+        std::memcpy(b.data(), f.data(), f.size());
+        for (std::size_t k = 0; k < slots.size(); ++k)
+            d::put32(b.data() + d::hello_size + 4 * k, slots[k]);
+        (void)s.write_all(reinterpret_cast<const char*>(b.data()), b.size(), std::max(handshake_timeout_, std::chrono::milliseconds(1)));
+    }
+
+    // One answer to a register or join: 1 a view (in view, epoch), 2 wait (the view follows later),
+    // -1 a refusal (in reason), 0 nothing usable (closed, timed out, garbage)
+    int read_view(tcp_stream& s, detail::collective::clock::time_point dl, std::vector<std::uint32_t>& view, std::uint64_t& epoch,
+                  unsigned& reason) const
+    {
+        namespace d = detail::collective;
+        {
             d::hello h;
-            h.kind = kind;
-            h.reason = reason;
+            if (!read_hello(s, dl, h) || !h.magic_ok)
+                return 0;
+            if (h.kind == d::wait_kind)
+                return 2;
+            if (h.kind == d::reject_kind) {
+                reason = h.reason;
+                return -1;
+            }
+            if (h.kind != d::view_kind || h.run_id != run_id_ || h.world == 0 || h.world > endpoints_.size())
+                return 0;
+            std::vector<unsigned char> b(4 * std::size_t(h.world));
+            std::string e;
+            if (read_exact(s, b.data(), b.size(), dl, &e) != 1)
+                return 0;
+            view.resize(h.world);
+            for (std::size_t k = 0; k < view.size(); ++k)
+                view[k] = d::get32(b.data() + 4 * k);
+            if (!std::is_sorted(view.begin(), view.end()) || std::adjacent_find(view.begin(), view.end()) != view.end() ||
+                view.back() >= endpoints_.size() || d::view_digest(run_id_, h.epoch, view) != h.digest)
+                return 0;
+            epoch = h.epoch;
+            return 1;
+        }
+    }
+
+    // A request on the listener outside a re-formation this rank coordinates: a joiner is held by the
+    // rendezvous (rank 0) and turned away elsewhere; a registration from this epoch means the group is
+    // failing (held for the coordinator this rank may become), one from an older epoch is told it is
+    // out, one from a newer epoch is not this rank's to answer
+    void serve(tcp_stream s, const detail::collective::hello& h)
+    {
+        namespace d = detail::collective;
+        if (!h.magic_ok)
+            return reject(s, h, d::bad_magic);
+        if (h.run_id != run_id_)
+            return reject(s, h, d::bad_run_id);
+        if (h.from >= endpoints_.size() || h.from == slot_)
+            return reject(s, h, d::bad_rank);
+        if (h.kind == d::join_kind) {
+            if (!elastic_ || rank_ != 0 || members_.empty())
+                return reject(s, h, d::not_coordinator);
+            if (is_member(h.from))
+                return reject(s, h, d::duplicate_rank);
+            const auto b = d::encode(frame(d::wait_kind, d::ok_reason, h.from));
+            if (!s.write_all(reinterpret_cast<const char*>(b.data()), b.size(), std::chrono::milliseconds(200)))
+                return;
+            for (auto& q : held_)
+                if (q.kind == d::join_kind && q.slot == h.from) {
+                    q.s = std::move(s);
+                    return;
+                }
+            held_.push_back({std::move(s), h.from, d::join_kind, h});
+            return;
+        }
+        if (h.kind == d::register_kind && elastic_) {
+            if (h.epoch < epoch_)
+                return reject(s, h, d::stale_epoch);
+            if (h.epoch > epoch_)
+                return reject(s, h, d::not_coordinator);
+            reform_asked_ = reform_asked_ || h.digest == digest_;
+            held_.push_back({std::move(s), h.from, d::register_kind, h});
+            return;
+        }
+        reject(s, h, d::bad_magic);
+    }
+
+    // Between collectives: every connection waiting on the listener, read and served. A frame must
+    // come at once (they are sent on connecting): this never holds the caller up for long
+    void serve_listener()
+    {
+        namespace d = detail::collective;
+        if (!listener_.valid())
+            return;
+        for (int k = 0; k < 64; ++k) {
+            pollfd pf{listener_.fd(), POLLIN, 0};
+            if (::poll(&pf, 1, 0) <= 0)
+                return;
+            auto s = listener_.accept(std::chrono::milliseconds(0));
+            if (!s.valid())
+                return;
+            d::hello h;
+            if (read_hello(s, d::clock::now() + std::min(handshake_timeout_, std::chrono::milliseconds(200)), h))
+                serve(std::move(s), h);
+        }
+    }
+
+    // The full mesh of the current membership: dial every lower rank twice (data, control) and say
+    // hello, accept every higher rank's two connections, collect the lower ranks' answers. Each
+    // hello names the run, the epoch and the members (their digest), so two ranks holding
+    // different memberships never connect. Requests that arrive meanwhile are served.
+    collective_result<void> build_mesh(detail::collective::clock::time_point dl)
+    {
+        namespace d = detail::collective;
+        using d::clock;
+        const std::size_t N = members_.size();
+        const std::size_t r = std::size_t(rank_);
+        if (N <= 1)
+            return ok();
+        auto link = [this](std::size_t p, unsigned ch) -> tcp_stream& { return ch == 0 ? links_[p] : ctrl_[p]; };
+        auto hi = [&](std::size_t to, unsigned char channel, unsigned char kind, unsigned char reason) {
+            d::hello h = frame(kind, reason, to < N ? members_[to] : 0);
             h.channel = channel;
-            h.world = std::uint32_t(N);
-            h.from = std::uint32_t(r);
-            h.to = std::uint32_t(to);
-            h.run_id = cfg.run_id;
             return d::encode(h);
         };
 
-        // Every pair has two connections: channel 0 for data, channel 1 for abort notices
-        auto link = [&c](std::size_t p, unsigned ch) -> tcp_stream& { return ch == 0 ? c.links_[p] : c.ctrl_[p]; };
-
-        // 1. Dial every lower rank twice and say hello. Each of them listens before it dials anyone,
-        //    so this waits only for processes to start, never on a cycle.
+        // 1. Dial every lower rank twice. Each of them listens before it dials anyone, so this waits
+        //    only for processes to start, never on a cycle.
         const backoff_policy policy{std::chrono::milliseconds(20), std::chrono::milliseconds(500)};
         for (std::size_t p = 0; p < 2 * r; ++p) {
             const unsigned ch = unsigned(p % 2);
             const std::size_t to = p / 2;
+            const auto& ep = eps_[members_[to]];
             std::string last;
             for (std::uint32_t attempt = 0;; ++attempt) {
                 const auto left = left_until(dl);
                 if (left.count() == 0)
                     return err(collective_error(collective_errc::connect_failed, int(to),
-                                                c.who(int(to)) + ": not reachable within " +
-                                                    std::to_string(cfg.connect_timeout.count()) + " ms" +
+                                                who(int(to)) + ": not reachable within " +
+                                                    std::to_string(connect_timeout_.count()) + " ms" +
                                                     (last.empty() ? "" : " (" + last + ")")));
-                auto s = tcp_stream::connect(eps[to].host, eps[to].port,
-                                             std::min(left, std::chrono::milliseconds(2000)), &last);
+                auto s = tcp_stream::connect(ep.host, ep.port, std::min(left, std::chrono::milliseconds(2000)), &last);
                 if (s.valid()) {
                     link(to, ch) = std::move(s);
                     break;
                 }
                 std::this_thread::sleep_for(std::min(backoff_ceiling(policy, attempt), left_until(dl)));
             }
-            const auto h = mine(to, static_cast<unsigned char>(ch), d::hello_kind, d::ok_reason);
+            const auto h = hi(to, static_cast<unsigned char>(ch), d::hello_kind, d::ok_reason);
             std::string e;
             if (!link(to, ch).write_all(reinterpret_cast<const char*>(h.data()), h.size(),
                                         std::max(left_until(dl), std::chrono::milliseconds(1)), &e))
-                return err(collective_error(collective_errc::connect_failed, int(to), c.who(int(to)) + ": " + e));
+                return err(collective_error(collective_errc::connect_failed, int(to), who(int(to)) + ": " + e));
         }
 
         // 2. Accept every higher rank: check its hello, answer it. A connection that is not one of
-        //    this job's ranks is refused and closed, and the wait goes on for the real one.
+        //    this membership's ranks is refused (or served, if it is a request), and the wait goes on.
         std::string refused;
         int refused_rank = -1;
-        for (std::size_t accepted = 0; accepted < 2 * (N - 1 - r);) {
+        std::size_t accepted = 0;
+        // One higher rank's connection and its hello: true when it is taken as a link
+        auto consider = [&](tcp_stream s, const d::hello& h) -> bool {
             std::string e;
-            auto s = listener.accept(left_until(dl), &e);
-            if (!s.valid()) {
-                if (errno != ETIMEDOUT && left_until(dl).count() > 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));   // EMFILE and friends
-                    continue;
-                }
-                std::size_t missing = r + 1;
-                while (missing < N && c.links_[missing].valid() && c.ctrl_[missing].valid())
-                    ++missing;
-                if (!refused.empty())
-                    return err(collective_error(collective_errc::handshake_rejected, refused_rank,
-                                                "waiting for " + c.who(int(missing)) + "; refused " + refused));
-                return err(collective_error(collective_errc::timed_out, int(missing),
-                                            c.who(int(missing)) + ": did not connect within " +
-                                                std::to_string(cfg.connect_timeout.count()) + " ms"));
+            if (h.magic_ok && (h.kind == d::join_kind || h.kind == d::register_kind)) {
+                serve(std::move(s), h);
+                return false;
             }
-            std::array<unsigned char, d::hello_size> buf{};
-            const auto hdl = std::min(dl, clock::now() + cfg.handshake_timeout);
-            if (read_exact(s, buf.data(), buf.size(), hdl, &e) != 1)
-                continue;                                         // silent or gone: not one of ours
-            const auto h = d::decode(buf.data());
+            const std::size_t from = std::size_t(std::find(members_.begin(), members_.end(), h.from) - members_.begin());
             unsigned char why = d::ok_reason;
             if (!h.magic_ok || h.kind != d::hello_kind || h.channel > 1)
                 why = d::bad_magic;
@@ -1168,25 +2040,58 @@ private:
                 why = d::bad_byte_order;
             else if (h.world != N)
                 why = d::bad_world;
-            else if (h.to != r || h.from <= r || h.from >= N)
+            else if (h.to != slot_ || from <= r || from >= N)
                 why = d::bad_rank;
-            else if (h.run_id != cfg.run_id)
+            else if (h.run_id != run_id_)
                 why = d::bad_run_id;
-            else if (link(h.from, h.channel).valid())
+            else if (h.epoch != epoch_ || h.digest != digest_)
+                why = d::bad_view;
+            else if (link(from, h.channel).valid())
                 why = d::duplicate_rank;
-            const auto reply = mine(h.magic_ok ? h.from : 0, h.channel,
-                                    why == d::ok_reason ? d::accept_kind : d::reject_kind, why);
-            const bool sent = s.write_all(reinterpret_cast<const char*>(reply.data()), reply.size(),
-                                          std::max(left_until(hdl), std::chrono::milliseconds(1)), &e);
+            d::hello reply = frame(why == d::ok_reason ? d::accept_kind : d::reject_kind, why, h.magic_ok ? h.from : 0);
+            reply.channel = h.channel;
+            const auto rb = d::encode(reply);
+            const bool sent = s.write_all(reinterpret_cast<const char*>(rb.data()), rb.size(),
+                                          std::max(left_until(std::min(dl, clock::now() + handshake_timeout_)), std::chrono::milliseconds(1)), &e);
             if (why != d::ok_reason) {
-                refused_rank = h.magic_ok && h.from < N ? int(h.from) : -1;
-                refused = "a connection claiming rank " + std::to_string(h.from) + ": " + d::reason_text(why);
-                continue;
+                refused_rank = h.magic_ok && from < N ? int(from) : -1;
+                refused = "a connection claiming slot " + std::to_string(h.from) + ": " + d::reason_text(why);
+                return false;
             }
             if (!sent)
-                continue;
-            link(h.from, h.channel) = std::move(s);
-            ++accepted;
+                return false;
+            link(from, h.channel) = std::move(s);
+            return true;
+        };
+        // Mesh connections that came while this rank waited to be admitted, first
+        for (auto& q : held_)
+            if (q.kind == d::hello_kind && q.s.valid() && accepted < 2 * (N - 1 - r))
+                accepted += consider(std::move(q.s), q.h) ? 1 : 0;
+        for (auto& q : held_)
+            if (q.kind == d::hello_kind)
+                q.s.close();
+        while (accepted < 2 * (N - 1 - r)) {
+            std::string e;
+            auto s = listener_.accept(left_until(dl), &e);
+            if (!s.valid()) {
+                if (errno != ETIMEDOUT && left_until(dl).count() > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));   // EMFILE and friends
+                    continue;
+                }
+                std::size_t missing = r + 1;
+                while (missing < N && links_[missing].valid() && ctrl_[missing].valid())
+                    ++missing;
+                if (!refused.empty())
+                    return err(collective_error(collective_errc::handshake_rejected, refused_rank,
+                                                "waiting for " + who(int(missing)) + "; refused " + refused));
+                return err(collective_error(collective_errc::timed_out, int(missing),
+                                            who(int(missing)) + ": did not connect within " +
+                                                std::to_string(connect_timeout_.count()) + " ms"));
+            }
+            d::hello h;
+            if (!read_hello(s, std::min(dl, clock::now() + handshake_timeout_), h))
+                continue;                                         // silent or gone: not one of ours
+            accepted += consider(std::move(s), h) ? 1 : 0;
         }
 
         // 3. Collect the lower ranks' answers.
@@ -1199,7 +2104,7 @@ private:
             if (got != 1)
                 return err(collective_error(got == -1 ? collective_errc::timed_out : collective_errc::handshake_rejected,
                                             int(p),
-                                            c.who(int(p)) + ": no handshake answer" +
+                                            who(int(p)) + ": no handshake answer" +
                                                 (got == 0 ? " (connection closed)" : e.empty() ? "" : " (" + e + ")")));
             const auto h = d::decode(buf.data());
             const char* why = nullptr;
@@ -1207,32 +2112,132 @@ private:
                 why = d::reason_text(d::bad_magic);
             else if (h.kind == d::reject_kind)
                 why = d::reason_text(h.reason);
-            else if (h.kind != d::accept_kind || h.from != p || h.to != r || h.channel != ch)
+            else if (h.kind != d::accept_kind || h.from != members_[p] || h.to != slot_ || h.channel != ch)
                 why = d::reason_text(d::bad_rank);
             else if (h.world != N)
                 why = d::reason_text(d::bad_world);
-            else if (h.run_id != cfg.run_id)
+            else if (h.run_id != run_id_)
                 why = d::reason_text(d::bad_run_id);
             else if (!h.native_order)
                 why = d::reason_text(d::bad_byte_order);
+            else if (h.epoch != epoch_ || h.digest != digest_)
+                why = d::reason_text(d::bad_view);
             if (why)
-                return err(collective_error(collective_errc::handshake_rejected, int(p),
-                                            c.who(int(p)) + ": " + why));
+                return err(collective_error(collective_errc::handshake_rejected, int(p), who(int(p)) + ": " + why));
         }
 
         for (std::size_t p = 0; p < N; ++p) {
             if (p == r)
                 continue;
-            auto& s = c.links_[p];
+            auto& s = links_[p];
             d::set_no_sigpipe(s.fd());
-            d::set_no_sigpipe(c.ctrl_[p].fd());
+            d::set_no_sigpipe(ctrl_[p].fd());
             s.set_nodelay(true);
-            c.ctrl_[p].set_nodelay(true);
-            c.ctrl_open_[p] = 1;
-            if (cfg.socket_buffer_bytes > 0)
-                s.set_buffer_sizes(cfg.socket_buffer_bytes, cfg.socket_buffer_bytes);
+            ctrl_[p].set_nodelay(true);
+            ctrl_open_[p] = 1;
+            if (socket_buffer_bytes_ > 0)
+                s.set_buffer_sizes(socket_buffer_bytes_, socket_buffer_bytes_);
         }
-        return ok(std::move(c));
+        // Joiners held by a rank that is no longer the rendezvous look elsewhere
+        if (rank_ != 0)
+            for (auto& q : held_)
+                if (q.kind == d::join_kind && q.s.valid())
+                    reject_slot(q.s, q.slot, d::not_coordinator);
+        held_.erase(std::remove_if(held_.begin(), held_.end(), [](const held_request& q) { return !q.s.valid(); }), held_.end());
+        return ok();
+    }
+
+    // A joiner's wait on a rendezvous: what arrives on the rendezvous connection, while requests to
+    // this rank (other joiners, survivors of an old membership) are turned away
+    int await_admission(tcp_stream& s, detail::collective::clock::time_point first, detail::collective::clock::time_point dl,
+                        std::vector<std::uint32_t>& view, std::uint64_t& epoch, unsigned& reason)
+    {
+        namespace d = detail::collective;
+        bool waited = false;
+        for (;;) {
+            if (!waited)
+                dl = std::min(dl, first);
+            if (left_until(dl).count() == 0)
+                return 0;
+            pollfd pf[2] = {{s.fd(), POLLIN, 0}, {listener_.valid() ? listener_.fd() : -1, POLLIN, 0}};
+            const int rc = ::poll(pf, 2, int(std::min<long long>(left_until(dl).count(), 1000)));
+            if (rc < 0 && errno != EINTR)
+                return 0;
+            if (rc > 0 && (pf[1].revents & POLLIN)) {
+                auto in = listener_.accept(std::chrono::milliseconds(0));
+                d::hello h;
+                if (in.valid() && read_hello(in, d::clock::now() + std::chrono::milliseconds(200), h)) {
+                    // A member of the membership this joiner is about to receive may dial it before the view
+                    // arrives (it learnt the joiners from admit's broadcast): held for build_mesh
+                    if (h.magic_ok && h.kind == d::hello_kind && h.run_id == run_id_)
+                        held_.push_back({std::move(in), h.from, d::hello_kind, h});
+                    else
+                        reject(in, h, h.magic_ok && h.run_id != run_id_ ? d::bad_run_id : d::not_coordinator);
+                }
+            }
+            if (rc > 0 && pf[0].revents != 0) {
+                const int got = read_view(s, dl, view, epoch, reason);
+                if (got != 2)
+                    return got;
+                waited = true;
+            }
+        }
+    }
+
+    static collective_result<collective> join_impl(const collective_config& given_cfg, tcp_listener* given)
+    {
+        namespace d = detail::collective;
+        using d::clock;
+        collective_config cfg = given_cfg;
+        cfg.elastic = true;
+        auto made = setup(cfg, given, true);
+        if (made.is_err())
+            return made;
+        collective c = std::move(made).unwrap();
+        const auto dl = clock::now() + cfg.join_timeout;
+        const backoff_policy policy{std::chrono::milliseconds(100), std::chrono::milliseconds(2000)};
+        std::string last = "no rank answered";
+        for (std::uint32_t attempt = 0; left_until(dl).count() > 0; ++attempt) {
+            for (std::uint32_t cand = 0; cand < c.endpoints_.size() && left_until(dl).count() > 0; ++cand) {
+                if (cand == c.slot_)
+                    continue;
+                auto s = tcp_stream::connect(c.eps_[cand].host, c.eps_[cand].port, std::min(c.probe_timeout_, left_until(dl)));
+                if (!s.valid())
+                    continue;
+                d::hello h;
+                h.kind = d::join_kind;
+                h.from = c.slot_;
+                h.to = cand;
+                h.run_id = c.run_id_;
+                const auto b = d::encode(h);
+                if (!s.write_all(reinterpret_cast<const char*>(b.data()), b.size(), std::max(left_until(dl), std::chrono::milliseconds(1))))
+                    continue;
+                // The first answer within gather_window (a member answers at its next poll), then the view
+                std::vector<std::uint32_t> view;
+                std::uint64_t epoch = 0;
+                unsigned reason = 0;
+                const int got = c.await_admission(s, clock::now() + c.gather_window_, dl, view, epoch, reason);
+                if (got < 0) {
+                    if (reason == d::bad_run_id || reason == d::bad_magic)
+                        return err(collective_error(collective_errc::handshake_rejected, int(cand),
+                                                    "slot " + std::to_string(cand) + " (" + c.endpoints_[cand] + "): " + d::reason_text(reason)));
+                    last = "slot " + std::to_string(cand) + ": " + d::reason_text(reason);
+                    continue;
+                }
+                if (got == 0)
+                    continue;
+                if (std::find(view.begin(), view.end(), c.slot_) == view.end())
+                    continue;
+                c.adopt(epoch, view);
+                if (auto e = c.build_mesh(std::min(dl, clock::now() + c.connect_timeout_)); e.is_err())
+                    return err(e.unwrap_err_unchecked());
+                return ok(std::move(c));
+            }
+            std::this_thread::sleep_for(std::min(backoff_ceiling(policy, attempt), left_until(dl)));
+        }
+        return err(collective_error(collective_errc::timed_out, -1,
+                                    "slot " + std::to_string(c.slot_) + " was not admitted within " +
+                                        std::to_string(cfg.join_timeout.count()) + " ms (" + last + ")"));
     }
 };
 

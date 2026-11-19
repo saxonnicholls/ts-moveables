@@ -4,8 +4,9 @@
 //
 //  Copyright 2010-2026 Saxon Herschel Nicholls
 //
-//  Thread Safe Moveables - allreduce_sum and broadcast throughput on loopback
-//  (net/collective.hpp), each rank a process, 0.5 GB of floats:
+//  Thread Safe Moveables - allreduce_sum, broadcast and all_to_all_v throughput
+//  on loopback (net/collective.hpp), each rank a process, 0.5 GB of floats
+//  (the all-to-all: each rank's buffer cut into N equal segments, one per rank):
 //
 //      collective_bench                  N = 2 and 4, 512 MiB, best of 3
 //      collective_bench --mb 64 --ranks 2,3,5 --reps 5 --sockbuf 4096 --segment 4096   (KiB)
@@ -45,7 +46,7 @@ int sockbuf = 0;               // --sockbuf KiB: SO_SNDBUF/SO_RCVBUF; 0 leaves t
 std::size_t segment = 0;       // --segment KiB: the reduction's unit; 0 is the default (1 MiB)
 
 struct timing {
-    double allreduce_s = 0, broadcast_s = 0;
+    double allreduce_s = 0, broadcast_s = 0, bf16_s = 0, a2a_s = 0;
 };
 
 // One rank: connect, then the best of `reps` of each collective (after one warm-up)
@@ -59,7 +60,13 @@ timing rank_main(const net::collective_config& cfg, net::tcp_listener listener, 
     auto& c = *made;
     std::vector<float> v(n);
     for (std::size_t i = 0; i < n; ++i) v[i] = float(i % 1024) * 0.001f + float(cfg.rank);
-    timing best{1e9, 1e9};
+    std::vector<std::uint16_t> h(n);   // the same element count in bfloat16: half the bytes
+    for (std::size_t i = 0; i < n; ++i) h[i] = std::uint16_t(0x3f80 + (i % 128));
+    std::vector<float> got(n);         // the all-to-all's: n / N elements to and from each rank
+    const std::size_t N = cfg.peers.size(), each = n / N;
+    std::vector<std::size_t> counts(N, each), offsets(N);
+    for (std::size_t q = 0; q < N; ++q) offsets[q] = q * each;
+    timing best{1e9, 1e9, 1e9, 1e9};
     for (int rep = 0; rep <= reps; ++rep) {
         if (c.barrier().is_err()) std::exit(1);
         auto t = clock_type::now();
@@ -75,9 +82,25 @@ timing rank_main(const net::collective_config& cfg, net::tcp_listener listener, 
             std::exit(1);
         }
         const double b = std::chrono::duration<double>(clock_type::now() - t).count();
+        if (c.barrier().is_err()) std::exit(1);
+        t = clock_type::now();
+        if (auto e = c.allreduce_sum_bf16(h.data(), n); e.is_err()) {
+            std::cerr << e.unwrap_err_unchecked().what() << "\n";
+            std::exit(1);
+        }
+        const double f = std::chrono::duration<double>(clock_type::now() - t).count();
+        if (c.barrier().is_err()) std::exit(1);
+        t = clock_type::now();
+        if (auto e = c.all_to_all_v(v.data(), counts, offsets, got.data(), counts, offsets); e.is_err()) {
+            std::cerr << e.unwrap_err_unchecked().what() << "\n";
+            std::exit(1);
+        }
+        const double x = std::chrono::duration<double>(clock_type::now() - t).count();
         if (rep > 0) {                        // rep 0 warms the page tables and the sockets
             best.allreduce_s = std::min(best.allreduce_s, a);
             best.broadcast_s = std::min(best.broadcast_s, b);
+            best.bf16_s = std::min(best.bf16_s, f);
+            best.a2a_s = std::min(best.a2a_s, x);
         }
     }
     return best;
@@ -121,6 +144,8 @@ bool run(int N, std::size_t n, int reps, timing& out)
     while (::read(fds[0], &t, sizeof t) == ssize_t(sizeof t)) {
         out.allreduce_s = std::max(out.allreduce_s, t.allreduce_s);
         out.broadcast_s = std::max(out.broadcast_s, t.broadcast_s);
+        out.bf16_s = std::max(out.bf16_s, t.bf16_s);
+        out.a2a_s = std::max(out.a2a_s, t.a2a_s);
     }
     ::close(fds[0]);
     bool ok = true;
@@ -156,9 +181,11 @@ int main(int argc, char** argv)
 
     std::printf("collectives on loopback: %zu MiB of floats (%zu elements), each rank a process, best of %d\n", mb, n,
                 reps);
-    std::printf("algbw = buffer / time; busbw = bytes each rank sends / time (2(N-1)/N of the buffer for allreduce)\n\n");
-    std::printf("| ranks | allreduce_sum | algbw GB/s | busbw GB/s | broadcast | algbw GB/s |\n");
-    std::printf("|---:|---:|---:|---:|---:|---:|\n");
+    std::printf("algbw = buffer / time; busbw = bytes each rank sends / time (2(N-1)/N of the buffer for allreduce,\n"
+                "(N-1)/N for all_to_all_v)\n\n");
+    std::printf("| ranks | allreduce_sum | algbw GB/s | busbw GB/s | broadcast | algbw GB/s | allreduce_sum_bf16, same n "
+                "| all_to_all_v | busbw GB/s |\n");
+    std::printf("|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for (const int N : ranks) {
         timing t;
         if (!run(N, n, reps, t)) {
@@ -166,8 +193,10 @@ int main(int argc, char** argv)
             return 1;
         }
         const double sent = 2.0 * (N - 1) / N * bytes;
-        std::printf("| %d | %.3f s | %.2f | %.2f | %.3f s | %.2f |\n", N, t.allreduce_s, bytes / t.allreduce_s / 1e9,
-                    sent / t.allreduce_s / 1e9, t.broadcast_s, bytes / t.broadcast_s / 1e9);
+        const double moved = double(N - 1) / N * bytes;
+        std::printf("| %d | %.3f s | %.2f | %.2f | %.3f s | %.2f | %.3f s | %.3f s | %.2f |\n", N, t.allreduce_s,
+                    bytes / t.allreduce_s / 1e9, sent / t.allreduce_s / 1e9, t.broadcast_s, bytes / t.broadcast_s / 1e9, t.bf16_s,
+                    t.a2a_s, moved / t.a2a_s / 1e9);
     }
 
     // What 1 Gbit/s allows: TCP over Ethernet carries about 0.94 Gbit/s of payload (1500-byte
@@ -183,8 +212,8 @@ int main(int argc, char** argv)
     for (const auto& m : models) {
         const double buf = m.params * 4;
         const double sent = 2.0 * 9 / 10 * buf;
-        std::printf("| %s | %.0fM | %.2f GB | %.2f GB | %.1f s |\n", m.name, m.params / 1e6, buf / 1e9, sent / 1e9,
-                    sent / goodput);
+        std::printf("| %s | %.0fM | %.2f GB | %.2f GB | %.1f s float, %.1f s bfloat16 |\n", m.name, m.params / 1e6, buf / 1e9,
+                    sent / 1e9, sent / goodput, sent / 2 / goodput);
     }
     return 0;
 }
