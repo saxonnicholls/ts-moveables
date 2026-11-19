@@ -114,6 +114,12 @@
 //  it, when rank 2 dies, rank 1 may see rank 0 give up and close before it sees
 //  rank 2's own connection end, and blame rank 0. A connection that ends is
 //  blamed only after a short look (100 ms at most) for such a notice.
+//  The notice names the collective it is about (the low byte of its sequence
+//  number). A rank can be one collective ahead of another - it finished
+//  collective s, whose last bytes are still on their way to a slower rank, and
+//  failed in s + 1 - so a notice about the next collective does not fail the
+//  one a rank is still finishing: every byte of that one is already sent. It
+//  is held, and the next call (or a failure of this one) takes its blame.
 //
 //  After any failure the collective is broken: the streams may be mid-message,
 //  so every later call returns `broken`. Destroy it (that closes the sockets)
@@ -494,6 +500,8 @@ inline std::uint64_t view_digest(std::uint64_t run_id, std::uint64_t epoch, cons
 // sockets and blaming it - which is what happens without this when one rank
 // dies and another gives up first.
 inline constexpr std::uint16_t abort_magic = 0x4154;          // "TA"
+// Byte 3 is the low byte of the sequence number of the collective that failed (sequence() at the
+// time: the one running, or for a failure seen by poll() the next one); bytes 4-7 the rank blamed.
 // The same 8 bytes with this magic is a progress notice: "I am moving bytes", sent by a rank in a
 // collective to every other rank at most every io_timeout / 4 while bytes move. A rank waiting on
 // that one restarts its stall clock: a peer still draining an earlier collective over a slow,
@@ -724,6 +732,8 @@ public:
             return ok();
         }
         serve_listener();
+        if (deferred_)
+            return take_deferred();
         if (reform_asked_)
             return finish(err(collective_error(collective_errc::peer_closed, -1,
                                                "a member is re-forming the group (a failure this rank has not seen)")));
@@ -1156,6 +1166,7 @@ private:
     std::vector<std::size_t> notice_got_;
     std::vector<char> ctrl_open_;                    // still worth reading
     bool adopted_ = false;                           // the failure in hand came from another rank's notice
+    std::optional<collective_error> deferred_;       // a notice about the next collective, held until then
     std::vector<char> heard_;                        // a progress notice arrived from this rank
     bool moved_ = false;                             // bytes moved since the last progress notice
     detail::collective::clock::time_point noted_{};  // when this rank last sent its progress notices
@@ -1190,6 +1201,8 @@ private:
             return err(collective_error(collective_errc::bad_config, -1, "null buffer"));
         if (n > std::numeric_limits<std::size_t>::max() / elem)
             return err(collective_error(collective_errc::bad_config, -1, "buffer too large"));
+        if (deferred_)
+            return take_deferred();
         if (reform_asked_)
             return finish(err(collective_error(collective_errc::peer_closed, -1,
                                                "a member is re-forming the group (a failure this rank has not seen)")));
@@ -1354,12 +1367,18 @@ private:
             ++seq_;
             return r;
         }
+        if (deferred_ && !adopted_) {                    // the group was already failing: the held notice's blame
+            r = err(*deferred_);
+            adopted_ = true;
+        }
+        deferred_.reset();
         broken_ = r.unwrap_err_unchecked();
         if (!adopted_) {
             std::array<unsigned char, d::abort_size> note{};
             note[0] = static_cast<unsigned char>(d::abort_magic & 0xff);
             note[1] = static_cast<unsigned char>(d::abort_magic >> 8);
             note[2] = static_cast<unsigned char>(broken_->code());
+            note[3] = static_cast<unsigned char>(seq_ & 0xff);
             d::put32(note.data() + 4, broken_->peer() < 0 ? d::nobody : std::uint32_t(broken_->peer()));
             for (std::size_t q = 0; q < ctrl_.size(); ++q)
                 if (ctrl_[q].valid())
@@ -1409,14 +1428,36 @@ private:
             ctrl_open_[i] = 0;
             return fail(collective_errc::io_error, q, "garbage on the control connection");
         }
-        adopted_ = true;
         const auto c = static_cast<collective_errc>(code);
-        if (culprit == std::uint32_t(rank_))
-            return err(collective_error(c, q, who(q) + " gave up on this rank: " + to_string(c)));
-        if (culprit == d::nobody || culprit >= std::uint32_t(size_))
-            return err(collective_error(c, -1, who(q) + " failed: " + to_string(c)));
-        return err(collective_error(c, int(culprit), who(int(culprit)) + ": found by " + who(q) +
-                                                         ", which told every rank"));
+        auto told = [&] {
+            if (culprit == std::uint32_t(rank_))
+                return collective_error(c, q, who(q) + " gave up on this rank: " + to_string(c));
+            if (culprit == d::nobody || culprit >= std::uint32_t(size_))
+                return collective_error(c, -1, who(q) + " failed: " + to_string(c));
+            return collective_error(c, int(culprit), who(int(culprit)) + ": found by " + who(q) +
+                                                         ", which told every rank");
+        }();
+        if (std::uint8_t(b[3] - std::uint8_t(seq_ & 0xff)) == 1) {
+            // About the collective after this one: q finished this one, so everything it owes here is
+            // sent. Hold the notice for the next call, and read on.
+            if (!deferred_)
+                deferred_ = std::move(told);
+            notice_got_[i] = 0;
+            return read_notice(q);
+        }
+        adopted_ = true;
+        return err(std::move(told));
+    }
+
+    // A notice held from the last collective (see read_notice): the next call fails with its blame
+    collective_result<void> take_deferred()
+    {
+        if (!deferred_)
+            return ok();
+        auto e = std::move(*deferred_);
+        deferred_.reset();
+        adopted_ = true;
+        return finish(err(std::move(e)));
     }
 
     collective_result<void> fail(collective_errc code, int p, const std::string& detail) const
@@ -1802,6 +1843,7 @@ private:
         rank_ = int(std::find(members_.begin(), members_.end(), slot_) - members_.begin());
         seq_ = 0;
         adopted_ = false;
+        deferred_.reset();
         reform_asked_ = false;
         drop_mesh();
         links_.resize(members_.size());

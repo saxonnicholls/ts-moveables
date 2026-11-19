@@ -740,13 +740,13 @@ c->barrier();
   collective together. Which rounds count after a rank died mid-collective is the caller's to settle (see the header
   comment). Deadlines: `probe_timeout`, `gather_window`, `reform_timeout`, `join_timeout`.
 
-`make test-collective` runs 29 tests: 1, 2, 3 and 5 ranks over 0, 1, N-1, N+1 and 10,000,007 floats whose sum
+`make test-collective` runs 30 tests: 1, 2, 3 and 5 ranks over 0, 1, N-1, N+1 and 10,000,007 floats whose sum
 provably depends on the order of addition, each rank's result compared bit for bit with the sequential reference;
 segments of one float, so the reduction ring wraps thousands of times; broadcast from every root; a barrier held by a late rank;
 fifteen collectives in a row; a different run id, a different world size and a stray connection; mismatched calls;
 a rank that never calls (`timed_out`, naming it, within `io_timeout`); and a rank in a forked process killed in the
 middle of an allreduce (every survivor names it, in milliseconds); the bfloat16 all-reduce on 1 to 5 ranks against
-its reference, specials included; a 2 MB/s buffering link with `io_timeout` 400 ms; and elastic membership: a rank
+its reference, specials included; a 2 MB/s buffering link with `io_timeout` 400 ms; a rank still receiving a collective that the others finished and then failed the next one in (it completes, and its next call takes their blame); and elastic membership: a rank
 that leaves is seen by `poll()`, the survivors re-form, a joiner of another run is refused, the slot rejoins; slot 0
 leaving; a middle slot leaving and rejoining (the rank above it dials the joiner); a process killed mid-allreduce and a new process for its slot admitted, every epoch's sums compared with its
 membership's reference; and `all_to_all_v` on 1 to 5 ranks (empty, random and skewed segments, float, bfloat16 and

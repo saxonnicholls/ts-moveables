@@ -35,6 +35,9 @@
 //      for bit; 64 MB each way at once; bad arguments; counts, element types or
 //      sizes or collectives that disagree are mismatched calls; a peer killed
 //      mid-exchange; a slow link; an all-to-all in each of two elastic epochs
+//    - an abort notice about the next collective does not fail the one a rank
+//      is still receiving (every byte of it already sent): it completes, and
+//      the next call fails with the notice's blame
 //
 
 #include "../test_helpers.hpp"
@@ -1320,6 +1323,45 @@ void test_all_to_all_v_slow_link()
     pass("collective: all_to_all_v over a slow, buffering link is progress, not a stall");
 }
 
+// A rank can be a collective ahead of another: in an all-to-all where rank 0 only receives, ranks 1 and 2 finish
+// while rank 2's rows to rank 0 still crawl over a slow, buffering link; then they fail the next collective between
+// themselves (a mismatched call) and tell every rank. Rank 0, still receiving and with all of it already sent,
+// completes the all-to-all with the reference's bits, and its next call fails with the blame the others gave
+void test_notice_about_the_next_collective_waits()
+{
+    auto j = make_job(3, 68);
+    throttle t(j.listeners[0].port(), 4'000'000);
+    j.cfgs[2].peers[0] = "127.0.0.1:" + std::to_string(t.front.port());
+    for (auto& c : j.cfgs) c.io_timeout = 5s;
+    const a2a_plan plan({{1, 0, 0}, {0, 1, 3}, {1'000'000, 3, 1}}, 1);
+    std::vector<int> good(3, 0);
+    std::vector<collective_errc> next(3);
+    std::atomic<int> done{0};
+    run_ranks(j, [&](int r, collective_result<collective>& c) {
+        assert(c.is_ok());
+        const std::size_t k = std::size_t(r);
+        std::vector<std::vector<float>> send_f;
+        for (int q = 0; q < 3; ++q) send_f.push_back(values(q, plan.sent(std::size_t(q)), 9));
+        const auto expect = moe_all_to_all_reference(send_f, plan.row_offsets, 1);
+        std::vector<float> got(expect[k].size());
+        const auto a = c->all_to_all_v(send_f[k].data(), plan.send_counts(k), plan.send_offsets(k), got.data(),
+                                       plan.recv_counts(k), plan.recv_offsets(k));
+        if (a.is_err()) std::cerr << "      rank " << r << " all_to_all_v: " << a.unwrap_err_unchecked().what() << "\n";
+        const bool ok = a.is_ok() && same_bits(got, expect[k]);
+        std::vector<float> w(3, 1.0f);
+        const auto e = r == 2 ? c->broadcast(w.data(), w.size(), 2) : c->barrier();
+        next[k] = e.is_err() ? e.unwrap_err_unchecked().code() : collective_errc{};
+        good[k] = ok && e.is_err();
+        done.fetch_add(1);
+        while (done.load() < 3) std::this_thread::sleep_for(5ms);    // nobody closes before every rank has its answer
+    });
+    for (int r = 0; r < 3; ++r) {
+        assert(good[std::size_t(r)] == 1);
+        assert(next[std::size_t(r)] == collective_errc::mismatched_call);
+    }
+    pass("collective: a notice about the next collective waits; the collective still in flight completes");
+}
+
 // Elastic: an all-to-all in epoch 0 over three ranks; one leaves; the survivors reform and the all-to-all of epoch
 // 1 is the reference over the two members
 void test_all_to_all_v_elastic()
@@ -1399,6 +1441,7 @@ int main(int argc, char** argv)
     run("all_to_all_v_errors", test_all_to_all_v_errors);
     run("all_to_all_v_large_two_way", test_all_to_all_v_large_two_way);
     run("all_to_all_v_slow_link", test_all_to_all_v_slow_link);
+    run("notice_about_the_next_collective_waits", test_notice_about_the_next_collective_waits);
     run("all_to_all_v_elastic", test_all_to_all_v_elastic);
     std::cout << "\ncollective: all " << tests_run << " tests passed\n";
     return 0;

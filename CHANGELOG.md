@@ -43,6 +43,12 @@ git tag, and `make check-version` fails if those three ever disagree.
 - **Handshake version 2** (56 bytes: the epoch and a digest of the members) and a 40-byte op header (with the
   epoch). Ranks of 1.9.0 and of 1.10.0 do not mesh together: upgrade every rank of a job at once. `sequence()`
   counts the collectives of the current epoch.
+- **An abort notice names its collective** (the low byte of its sequence number). A rank can be one collective
+  ahead of another: it finished collective s, whose last bytes are still on their way to a slower rank, and then
+  failed in s + 1. The slower rank used to fail s too on that notice, though every byte of s was sent, so its result
+  was lost and the ranks disagreed about how far the group got (seen as flaky elastic tests under load: the survivors
+  of a departure reformed from different collectives). Now a notice about the next collective is held: s completes,
+  and the next call (or `poll()`) fails with the notice's blame; a failure of s itself takes that blame too.
 - **Pins snicholls-core v0.16.0** (`third_party/core`, was v0.9.0; through v0.15.0), so a build that carries this
   library beside core 0.16.0 reaches one core version (core's diamond rule). No API change follows from it;
   `snicholls_core_require` stays at 0.8.0.
