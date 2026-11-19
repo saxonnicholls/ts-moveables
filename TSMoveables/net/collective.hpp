@@ -17,6 +17,7 @@
 //
 //      c->broadcast(weights.data(), weights.size(), 0);       // rank 0's initial weights everywhere
 //      c->allreduce_sum(grads.data(), grads.size());          // every rank: the same sum, bit for bit
+//      c->allreduce_sum_bf16(bits.data(), bits.size());       // the same over bfloat16, half the bytes
 //      c->barrier();
 //
 //  ------------------------------------------------------------- the sum
@@ -32,6 +33,20 @@
 //  same thing) can check it bit for bit. Floating-point addition is not
 //  associative, so this is a real constraint: a ring allreduce gives each
 //  element a different summation order depending on which rank owns its chunk.
+//
+//  allreduce_sum_bf16(bits, n) is the same over bfloat16 values (the 16-bit
+//  patterns of snicholls-core's ml::bfloat16): every rank ends with, per element,
+//
+//      bf16( ((f(x_0) + f(x_1)) + f(x_2)) + ... + f(x_{N-1}) )
+//
+//  where f decodes a bfloat16 to float exactly, the sum is in float in rank
+//  order (core's ml::ordered_sum_bf16), and bf16 rounds it to nearest even
+//  (core's ml::to_bfloat16) once, at the rank that owns the chunk. bfloat16
+//  travels both ways - the pieces to the owner and the reduced chunks back - so
+//  each rank moves exactly half the bytes of allreduce_sum for the same n (the
+//  40-byte headers aside). The sum's one rounding is the price; a caller that
+//  divides by N for a mean does so after (core's ml::ordered_mean_bf16 is that
+//  mean). NaN comes back quiet; infinities add as float adds them.
 //
 //  ------------------------------------------------------------ the algorithm
 //
@@ -89,7 +104,61 @@
 //
 //  After any failure the collective is broken: the streams may be mid-message,
 //  so every later call returns `broken`. Destroy it (that closes the sockets)
-//  and connect again.
+//  and connect again - or, in an elastic collective, reform() (below).
+//
+//  A slow link is not a stall. A rank whose last bytes sit in its socket and
+//  tunnel buffers finishes a collective and waits in the next one while its
+//  peer is still receiving the last; over a slow, buffering link (an ssh tunnel
+//  at 0.1 Mbit/s) that wait can outlast io_timeout with nothing wrong. So a
+//  rank moving bytes in a collective sends every other rank an 8-byte progress
+//  notice on the control connection, at most every io_timeout / 4, and a rank
+//  that hears one restarts its stall clock for that peer. A frozen or dead peer
+//  sends none, and is still named at io_timeout.
+//
+//  ---------------------------------------------------------- re-formation
+//
+//  With cfg.elastic, a failure need not end the job. cfg.rank is then the
+//  rank's slot, its fixed place in cfg.peers; the membership is a list of
+//  slots and an epoch (0 at connect), and rank() is the slot's position in the
+//  list. Every rank listens, the last too, and keeps its listener.
+//
+//  - reform(), on every survivor after a failure: each dials the members of the
+//    old epoch below its own slot, lowest first, and registers with the first
+//    that answers (naming the rank its failure blamed). One that finds no lower
+//    member alive is the coordinator. It waits until every old member has
+//    registered or has been blamed by a registered one - at once, usually: the
+//    abort notices make every survivor blame the same rank - or until
+//    gather_window, then sends each registered survivor the new membership:
+//    the survivors in slot order, epoch + 1. Ranks are dense again, in the old
+//    order. A survivor too late for that is told it is excluded, and joins.
+//  - join(), on a restarted rank: it dials the other slots, lowest first, with
+//    the run id, until the rendezvous - rank 0 of the current epoch, the lowest
+//    live slot - holds it. Another run id is refused. It waits there.
+//  - admit(), collective, on every member at a round boundary: rank 0 says which
+//    joiners it holds (a small broadcast, so it is a barrier too). With any, the
+//    members and the joiners move to epoch + 1 together. Joiners enter only
+//    here, never in the middle of a collective.
+//  - poll(), between collectives (each training step): sees a failure without
+//    waiting for the next collective (a notice, a closed connection, a survivor
+//    registering) and lets the rendezvous take joiners' requests; a group
+//    re-forming waits for every survivor's next poll().
+//
+//  Every mesh connection's handshake carries the epoch and a digest of the
+//  members, and every op header the epoch, so two ranks holding different
+//  memberships never connect, let alone run a collective together: every
+//  collective in an epoch is the reference over that epoch's members. What is
+//  agreed is the membership, not the data: when a rank dies at the very end of
+//  a collective, some survivors may have completed it and others not. The
+//  caller settles which rounds count (ts-moveables cannot: it does not know what
+//  a round is) - for example with a small allreduce after the re-formation, in
+//  which each member says what it holds.
+//
+//  Limits: the coordinator is chosen by who answers, so a network partition
+//  (not a death) can split the group in two, each re-forming on its own;
+//  min_members (a majority, say) refuses the smaller side. A coordinator that
+//  dies during a re-formation leaves its registrants with an error (they call
+//  reform() again). Deadlines: probe_timeout to dial one rank, gather_window,
+//  reform_timeout for the whole of reform(), join_timeout for join().
 //
 //  Results are snicholls::result<T, collective_error>, as in fs/ and
 //  http::client; collective_error is a std::runtime_error whose what() names
@@ -102,6 +171,8 @@
 //    compile: it may reassociate the sum.
 //  - One thread at a time per collective. Ranks are processes (or threads)
 //    each with their own collective.
+//  - The handshake is version 2 (56 bytes, with the epoch and the members'
+//    digest), so ranks of 1.9.0 and later releases do not mesh together.
 //  - No encryption or authentication beyond the run id: run it on a network
 //    you trust.
 //
