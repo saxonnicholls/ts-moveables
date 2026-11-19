@@ -619,16 +619,17 @@ struct throttle {
     std::uint16_t back = 0;
     std::size_t rate = 0;
     std::atomic<bool> stop{false};
-    std::vector<std::thread> ts;
+    std::vector<std::thread> pumps;   // touched by the acceptor only, until it is joined
+    std::thread acceptor;
 
     throttle(std::uint16_t to, std::size_t bytes_per_second) : back(to), rate(bytes_per_second)
     {
-        ts.emplace_back([this] {
+        acceptor = std::thread([this] {
             while (!stop) {
                 auto a = front.accept(50ms);
                 if (!a.valid()) continue;
                 auto b = snicholls::net::tcp_stream::connect("127.0.0.1", back, 2s);
-                ts.emplace_back([this, a = std::move(a), b = std::move(b)]() mutable { pump(a, b); });
+                pumps.emplace_back([this, a = std::move(a), b = std::move(b)]() mutable { pump(a, b); });
             }
         });
     }
@@ -663,7 +664,8 @@ struct throttle {
     ~throttle()
     {
         stop = true;
-        for (std::size_t i = 0; i < ts.size(); ++i) ts[i].join();
+        acceptor.join();
+        for (auto& t : pumps) t.join();
     }
 };
 
