@@ -903,7 +903,9 @@ void test_elastic_rendezvous_leaves()
 }
 
 // Processes: slot 2 is killed in the middle of an allreduce; slots 0 and 1 (threads here) re-form and
-// continue; a second process for slot 2, forked at the start and waiting, then joins and is admitted
+// continue; a second process for slot 2, forked at the start and waiting, then joins and is admitted.
+// Slot 1 calls the allreduce only once slot 2 is dead, so the allreduce cannot complete before the kill
+// however fast the machine: slots 0 and 2 are moving bytes when it lands
 void test_elastic_killed_and_rejoined()
 {
     auto j = make_job(3, 55);
@@ -943,6 +945,12 @@ void test_elastic_killed_and_rejoined()
     }
     ::close(go[0]);
     j.listeners[2].close();
+    int killed_status = 0;
+    std::atomic<bool> dead{false};
+    std::thread watcher([&] {
+        ::waitpid(killed, &killed_status, 0);
+        dead = true;
+    });
     std::vector<int> good(2, 0);
     std::vector<std::thread> ts;
     for (int r = 0; r < 2; ++r)
@@ -952,16 +960,18 @@ void test_elastic_killed_and_rejoined()
             auto c = std::move(made).unwrap();
             bool ok = round_ok(c, 1001, 0);
             std::vector<float> v(big, 1.0f);
+            if (r == 1)
+                while (!dead) std::this_thread::sleep_for(1ms);
             const auto res = c.allreduce_sum(v.data(), v.size());
+            if (res.is_err() && res.unwrap_err_unchecked().peer() != 2)
+                std::cerr << "      slot " << r << " allreduce: " << res.unwrap_err_unchecked().what() << "\n";
             ok = ok && res.is_err() && res.unwrap_err_unchecked().peer() == 2;
             const auto f = c.reform();
             if (f.is_err()) std::cerr << "      slot " << r << " reform: " << f.unwrap_err_unchecked().what() << "\n";
             ok = ok && f.is_ok() && c.epoch() == 1 && c.size() == 2;
             ok = ok && round_ok(c, 1001, 1);
             if (r == 0) {
-                int status = 0;
-                ::waitpid(killed, &status, 0);
-                ok = ok && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+                ok = ok && dead && WIFSIGNALED(killed_status) && WTERMSIG(killed_status) == SIGKILL;
                 ok = ok && ::write(go[1], "g", 1) == 1;
             }
             ok = ok && admit_until_joined(c, 3) && c.epoch() == 2;
@@ -969,6 +979,7 @@ void test_elastic_killed_and_rejoined()
             good[std::size_t(r)] = ok;
         });
     for (auto& t : ts) t.join();
+    watcher.join();
     ::close(go[1]);
     int status = 0;
     ::waitpid(rejoiner, &status, 0);
