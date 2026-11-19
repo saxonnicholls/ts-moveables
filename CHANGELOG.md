@@ -7,7 +7,7 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
-## [Unreleased]
+## [1.10.0] — 2026-11-19
 
 ### Added
 
@@ -41,8 +41,11 @@ git tag, and `make check-version` fails if those three ever disagree.
   run over a slow, buffering link (an ssh tunnel at 0.1 Mbit/s) failed with `timed_out`: a rank that had finished a
   collective waited in the next one while its peer was still receiving.
 - **Handshake version 2** (56 bytes: the epoch and a digest of the members) and a 40-byte op header (with the
-  epoch). Ranks of 1.9.0 and of this release do not mesh together. `sequence()` counts the collectives of the
-  current epoch.
+  epoch). Ranks of 1.9.0 and of 1.10.0 do not mesh together: upgrade every rank of a job at once. `sequence()`
+  counts the collectives of the current epoch.
+- **Pins snicholls-core v0.16.0** (`third_party/core`, was v0.9.0; through v0.15.0), so a build that carries this
+  library beside core 0.16.0 reaches one core version (core's diamond rule). No API change follows from it;
+  `snicholls_core_require` stays at 0.8.0.
 
 ## [1.9.0] — 2026-11-19
 
@@ -621,7 +624,7 @@ nothing that worked in 1.2.1 behaves differently.
   immovable and each given its reason.
 
 - **What an HTTP engine behind someone else's interface needs**, found by
-  building one: the TSMoveables engine behind asoMonoRepo1's
+  building one: the TSMoveables engine behind an application's
   `HttpServerInterface`, measured against its httplib engine.
   - `response_stream::abort()` ends a streamed body as a failure. `end()` sends
     the terminal chunk, which makes a broken SSE feed look finished. On
@@ -1192,6 +1195,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.10.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.10.0
 [1.9.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.9.0
 [1.8.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.8.0
 [1.7.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.7.0

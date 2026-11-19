@@ -416,7 +416,7 @@ The structural expectation for the head-to-head was that a reactor holds the C10
 
 ### A first real consumer: an engine behind someone else's interface
 
-`HTTP_ENGINE_WORK_ORDER.md` asked for the server behind asoMonoRepo1's
+`HTTP_ENGINE_WORK_ORDER.md` asked for the server behind an application's
 `HttpServerInterface`, an httplib-shaped contract with synchronous handlers
 that may block, std::regex routing and a pull-model chunked provider. The
 engine lives in that repo, at
