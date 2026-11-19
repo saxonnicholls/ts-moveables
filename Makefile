@@ -8,7 +8,7 @@
 #   make asan    build and run the unit tests under Address+UB Sanitizers
 #   make demo    build and run the demo (same code as the Xcode target)
 #   make demo-remote  remote execution: client and workers over loopback (C++20, POSIX)
-#   make test-collective  allreduce, broadcast and barrier over TCP (C++20, POSIX)
+#   make test-collective  allreduce, broadcast, barrier and all-to-all over TCP (C++20, POSIX)
 #   make clean
 #
 #   make test STD=c++17    any target can be built against a different standard
@@ -395,7 +395,7 @@ asan-client: build/tests_http_client_asan
 	./build/tests_http_client_asan
 
 # Collectives over TCP (TSMoveables/net/collective.hpp): a full mesh, allreduce_sum in rank
-# order, broadcast and barrier. C++20 and POSIX, like http::client, so a program of its own.
+# order, broadcast, barrier and all_to_all_v. C++20 and POSIX, like http::client, so a program of its own.
 # The tests run 1 to 5 ranks as threads on 127.0.0.1 (one is a forked process, killed);
 # the demo runs ranks as processes; the benchmark moves 0.5 GB on 2 and 4 processes.
 COLL_HDRS := TSMoveables/net/collective.hpp TSMoveables/net/tcp.hpp

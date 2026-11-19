@@ -682,6 +682,8 @@ if (c.is_err()) die(c.unwrap_err_unchecked().what());               // names the
 
 c->broadcast(weights.data(), weights.size(), 0);    // rank 0's initial weights, everywhere
 c->allreduce_sum(grads.data(), grads.size());       // ((g_0 + g_1) + g_2) + ... in rank order, in float
+c->all_to_all_v(rows, send_counts, send_offsets,    // rank r's segment for each rank, and each rank's
+                got, recv_counts, recv_offsets);    // segment for r, in rank order (expert parallelism)
 c->barrier();
 ```
 
@@ -720,6 +722,14 @@ c->barrier();
   pieces to float, adds them in rank order in float, and rounds the sum to bfloat16 once, to nearest even (core's
   `ml::to_bfloat16`), so every rank holds `bf16(ordered_sum_bf16)` bit for bit. It moves exactly half the bytes of
   the float all-reduce, because bfloat16 travels in both phases.
+- **All-to-all** (`all_to_all_v`, MPI's Alltoallv): each rank sends every rank its own segment of the caller's
+  buffer and receives one from each, counts and offsets in elements, over `float`, bfloat16 bits or any element size.
+  It is expert parallelism's dispatch and combine: with the receive offsets the prefix sums of the counts, every rank
+  gets the segments for it in source order, which is snicholls-core's `ml::moe_all_to_all` bit for bit. Segments go
+  straight between the caller's buffers, both directions of every pair at once, so memory does not grow with the
+  sizes and two ranks sending each other gigabytes do not deadlock. Each pair's header carries the count for its
+  receiver, checked against the count the receiver expects before any element lands (`exchange_counts` tells each
+  rank what to expect), so a disagreement is a `mismatched_call`, not rows in the wrong place.
 - **Elastic membership** (`cfg.elastic`; `cfg.rank` is then the rank's fixed *slot* in `peers`). After a failure the
   survivors call `reform()`. Each registers with the lowest live slot below it; the lowest of them coordinates and
   sends the new membership (the survivors in slot order, the epoch one higher). Ranks are renumbered densely in the
@@ -730,7 +740,7 @@ c->barrier();
   collective together. Which rounds count after a rank died mid-collective is the caller's to settle (see the header
   comment). Deadlines: `probe_timeout`, `gather_window`, `reform_timeout`, `join_timeout`.
 
-`make test-collective` runs 23 tests: 1, 2, 3 and 5 ranks over 0, 1, N-1, N+1 and 10,000,007 floats whose sum
+`make test-collective` runs 29 tests: 1, 2, 3 and 5 ranks over 0, 1, N-1, N+1 and 10,000,007 floats whose sum
 provably depends on the order of addition, each rank's result compared bit for bit with the sequential reference;
 segments of one float, so the reduction ring wraps thousands of times; broadcast from every root; a barrier held by a late rank;
 fifteen collectives in a row; a different run id, a different world size and a stray connection; mismatched calls;
@@ -739,7 +749,11 @@ middle of an allreduce (every survivor names it, in milliseconds); the bfloat16 
 its reference, specials included; a 2 MB/s buffering link with `io_timeout` 400 ms; and elastic membership: a rank
 that leaves is seen by `poll()`, the survivors re-form, a joiner of another run is refused, the slot rejoins; slot 0
 leaving; a middle slot leaving and rejoining (the rank above it dials the joiner); a process killed mid-allreduce and a new process for its slot admitted, every epoch's sums compared with its
-membership's reference. `make demo-collective` runs four processes
+membership's reference; and `all_to_all_v` on 1 to 5 ranks (empty, random and skewed segments, float, bfloat16 and
+whole rows as bytes, the counts given or exchanged, and back again) against a re-implementation of core's
+`ml::moe_all_to_all`, bit for bit; 64 MB each way between two ranks at once; bad arguments and four kinds of
+mismatched call; a rank killed in the middle of one; a 2 MB/s buffering link; and an all-to-all in each of two
+elastic epochs. `make demo-collective` runs four processes
 through a broadcast and five training steps; `collective_demo rank R host:port,...` runs one rank of a real job.
 
 `make bench-collective` moves 0.5 GB between processes on loopback (Xeon W-3245, macOS 26, `-O3`, 2026-11-19):
@@ -748,6 +762,10 @@ through a broadcast and five training steps; `collective_demo rank R host:port,.
 |---:|---:|---:|---:|---:|---:|
 | 2 | 0.734 s | 0.73 | 0.73 | 0.290 s | 1.85 |
 | 4 | 1.171 s | 0.46 | 0.69 | 0.541 s | 0.99 |
+
+`all_to_all_v` with the buffer cut into N equal segments (the same machine and build, 2026-11-19, load average about
+70): 0.180 s with two ranks and 0.464 s with four, 1.49 and 0.87 GB/s of what each rank sends ((N-1)/N of the buffer);
+in the same run the allreduce took 0.363 s and 0.860 s.
 
 algbw is the buffer over the time; busbw is what each rank sends (2(N-1)/N of the buffer) over the time. The
 machine was shared (load average near 100 on 32 threads), so these are floors; with 128 MiB on a quieter moment two

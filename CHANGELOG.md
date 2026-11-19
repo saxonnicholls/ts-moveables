@@ -11,6 +11,17 @@ git tag, and `make check-version` fails if those three ever disagree.
 
 ### Added
 
+- **`collective::all_to_all_v`**, the all-to-all with a count for every pair (MPI's Alltoallv), for expert
+  parallelism's dispatch and combine: this rank's segment `[send_offsets[q], + send_counts[q])` goes to rank `q`, and
+  rank `q`'s segment for this rank lands at `[recv_offsets[q], + recv_counts[q])`. Over `float`, bfloat16 bits
+  (`std::uint16_t`) or any element size (`const void*`, `element_size`). With `recv_offsets` the prefix sums of
+  `recv_counts` every rank receives the segments for it in source order, which is snicholls-core's
+  `ml::moe_all_to_all` bit for bit. Each pair's header carries the count for its receiver, which checks it against
+  the count it expects before any element lands: counts that disagree, another element type or size, or another
+  collective are a `mismatched_call` naming the peer. Segments go straight between the caller's buffers both ways at
+  once (no staging, no deadlock), with the stall deadline, progress notices, abort notices and elastic epochs of the
+  other collectives. `exchange_counts(send_counts, recv_counts)` tells each rank what the others will send it, and an
+  overload taking `std::vector`s exchanges the counts first and packs what arrives in source order.
 - **`collective::allreduce_sum_bf16(std::uint16_t*, n)`**: the all-reduce over bfloat16 bits. Every rank ends with
   `bf16(((f(x_0) + f(x_1)) + ...) + f(x_{N-1}))`: exact decoding, a float sum in rank order, one rounding to
   nearest even at the chunk's owner (snicholls-core's `ml::ordered_sum_bf16` and `ml::to_bfloat16`). It moves exactly

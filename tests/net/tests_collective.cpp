@@ -29,6 +29,12 @@
 //      leaving; a joiner with another run id refused - and every collective in
 //      every epoch is the same bits on every member and the reference for that
 //      epoch's membership
+//    - all_to_all_v on 1 to 5 ranks (empty, random and skewed segments; float,
+//      bfloat16 and whole rows as bytes; counts given or exchanged; and back)
+//      equals a re-implementation of snicholls-core's ml::moe_all_to_all bit
+//      for bit; 64 MB each way at once; bad arguments; counts, element types or
+//      sizes or collectives that disagree are mismatched calls; a peer killed
+//      mid-exchange; a slow link; an all-to-all in each of two elastic epochs
 //
 
 #include "../test_helpers.hpp"
@@ -42,6 +48,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <signal.h>
@@ -963,6 +970,398 @@ void test_elastic_requires_elastic()
     });
     pass("collective: reform() and admit() need an elastic collective; poll() is a no-op without one");
 }
+
+// ------------------------------------------------------------ all_to_all_v
+
+// Rows each source sends each destination: rows[s][q]. Patterns: 0 all empty; 1 random with about a quarter
+// empty, self included; 2 skewed: every source sends nearly everything to rank 0 and one row to the last rank
+std::vector<std::vector<std::size_t>> a2a_rows(int P, int pattern, std::uint64_t seed, std::size_t most = 9)
+{
+    std::uint64_t st = seed;
+    std::vector<std::vector<std::size_t>> rows(std::size_t(P), std::vector<std::size_t>(std::size_t(P), 0));
+    for (int s = 0; s < P; ++s)
+        for (int q = 0; q < P; ++q) {
+            auto& n = rows[std::size_t(s)][std::size_t(q)];
+            if (pattern == 1) {
+                const auto z = splitmix(st);
+                n = z % 4 == 0 ? 0 : std::size_t(z >> 8) % (most + 1);
+            } else if (pattern == 2) {
+                n = q == 0 ? most * 50 + std::size_t(s) : q == P - 1 ? 1 : 0;
+            }
+        }
+    return rows;
+}
+
+// snicholls-core's ml::moe_all_to_all (ml/expert_parallel.hpp), re-implemented: destination r receives, in source
+// order, each source's rows [send_offsets[s][r], send_offsets[s][r + 1]) of `width` elements
+template <class T>
+std::vector<std::vector<T>> moe_all_to_all_reference(const std::vector<std::vector<T>>& send,
+                                                     const std::vector<std::vector<std::uint32_t>>& send_offsets, std::size_t width)
+{
+    const std::size_t ranks = send.size();
+    std::vector<std::vector<T>> receive(ranks);
+    for (std::size_t r = 0; r < ranks; ++r)
+        for (std::size_t s = 0; s < ranks; ++s)
+            for (std::size_t i = std::size_t(send_offsets[s][r]) * width; i < std::size_t(send_offsets[s][r + 1]) * width; ++i)
+                receive[r].push_back(send[s][i]);
+    return receive;
+}
+
+// One all-to-all of a whole job, as the ranks see it: what rank r sends (rows of `width` elements, destination after
+// destination), its counts and offsets each way in elements, and the reference's offsets in rows
+struct a2a_plan {
+    std::size_t width = 0;
+    std::vector<std::vector<std::size_t>> rows;
+    std::vector<std::vector<std::uint32_t>> row_offsets;   // per source, P + 1 (core's send offsets)
+
+    a2a_plan(std::vector<std::vector<std::size_t>> r, std::size_t w) : width(w), rows(std::move(r))
+    {
+        for (const auto& per : rows) {
+            std::vector<std::uint32_t> o{0};
+            for (const auto n : per) o.push_back(o.back() + std::uint32_t(n));
+            row_offsets.push_back(o);
+        }
+    }
+    std::size_t ranks() const { return rows.size(); }
+    std::size_t sent(std::size_t r) const { return row_offsets[r].back() * width; }
+    std::vector<std::size_t> send_counts(std::size_t r) const
+    {
+        std::vector<std::size_t> c;
+        for (const auto n : rows[r]) c.push_back(n * width);
+        return c;
+    }
+    std::vector<std::size_t> send_offsets(std::size_t r) const
+    {
+        std::vector<std::size_t> o;
+        for (std::size_t q = 0; q < ranks(); ++q) o.push_back(row_offsets[r][q] * width);
+        return o;
+    }
+    std::vector<std::size_t> recv_counts(std::size_t r) const
+    {
+        std::vector<std::size_t> c;
+        for (std::size_t s = 0; s < ranks(); ++s) c.push_back(rows[s][r] * width);
+        return c;
+    }
+    std::vector<std::size_t> recv_offsets(std::size_t r) const   // packed in source order
+    {
+        std::vector<std::size_t> o;
+        std::size_t at = 0;
+        for (const auto n : recv_counts(r)) {
+            o.push_back(at);
+            at += n;
+        }
+        return o;
+    }
+};
+
+template <class T>
+bool same_bytes(const std::vector<T>& a, const std::vector<T>& b)
+{
+    return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
+}
+
+// Every way of calling it on one plan, each checked bit for bit against the reference: float with the counts given;
+// bfloat16 with the counts exchanged first; whole rows as elements of 4 * width bytes; and the way back (each
+// received segment returned to its source), which restores every rank's send buffer
+bool a2a_rank(collective& c, const a2a_plan& plan, std::uint64_t seed, const std::vector<std::vector<float>>& expect_f,
+              const std::vector<std::vector<std::uint16_t>>& expect_h)
+{
+    const std::size_t r = std::size_t(c.rank());
+    const auto send = values(int(r), plan.sent(r), seed);
+    const auto send_h = bf16_values(int(r), plan.sent(r), seed);
+    const auto sc = plan.send_counts(r), so = plan.send_offsets(r), rc = plan.recv_counts(r), ro = plan.recv_offsets(r);
+    auto report = [&](const char* what, const collective_result<void>& e) {
+        if (e.is_err()) std::cerr << "      rank " << r << " " << what << ": " << e.unwrap_err_unchecked().what() << "\n";
+        return e.is_ok();
+    };
+
+    std::vector<std::size_t> counted(plan.ranks());
+    bool ok = report("exchange_counts", c.exchange_counts(sc, counted)) && counted == rc;
+
+    std::vector<float> got(expect_f[r].size(), -1.0f);
+    ok = ok && report("float", c.all_to_all_v(send.data(), sc, so, got.data(), rc, ro)) && same_bits(got, expect_f[r]);
+
+    std::vector<std::uint16_t> got_h;
+    std::vector<std::size_t> hc, ho;
+    ok = ok && report("bfloat16", c.all_to_all_v(send_h.data(), sc, so, got_h, hc, ho)) && same_bytes(got_h, expect_h[r]) &&
+         hc == rc && ho == ro;
+
+    std::vector<std::size_t> rsc, rso, rrc, rro;     // in rows, each row one element of 4 * width bytes
+    for (std::size_t q = 0; q < plan.ranks(); ++q) {
+        rsc.push_back(sc[q] / plan.width);
+        rso.push_back(so[q] / plan.width);
+        rrc.push_back(rc[q] / plan.width);
+        rro.push_back(ro[q] / plan.width);
+    }
+    std::vector<float> rows_got(expect_f[r].size(), -1.0f);
+    ok = ok && report("bytes", c.all_to_all_v(send.data(), rsc, rso, rows_got.data(), rrc, rro, 4 * plan.width)) &&
+         same_bits(rows_got, expect_f[r]);
+
+    std::vector<float> back(send.size(), -1.0f);     // the combine: the way back, offsets swapped
+    ok = ok && report("back", c.all_to_all_v(got.data(), rc, ro, back.data(), sc, so)) && same_bits(back, send);
+    return ok;
+}
+
+void check_all_to_all(int P, int pattern, std::size_t width, std::uint64_t seed, std::size_t most = 9)
+{
+    const a2a_plan plan(a2a_rows(P, pattern, seed, most), width);
+    std::vector<std::vector<float>> send_f;
+    std::vector<std::vector<std::uint16_t>> send_h;
+    for (int r = 0; r < P; ++r) {
+        send_f.push_back(values(r, plan.sent(std::size_t(r)), seed));
+        send_h.push_back(bf16_values(r, plan.sent(std::size_t(r)), seed));
+    }
+    const auto expect_f = moe_all_to_all_reference(send_f, plan.row_offsets, width);
+    const auto expect_h = moe_all_to_all_reference(send_h, plan.row_offsets, width);
+    auto j = make_job(P);
+    std::vector<int> good(std::size_t(P), 0);
+    run_ranks(j, [&](int r, collective_result<collective>& c) {
+        assert(c.is_ok());
+        bool ok = a2a_rank(*c, plan, seed, expect_f, expect_h);
+        // An allreduce on the same mesh after the all-to-alls, as a training step mixes them
+        std::vector<std::vector<float>> xs;
+        for (int k = 0; k < P; ++k) xs.push_back(values(k, 1001, seed + 1));
+        auto mine = xs[std::size_t(r)];
+        ok = ok && c->allreduce_sum(mine.data(), mine.size()).is_ok() && same_bits(mine, rank_order_sum(xs));
+        ok = ok && c->sequence() == 7;   // counts, float, bfloat16 (two), bytes, back, allreduce
+        good[std::size_t(r)] = ok;
+    });
+    for (int r = 0; r < P; ++r) assert(good[std::size_t(r)] == 1);
+}
+
+void test_all_to_all_v()
+{
+    for (int P = 1; P <= 5; ++P) {
+        check_all_to_all(P, 0, 3, 11);           // every segment empty
+        check_all_to_all(P, 1, 3, 12);           // random, about a quarter empty
+        check_all_to_all(P, 1, 1, 13, 200);
+        check_all_to_all(P, 2, 6, 14);           // skewed: nearly everything to rank 0
+    }
+    // The reference itself, on a case worked by hand (core's test): two ranks, rows of width 2
+    const std::vector<std::vector<int>> s{{1, 1, 2, 2, 3, 3}, {4, 4, 5, 5}};
+    const auto got = moe_all_to_all_reference(s, {{0, 1, 3}, {0, 2, 2}}, 2);
+    assert(got[0] == (std::vector<int>{1, 1, 4, 4, 5, 5}) && got[1] == (std::vector<int>{2, 2, 3, 3}));
+    pass("collective: all_to_all_v on 1 to 5 ranks (empty, random and skewed segments; float, bfloat16, whole rows "
+         "as bytes; counts given or exchanged; and back) is core's moe_all_to_all bit for bit");
+}
+
+void test_all_to_all_v_large_two_way()
+{
+    // Two ranks sending each other 64 MB at once, far beyond any socket buffer: no deadlock, every bit there; then
+    // three ranks with nearly all of 3 x 24 MB going to rank 0
+    for (const auto& [P, pattern, most] : {std::tuple{2, 1, std::size_t(8'000'000)}, std::tuple{3, 2, std::size_t(120'000)}}) {
+        const a2a_plan plan(pattern == 1 ? std::vector<std::vector<std::size_t>>{{1, 16'000'000}, {16'000'000, 3}}
+                                         : a2a_rows(P, pattern, 21, most),
+                            1);
+        std::vector<std::vector<float>> send_f;
+        for (int r = 0; r < P; ++r) send_f.push_back(values(r, plan.sent(std::size_t(r)), 21));
+        const auto expect = moe_all_to_all_reference(send_f, plan.row_offsets, plan.width);
+        auto j = make_job(P);
+        std::vector<int> good(std::size_t(P), 0);
+        std::vector<double> took(static_cast<std::size_t>(P), 0.0);
+        run_ranks(j, [&](int r, collective_result<collective>& c) {
+            assert(c.is_ok());
+            const std::size_t k = std::size_t(r);
+            std::vector<float> got(expect[k].size());
+            const auto t0 = clock_type::now();
+            const auto res = c->all_to_all_v(send_f[k].data(), plan.send_counts(k), plan.send_offsets(k), got.data(),
+                                             plan.recv_counts(k), plan.recv_offsets(k));
+            took[k] = std::chrono::duration<double>(clock_type::now() - t0).count();
+            if (res.is_err()) std::cerr << "      rank " << r << ": " << res.unwrap_err_unchecked().what() << "\n";
+            good[k] = res.is_ok() && same_bits(got, expect[k]);
+        });
+        for (int r = 0; r < P; ++r) assert(good[std::size_t(r)] == 1);
+        std::cout << "      " << P << " ranks: " << took[0] << " s\n";
+    }
+    pass("collective: all_to_all_v of 64 MB each way between two ranks, and 3 ranks skewed to one, complete "
+         "bit for bit (non-blocking both ways, no staging)");
+}
+
+void test_all_to_all_v_errors()
+{
+    {   // bad arguments, before any byte moves; one rank needs no network
+        collective_config one;
+        one.peers = {"127.0.0.1:9"};
+        auto c = collective::connect(one);
+        assert(c.is_ok());
+        std::vector<float> a{1, 2, 3}, b(3);
+        const std::vector<std::size_t> three{3}, zero{0}, two{0, 0};
+        assert(c->all_to_all_v(a.data(), three, zero, b.data(), three, zero).is_ok() && same_bits(a, b));
+        assert(c->all_to_all_v(a.data(), two, two, b.data(), two, two).unwrap_err_unchecked().code() == collective_errc::bad_config);
+        const std::vector<std::size_t> two_elems{2};
+        assert(c->all_to_all_v(a.data(), three, zero, b.data(), two_elems, zero).unwrap_err_unchecked().code() ==
+               collective_errc::bad_config);   // sends itself 3, expects 2
+        assert(c->all_to_all_v(static_cast<const float*>(nullptr), three, zero, b.data(), three, zero).unwrap_err_unchecked().code() ==
+               collective_errc::bad_config);
+        assert(c->all_to_all_v(a.data(), three, zero, b.data(), three, zero, 0).unwrap_err_unchecked().code() ==
+               collective_errc::bad_config);
+        std::vector<std::size_t> counted(1);
+        assert(c->exchange_counts(three, counted).is_ok() && counted == three);
+        assert(c->exchange_counts(two, counted).unwrap_err_unchecked().code() == collective_errc::bad_config);
+        assert(!c->broken());
+        collective idle;
+        assert(idle.all_to_all_v(a.data(), three, zero, b.data(), three, zero).unwrap_err_unchecked().code() ==
+               collective_errc::bad_config);
+    }
+    // Calls that do not match, each a mismatched_call on both ranks naming the other, then broken: counts that
+    // disagree both ways; a float call against a bfloat16 one; 4-byte against 8-byte elements; against an allreduce
+    for (int kind = 0; kind < 4; ++kind) {
+        auto j = make_job(2);
+        std::vector<collective_errc> code(2);
+        std::vector<int> peer(2, -1), broken(2, 0);
+        run_ranks(j, [&](int r, collective_result<collective>& c) {
+            assert(c.is_ok());
+            std::vector<float> s(64, 1.0f), g(64);
+            std::vector<std::uint16_t> sh(64, 1), gh(64);
+            const std::vector<std::size_t> off{0, 16};   // in 8-byte elements too, inside the 256 bytes
+            const std::vector<std::size_t> cnt{4, 4};
+            collective_result<void> res = snicholls::ok();
+            if (kind == 0)
+                // rank 0 sends rank 1 four, which expects three; rank 1 sends rank 0 six, which expects five
+                res = c->all_to_all_v(s.data(), r == 0 ? cnt : std::vector<std::size_t>{6, 4}, off, g.data(),
+                                      r == 0 ? std::vector<std::size_t>{4, 5} : std::vector<std::size_t>{3, 4}, off);
+            else if (kind == 1)
+                res = r == 0 ? c->all_to_all_v(s.data(), cnt, off, g.data(), cnt, off)
+                             : c->all_to_all_v(sh.data(), cnt, off, gh.data(), cnt, off);
+            else if (kind == 2)
+                res = c->all_to_all_v(s.data(), cnt, off, g.data(), cnt, off, r == 0 ? 4 : 8);
+            else
+                res = r == 0 ? c->all_to_all_v(s.data(), cnt, off, g.data(), cnt, off) : c->allreduce_sum(s.data(), 8);
+            assert(res.is_err());
+            code[std::size_t(r)] = res.unwrap_err_unchecked().code();
+            peer[std::size_t(r)] = res.unwrap_err_unchecked().peer();
+            if (r == 0 && kind == 0) std::cout << "      " << res.unwrap_err_unchecked().what() << "\n";
+            broken[std::size_t(r)] = c->barrier().unwrap_err_unchecked().code() == collective_errc::broken;
+        });
+        for (int r = 0; r < 2; ++r)
+            assert(code[std::size_t(r)] == collective_errc::mismatched_call && peer[std::size_t(r)] == 1 - r && broken[std::size_t(r)]);
+    }
+    pass("collective: all_to_all_v refuses bad arguments; counts that disagree, another element type or size, or "
+         "another collective are a mismatched call on both ranks, then broken");
+}
+
+// A rank killed in the middle of a large all-to-all: an error naming it on every survivor, not a hang
+void test_all_to_all_v_killed_peer()
+{
+    auto j = make_job(3, 43);
+    for (auto& c : j.cfgs) c.io_timeout = 60s;
+    const std::size_t big = 20'000'000;              // per pair
+    const std::vector<std::size_t> cnt{big, big, big}, off{0, big, 2 * big};
+    const pid_t child = ::fork();
+    assert(child >= 0);
+    if (child == 0) {
+        j.listeners[0].close();
+        j.listeners[1].close();
+        auto c = collective::connect(j.cfgs[2], std::move(j.listeners[2]));
+        if (c.is_ok()) {
+            std::vector<float> s(3 * big, 1.0f), g(3 * big);
+            std::thread killer([] { std::this_thread::sleep_for(20ms); ::kill(::getpid(), SIGKILL); });
+            (void)c->all_to_all_v(s.data(), cnt, off, g.data(), cnt, off);
+            ::kill(::getpid(), SIGKILL);
+        }
+        ::_exit(3);
+    }
+    j.listeners[2].close();
+    std::vector<collective_errc> code(2);
+    std::vector<int> peer(2, -1);
+    std::vector<double> took(2);
+    std::vector<std::thread> ts;
+    for (int r = 0; r < 2; ++r)
+        ts.emplace_back([&, r] {
+            auto c = collective::connect(j.cfgs[std::size_t(r)], std::move(j.listeners[std::size_t(r)]));
+            assert(c.is_ok());
+            std::vector<float> s(3 * big, 1.0f), g(3 * big);
+            const auto t0 = clock_type::now();
+            const auto res = c->all_to_all_v(s.data(), cnt, off, g.data(), cnt, off);
+            took[std::size_t(r)] = std::chrono::duration<double>(clock_type::now() - t0).count();
+            assert(res.is_err());
+            std::cout << "      rank " << r << " after " << took[std::size_t(r)] << " s: " << res.unwrap_err_unchecked().what() << "\n";
+            code[std::size_t(r)] = res.unwrap_err_unchecked().code();
+            peer[std::size_t(r)] = res.unwrap_err_unchecked().peer();
+        });
+    for (auto& t : ts) t.join();
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    for (int r = 0; r < 2; ++r) {
+        assert(code[std::size_t(r)] == collective_errc::peer_closed || code[std::size_t(r)] == collective_errc::io_error);
+        assert(peer[std::size_t(r)] == 2);
+        assert(took[std::size_t(r)] < 30.0);
+    }
+    pass("collective: a peer killed in the middle of an all_to_all_v is an error naming it, not a hang");
+}
+
+// Over a slow, buffering link (2 MB/s one way, io_timeout 400 ms) an all-to-all of 4 MB a direction takes seconds:
+// the progress notices keep it from being called a stall
+void test_all_to_all_v_slow_link()
+{
+    auto j = make_job(2, 67);
+    throttle t(j.listeners[0].port(), 2'000'000);
+    j.cfgs[1].peers[0] = "127.0.0.1:" + std::to_string(t.front.port());
+    for (auto& c : j.cfgs) c.io_timeout = 400ms;
+    const a2a_plan plan({{5, 1'000'000}, {1'000'000, 7}}, 1);
+    std::vector<int> good(2, 0);
+    run_ranks(j, [&](int r, collective_result<collective>& c) {
+        assert(c.is_ok());
+        const std::size_t k = std::size_t(r);
+        bool ok = true;
+        for (std::uint64_t round = 0; round < 2 && ok; ++round) {
+            std::vector<std::vector<float>> send_f{values(0, plan.sent(0), round), values(1, plan.sent(1), round)};
+            const auto expect = moe_all_to_all_reference(send_f, plan.row_offsets, 1);
+            std::vector<float> got(expect[k].size());
+            const auto res = c->all_to_all_v(send_f[k].data(), plan.send_counts(k), plan.send_offsets(k), got.data(),
+                                             plan.recv_counts(k), plan.recv_offsets(k));
+            if (res.is_err()) std::cerr << "      rank " << r << ": " << res.unwrap_err_unchecked().what() << "\n";
+            ok = res.is_ok() && same_bits(got, expect[k]) && c->barrier().is_ok();
+        }
+        good[k] = ok;
+    });
+    assert(good[0] == 1 && good[1] == 1);
+    pass("collective: all_to_all_v over a slow, buffering link is progress, not a stall");
+}
+
+// Elastic: an all-to-all in epoch 0 over three ranks; one leaves; the survivors reform and the all-to-all of epoch
+// 1 is the reference over the two members
+void test_all_to_all_v_elastic()
+{
+    auto j = make_job(3, 79);
+    std::vector<int> good(3, 0);
+    std::vector<std::thread> ts;
+    const a2a_plan three(a2a_rows(3, 1, 31), 4), two(a2a_rows(2, 1, 32), 4);
+    auto expected = [](const a2a_plan& plan, std::uint64_t seed) {
+        std::vector<std::vector<float>> f;
+        std::vector<std::vector<std::uint16_t>> h;
+        for (std::size_t r = 0; r < plan.ranks(); ++r) {
+            f.push_back(values(int(r), plan.sent(r), seed));
+            h.push_back(bf16_values(int(r), plan.sent(r), seed));
+        }
+        return std::pair{moe_all_to_all_reference(f, plan.row_offsets, plan.width), moe_all_to_all_reference(h, plan.row_offsets, plan.width)};
+    };
+    const auto e3 = expected(three, 5), e2 = expected(two, 6);
+    for (int r = 0; r < 3; ++r)
+        ts.emplace_back([&, r] {
+            auto made = collective::connect(elastic_cfg(j, r), std::move(j.listeners[std::size_t(r)]));
+            assert(made.is_ok());
+            auto c = std::move(made).unwrap();
+            bool ok = a2a_rank(c, three, 5, e3.first, e3.second);
+            if (r == 2) {
+                c = collective{};                       // leaves
+                good[2] = ok;
+                return;
+            }
+            collective_result<void> p = snicholls::ok();
+            for (int k = 0; k < 200 && (p = c.poll()).is_ok(); ++k) std::this_thread::sleep_for(10ms);
+            ok = ok && p.is_err();
+            ok = ok && c.reform().is_ok() && c.epoch() == 1 && c.size() == 2;
+            ok = ok && a2a_rank(c, two, 6, e2.first, e2.second);
+            good[std::size_t(r)] = ok;
+        });
+    for (auto& t : ts) t.join();
+    for (int r = 0; r < 3; ++r) assert(good[std::size_t(r)] == 1);
+    pass("collective: elastic - all_to_all_v in epoch 0, a rank leaves, the survivors reform, and epoch 1's "
+         "all_to_all_v is the reference over its members");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -977,6 +1376,7 @@ int main(int argc, char** argv)
     run("one_rank", test_one_rank);
     run("killed_peer", test_killed_peer);                  // forks: first, while this process has one thread
     run("elastic_killed_and_rejoined", test_elastic_killed_and_rejoined);   // forks too
+    run("all_to_all_v_killed_peer", test_all_to_all_v_killed_peer);         // forks too
     run("connect_times_out", test_connect_times_out);
     run("allreduce_small", test_allreduce_small);
     run("allreduce_ring_wraps", test_allreduce_ring_wraps);
@@ -995,6 +1395,11 @@ int main(int argc, char** argv)
     run("elastic_leave_reform_rejoin", test_elastic_leave_reform_rejoin);
     run("elastic_rendezvous_leaves", test_elastic_rendezvous_leaves);
     run("elastic_middle_slot_rejoins", test_elastic_middle_slot_rejoins);
+    run("all_to_all_v", test_all_to_all_v);
+    run("all_to_all_v_errors", test_all_to_all_v_errors);
+    run("all_to_all_v_large_two_way", test_all_to_all_v_large_two_way);
+    run("all_to_all_v_slow_link", test_all_to_all_v_slow_link);
+    run("all_to_all_v_elastic", test_all_to_all_v_elastic);
     std::cout << "\ncollective: all " << tests_run << " tests passed\n";
     return 0;
 }

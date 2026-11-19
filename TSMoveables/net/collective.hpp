@@ -18,6 +18,8 @@
 //      c->broadcast(weights.data(), weights.size(), 0);       // rank 0's initial weights everywhere
 //      c->allreduce_sum(grads.data(), grads.size());          // every rank: the same sum, bit for bit
 //      c->allreduce_sum_bf16(bits.data(), bits.size());       // the same over bfloat16, half the bytes
+//      c->all_to_all_v(rows, send_counts, send_offsets,      // rank r's segment for each rank,
+//                      got, recv_counts, recv_offsets);      // and each rank's for r, in rank order
 //      c->barrier();
 //
 //  ------------------------------------------------------------- the sum
@@ -66,6 +68,17 @@
 //  all-gather lands straight in it. One thread, one poll() loop over every peer's
 //  socket, non-blocking in both directions: two ranks sending each other half a
 //  gigabyte cannot deadlock on full socket buffers.
+//
+//  all_to_all_v(send, send_counts, send_offsets, recv, recv_counts,
+//  recv_offsets) sends every rank its own segment of the caller's buffer and
+//  receives one from each (MPI's Alltoallv): expert parallelism's dispatch and
+//  combine. Each pair's segments go directly between the caller's buffers in
+//  both directions at once, with no staging, so memory does not grow with the
+//  sizes; each header carries the count for its receiver, which checks it
+//  against the count it expects (exchange_counts() tells it) before any
+//  element lands. With recv_offsets the prefix sums of recv_counts, rank r
+//  receives the segments for r in source order, which is snicholls-core's
+//  ml::moe_all_to_all bit for bit. Float, bfloat16 bits, or any element size.
 //
 //  broadcast(data, n, root) scatters the buffer from the root in N-1 pieces, one
 //  to each other rank, which forward their piece to everyone but the root as it
@@ -196,8 +209,10 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -494,8 +509,8 @@ inline constexpr std::uint32_t nobody = 0xffffffff;
 // the epoch, the element count and the epoch.
 inline constexpr std::uint32_t op_magic = 0x4f4d5354;      // "TSMO"
 inline constexpr std::size_t op_header_size = 40;
-enum : unsigned char { op_allreduce_sum = 1, op_broadcast = 2, op_barrier = 3 };
-enum : unsigned char { dtype_none = 0, dtype_f32 = 1, dtype_bf16 = 2 };
+enum : unsigned char { op_allreduce_sum = 1, op_broadcast = 2, op_barrier = 3, op_all_to_all_v = 4 };
+enum : unsigned char { dtype_none = 0, dtype_f32 = 1, dtype_bf16 = 2, dtype_bytes = 3 };
 
 inline const char* op_name(unsigned op)
 {
@@ -503,6 +518,7 @@ inline const char* op_name(unsigned op)
     case op_allreduce_sum: return "allreduce_sum";
     case op_broadcast: return "broadcast";
     case op_barrier: return "barrier";
+    case op_all_to_all_v: return "all_to_all_v";
     default: return "an unknown operation";
     }
 }
@@ -534,7 +550,11 @@ inline std::string describe(const unsigned char* b)
     std::string s = op_name(b[4]);
     if (b[4] == op_allreduce_sum)
         s += b[5] == dtype_bf16 ? " (bfloat16)" : " (float)";
+    if (b[4] == op_all_to_all_v)
+        s += b[5] == dtype_bf16 ? " (bfloat16)" : b[5] == dtype_f32 ? " (float)" : " (" + std::to_string(get32(b + 8)) + "-byte elements)";
     s += " #" + std::to_string(get64(b + 16)) + " of " + std::to_string(get64(b + 24)) + " elements";
+    if (b[4] == op_all_to_all_v)
+        s += " for the receiving rank";
     s += " in epoch " + std::to_string(get64(b + 32));
     if (b[4] == op_broadcast)
         s += " from root " + std::to_string(get32(b + 8));
@@ -994,6 +1014,104 @@ public:
         return finish(run(lanes, [] { return true; }));
     }
 
+    /// All-to-all with a count for every pair (MPI's Alltoallv), for the dispatch
+    /// and combine of expert parallelism. This rank's elements
+    /// [send_offsets[q], send_offsets[q] + send_counts[q]) of send go to rank q,
+    /// and rank q's elements for this rank land at [recv_offsets[q],
+    /// recv_offsets[q] + recv_counts[q]) of recv. Counts and offsets are in
+    /// elements, one per rank, in rank order; recv_counts[q] must be what rank q
+    /// passes as send_counts[this rank] (exchange_counts() tells it), and a
+    /// difference is a mismatched_call naming q, found from the op header before
+    /// any of q's elements land. With recv_offsets the prefix sums of recv_counts,
+    /// rank r receives every rank's segment for r in rank (source) order: the
+    /// reference order of snicholls-core's ml::moe_all_to_all, bit for bit (the
+    /// bytes are copied, never converted).
+    ///
+    /// Sends go straight from send and receives land straight in recv: no
+    /// staging, whatever the sizes. Every pair's two directions move at once in
+    /// the one poll() loop, so two ranks sending each other gigabytes cannot
+    /// deadlock; progress notices, the stall deadline, abort notices and the
+    /// elastic epoch are those of every collective. This rank's own segment is
+    /// copied in memory. send and recv must not overlap.
+    collective_result<void> all_to_all_v(const float* send, std::span<const std::size_t> send_counts,
+                                         std::span<const std::size_t> send_offsets, float* recv,
+                                         std::span<const std::size_t> recv_counts, std::span<const std::size_t> recv_offsets)
+    {
+        return all_to_all(reinterpret_cast<const char*>(send), send_counts, send_offsets, reinterpret_cast<char*>(recv),
+                          recv_counts, recv_offsets, sizeof(float), detail::collective::dtype_f32);
+    }
+
+    /// The same over bfloat16 bits (snicholls-core's ml::bfloat16::bits): half
+    /// the bytes of float rows. A float call against a bfloat16 call is a
+    /// mismatched_call.
+    collective_result<void> all_to_all_v(const std::uint16_t* send, std::span<const std::size_t> send_counts,
+                                         std::span<const std::size_t> send_offsets, std::uint16_t* recv,
+                                         std::span<const std::size_t> recv_counts, std::span<const std::size_t> recv_offsets)
+    {
+        return all_to_all(reinterpret_cast<const char*>(send), send_counts, send_offsets, reinterpret_cast<char*>(recv),
+                          recv_counts, recv_offsets, sizeof(std::uint16_t), detail::collective::dtype_bf16);
+    }
+
+    /// The same over elements of element_size bytes each, copied as they are
+    /// (every rank has the same byte order: the handshake checks it). Every rank
+    /// passes the same element_size, or it is a mismatched_call.
+    collective_result<void> all_to_all_v(const void* send, std::span<const std::size_t> send_counts,
+                                         std::span<const std::size_t> send_offsets, void* recv,
+                                         std::span<const std::size_t> recv_counts, std::span<const std::size_t> recv_offsets,
+                                         std::size_t element_size)
+    {
+        return all_to_all(static_cast<const char*>(send), send_counts, send_offsets, static_cast<char*>(recv), recv_counts,
+                          recv_offsets, element_size, detail::collective::dtype_bytes);
+    }
+
+    /// The counts of an all_to_all_v, exchanged: recv_counts[q] becomes what rank
+    /// q passed as send_counts[this rank]. One collective of 8 bytes per pair.
+    collective_result<void> exchange_counts(std::span<const std::size_t> send_counts, std::span<std::size_t> recv_counts)
+    {
+        const std::size_t N = std::size_t(size_ < 1 ? 1 : size_);
+        if (send_counts.size() != N || recv_counts.size() != N)
+            return err(collective_error(collective_errc::bad_config, -1, "exchange_counts needs one count per rank"));
+        std::vector<std::uint64_t> out(N), in(N);
+        std::vector<std::size_t> ones(N, 1), at(N);
+        for (std::size_t q = 0; q < N; ++q) {
+            out[q] = send_counts[q];
+            at[q] = q;
+        }
+        if (auto e = all_to_all(reinterpret_cast<const char*>(out.data()), ones, at, reinterpret_cast<char*>(in.data()), ones,
+                                at, sizeof(std::uint64_t), detail::collective::dtype_bytes);
+            e.is_err())
+            return e;
+        for (std::size_t q = 0; q < N; ++q) {
+            if (in[q] > std::numeric_limits<std::size_t>::max())
+                return finish(fail(collective_errc::io_error, int(q), "a count too large for this rank"));
+            recv_counts[q] = std::size_t(in[q]);
+        }
+        return ok();
+    }
+
+    /// Counts exchanged first, then the elements: recv is resized to what this
+    /// rank receives, packed in rank (source) order, and recv_counts /
+    /// recv_offsets say where each rank's segment is. Two collectives.
+    template <class T>
+        requires(std::is_same_v<T, float> || std::is_same_v<T, std::uint16_t>)
+    collective_result<void> all_to_all_v(const T* send, std::span<const std::size_t> send_counts,
+                                         std::span<const std::size_t> send_offsets, std::vector<T>& recv,
+                                         std::vector<std::size_t>& recv_counts, std::vector<std::size_t>& recv_offsets)
+    {
+        recv_counts.assign(send_counts.size(), 0);
+        if (auto e = exchange_counts(send_counts, recv_counts); e.is_err())
+            return e;
+        recv_offsets.assign(recv_counts.size(), 0);
+        std::size_t total = 0;
+        for (std::size_t q = 0; q < recv_counts.size(); ++q) {
+            recv_offsets[q] = total;
+            total += recv_counts[q];
+        }
+        recv.resize(total);
+        return all_to_all_v(send, send_counts, send_offsets, recv.data(), std::span<const std::size_t>(recv_counts),
+                            std::span<const std::size_t>(recv_offsets));
+    }
+
     /// Element range of chunk c when n elements are cut into parts chunks: the
     /// first n % parts chunks are one longer. Public so a caller can tell which
     /// rank reduces which elements.
@@ -1047,6 +1165,8 @@ private:
     std::optional<collective_error> broken_;
     std::array<unsigned char, detail::collective::op_header_size> header_out_{};
     std::vector<std::array<unsigned char, detail::collective::op_header_size>> header_in_;
+    std::vector<std::array<unsigned char, detail::collective::op_header_size>> header_v_;   // all_to_all_v: to each peer
+    std::vector<std::array<unsigned char, detail::collective::op_header_size>> expect_;     // all_to_all_v: from each peer
     std::vector<std::vector<float>> rings_;
     std::vector<std::vector<std::uint16_t>> rings16_;
     std::vector<float> acc_;
@@ -1154,12 +1274,65 @@ private:
         return finish(run(lanes, reduce));
     }
 
+    // The all-to-all over elements of E bytes: per peer, a header whose n is the elements sent to
+    // that peer, checked against one whose n is the elements this rank expects from it; then the
+    // segment out of send and the segment into recv, both in place.
+    collective_result<void> all_to_all(const char* send, std::span<const std::size_t> send_counts,
+                                       std::span<const std::size_t> send_offsets, char* recv,
+                                       std::span<const std::size_t> recv_counts, std::span<const std::size_t> recv_offsets,
+                                       std::size_t E, unsigned dtype)
+    {
+        namespace d = detail::collective;
+        if (auto e = precheck(nullptr, 0, 1); e.is_err())
+            return e;
+        const std::size_t N = std::size_t(size_), r = std::size_t(rank_);
+        auto bad = [](const std::string& why) { return err(collective_error(collective_errc::bad_config, -1, why)); };
+        if (send_counts.size() != N || send_offsets.size() != N || recv_counts.size() != N || recv_offsets.size() != N)
+            return bad("all_to_all_v needs one count and one offset per rank, each way");
+        if (E == 0 || E > 0xffffffffu)
+            return bad("all_to_all_v needs an element size from 1 to 2^32 - 1 bytes");
+        const std::size_t most = std::numeric_limits<std::size_t>::max() / E;
+        for (std::size_t q = 0; q < N; ++q) {
+            if (send_counts[q] > most || send_offsets[q] > most - send_counts[q] || recv_counts[q] > most ||
+                recv_offsets[q] > most - recv_counts[q])
+                return bad("all_to_all_v: a segment too large");
+            if ((send_counts[q] != 0 && send == nullptr) || (recv_counts[q] != 0 && recv == nullptr))
+                return bad("null buffer");
+        }
+        if (send_counts[r] != recv_counts[r])
+            return bad("all_to_all_v: this rank sends itself " + std::to_string(send_counts[r]) + " elements and expects " +
+                       std::to_string(recv_counts[r]));
+        if (send_counts[r] != 0)
+            std::memcpy(recv + recv_offsets[r] * E, send + send_offsets[r] * E, send_counts[r] * E);
+        if (N == 1) {
+            ++seq_;
+            return ok();
+        }
+        auto lanes = start(d::op_all_to_all_v, dtype, std::uint32_t(E), 0);
+        header_v_.assign(N, {});
+        expect_.assign(N, {});
+        for (std::size_t p = 0; p < N; ++p) {
+            if (p == r)
+                continue;
+            header_v_[p] = d::encode(d::op_header{d::op_all_to_all_v, dtype, std::uint32_t(E), std::uint32_t(size_), seq_,
+                                                  std::uint64_t(send_counts[p]), epoch_});
+            expect_[p] = d::encode(d::op_header{d::op_all_to_all_v, dtype, std::uint32_t(E), std::uint32_t(size_), seq_,
+                                                std::uint64_t(recv_counts[p]), epoch_});
+            auto& l = lanes[p];
+            l.out[0].base = reinterpret_cast<char*>(header_v_[p].data());
+            l.out.push_back({const_cast<char*>(send) + send_offsets[p] * E, send_counts[p] * E});
+            l.in.push_back({recv + recv_offsets[p] * E, recv_counts[p] * E});
+        }
+        return finish(run(lanes, [] { return true; }));
+    }
+
     // Every lane starts by sending this rank's header and receiving the peer's
     lanes_t start(unsigned op, unsigned dtype, std::uint32_t root, std::size_t n)
     {
         namespace d = detail::collective;
         header_out_ = d::encode(d::op_header{op, dtype, root, std::uint32_t(size_), seq_, std::uint64_t(n), epoch_});
         header_in_.assign(std::size_t(size_), {});
+        expect_.clear();
         lanes_t lanes(static_cast<std::size_t>(size_));
         for (std::size_t p = 0; p < lanes.size(); ++p) {
             if (int(p) == rank_)
@@ -1480,10 +1653,12 @@ private:
             moved_ = true;
             l.last = l.last_rx = d::clock::now();
             if (pt.done == pt.len) {
-                if (l.ii == 0 && std::memcmp(pt.base, header_out_.data(), d::op_header_size) != 0)
+                // The header this rank expects from p: its own, or for all_to_all_v one with p's count
+                const unsigned char* want = expect_.empty() ? header_out_.data() : expect_[std::size_t(p)].data();
+                if (l.ii == 0 && std::memcmp(pt.base, want, d::op_header_size) != 0)
                     return fail(collective_errc::mismatched_call, p,
                                 "it called " + d::describe(reinterpret_cast<const unsigned char*>(pt.base)) +
-                                    ", this rank " + d::describe(header_out_.data()));
+                                    ", this rank " + d::describe(want));
                 ++l.ii;
                 while (l.ii < l.in.size() && l.in[l.ii].len == 0)
                     ++l.ii;
