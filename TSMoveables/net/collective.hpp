@@ -1849,30 +1849,13 @@ private:
         //    this membership's ranks is refused (or served, if it is a request), and the wait goes on.
         std::string refused;
         int refused_rank = -1;
-        for (std::size_t accepted = 0; accepted < 2 * (N - 1 - r);) {
+        std::size_t accepted = 0;
+        // One higher rank's connection and its hello: true when it is taken as a link
+        auto consider = [&](tcp_stream s, const d::hello& h) -> bool {
             std::string e;
-            auto s = listener_.accept(left_until(dl), &e);
-            if (!s.valid()) {
-                if (errno != ETIMEDOUT && left_until(dl).count() > 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));   // EMFILE and friends
-                    continue;
-                }
-                std::size_t missing = r + 1;
-                while (missing < N && links_[missing].valid() && ctrl_[missing].valid())
-                    ++missing;
-                if (!refused.empty())
-                    return err(collective_error(collective_errc::handshake_rejected, refused_rank,
-                                                "waiting for " + who(int(missing)) + "; refused " + refused));
-                return err(collective_error(collective_errc::timed_out, int(missing),
-                                            who(int(missing)) + ": did not connect within " +
-                                                std::to_string(connect_timeout_.count()) + " ms"));
-            }
-            d::hello h;
-            if (!read_hello(s, std::min(dl, clock::now() + handshake_timeout_), h))
-                continue;                                         // silent or gone: not one of ours
             if (h.magic_ok && (h.kind == d::join_kind || h.kind == d::register_kind)) {
                 serve(std::move(s), h);
-                continue;
+                return false;
             }
             const std::size_t from = std::size_t(std::find(members_.begin(), members_.end(), h.from) - members_.begin());
             unsigned char why = d::ok_reason;
@@ -1898,12 +1881,42 @@ private:
             if (why != d::ok_reason) {
                 refused_rank = h.magic_ok && from < N ? int(from) : -1;
                 refused = "a connection claiming slot " + std::to_string(h.from) + ": " + d::reason_text(why);
-                continue;
+                return false;
             }
             if (!sent)
-                continue;
+                return false;
             link(from, h.channel) = std::move(s);
-            ++accepted;
+            return true;
+        };
+        // Mesh connections that came while this rank waited to be admitted, first
+        for (auto& q : held_)
+            if (q.kind == d::hello_kind && q.s.valid() && accepted < 2 * (N - 1 - r))
+                accepted += consider(std::move(q.s), q.h) ? 1 : 0;
+        for (auto& q : held_)
+            if (q.kind == d::hello_kind)
+                q.s.close();
+        while (accepted < 2 * (N - 1 - r)) {
+            std::string e;
+            auto s = listener_.accept(left_until(dl), &e);
+            if (!s.valid()) {
+                if (errno != ETIMEDOUT && left_until(dl).count() > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));   // EMFILE and friends
+                    continue;
+                }
+                std::size_t missing = r + 1;
+                while (missing < N && links_[missing].valid() && ctrl_[missing].valid())
+                    ++missing;
+                if (!refused.empty())
+                    return err(collective_error(collective_errc::handshake_rejected, refused_rank,
+                                                "waiting for " + who(int(missing)) + "; refused " + refused));
+                return err(collective_error(collective_errc::timed_out, int(missing),
+                                            who(int(missing)) + ": did not connect within " +
+                                                std::to_string(connect_timeout_.count()) + " ms"));
+            }
+            d::hello h;
+            if (!read_hello(s, std::min(dl, clock::now() + handshake_timeout_), h))
+                continue;                                         // silent or gone: not one of ours
+            accepted += consider(std::move(s), h) ? 1 : 0;
         }
 
         // 3. Collect the lower ranks' answers.
@@ -1978,8 +1991,14 @@ private:
             if (rc > 0 && (pf[1].revents & POLLIN)) {
                 auto in = listener_.accept(std::chrono::milliseconds(0));
                 d::hello h;
-                if (in.valid() && read_hello(in, d::clock::now() + std::chrono::milliseconds(200), h))
-                    reject(in, h, h.magic_ok && h.run_id != run_id_ ? d::bad_run_id : d::not_coordinator);
+                if (in.valid() && read_hello(in, d::clock::now() + std::chrono::milliseconds(200), h)) {
+                    // A member of the membership this joiner is about to receive may dial it before the view
+                    // arrives (it learnt the joiners from admit's broadcast): held for build_mesh
+                    if (h.magic_ok && h.kind == d::hello_kind && h.run_id == run_id_)
+                        held_.push_back({std::move(in), h.from, d::hello_kind, h});
+                    else
+                        reject(in, h, h.magic_ok && h.run_id != run_id_ ? d::bad_run_id : d::not_coordinator);
+                }
             }
             if (rc > 0 && pf[0].revents != 0) {
                 const int got = read_view(s, dl, view, epoch, reason);
