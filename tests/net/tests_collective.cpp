@@ -720,6 +720,13 @@ collective_config elastic_cfg(const job& j, int slot)
     return c;
 }
 
+collective_config elastic_cfg_short(const job& j, int slot)
+{
+    auto c = elastic_cfg(j, slot);
+    c.connect_timeout = 3s;
+    return c;
+}
+
 // One member's allreduce of its slot's values for this round, checked against the reference for the membership
 bool round_ok(collective& c, std::size_t n, std::uint64_t round)
 {
@@ -800,6 +807,46 @@ void test_elastic_leave_reform_rejoin()
     for (int r = 0; r < 3; ++r) assert(good[std::size_t(r)] == 1);
     pass("collective: elastic - a rank leaves, poll() sees it, the survivors reform; a joiner of another run is "
          "refused; the slot rejoins at admit(); every epoch's allreduce is its membership's reference");
+}
+
+
+// A middle slot leaves and rejoins, five times over: the slot above it must dial the joiner, and may do so before the
+// joiner has read its admission (it learns the joiners from admit's broadcast); the joiner holds that connection
+void test_elastic_middle_slot_rejoins()
+{
+    for (int rep = 0; rep < 5; ++rep) {
+        auto j = make_job(3, 300 + std::uint64_t(rep));
+        const auto port1 = j.listeners[1].port();
+        std::vector<int> good(3, 0);
+        std::atomic<int> reformed{0};
+        std::vector<std::thread> ts;
+        for (int r = 0; r < 3; ++r)
+            ts.emplace_back([&, r] {
+                auto made = collective::connect(elastic_cfg(j, r), std::move(j.listeners[std::size_t(r)]));
+                assert(made.is_ok());
+                auto c = std::move(made).unwrap();
+                bool ok = round_ok(c, 501, 0);
+                if (r == 1) {
+                    c = collective{};
+                    while (reformed.load() < 2) std::this_thread::sleep_for(5ms);
+                    auto back = collective::join(elastic_cfg_short(j, 1), tcp_listener::bind("127.0.0.1", port1));
+                    if (back.is_err()) std::cerr << "      join: " << back.unwrap_err_unchecked().what() << "\n";
+                    ok = ok && back.is_ok() && back->rank() == 1 && round_ok(*back, 501, 2);
+                    good[1] = ok;
+                    return;
+                }
+                collective_result<void> p = snicholls::ok();
+                for (int k = 0; k < 400 && (p = c.poll()).is_ok(); ++k) std::this_thread::sleep_for(5ms);
+                ok = ok && p.is_err() && c.reform().is_ok() && c.members() == std::vector<std::uint32_t>{0, 2};
+                ok = ok && round_ok(c, 501, 1);
+                reformed.fetch_add(1);
+                ok = ok && admit_until_joined(c, 3) && round_ok(c, 501, 2);
+                good[std::size_t(r)] = ok;
+            });
+        for (auto& t : ts) t.join();
+        for (int r = 0; r < 3; ++r) assert(good[std::size_t(r)] == 1);
+    }
+    pass("collective: elastic - a middle slot leaves and rejoins (five times); the rank above it dials the joiner");
 }
 
 void test_elastic_rendezvous_leaves()
@@ -947,6 +994,7 @@ int main(int argc, char** argv)
     run("elastic_requires_elastic", test_elastic_requires_elastic);
     run("elastic_leave_reform_rejoin", test_elastic_leave_reform_rejoin);
     run("elastic_rendezvous_leaves", test_elastic_rendezvous_leaves);
+    run("elastic_middle_slot_rejoins", test_elastic_middle_slot_rejoins);
     std::cout << "\ncollective: all " << tests_run << " tests passed\n";
     return 0;
 }
