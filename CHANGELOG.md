@@ -7,6 +7,40 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [1.11.0] — 2026-11-20
+
+### Added
+
+- **`atomic_file_writer`** (`fs/file.hpp`): `write_file_atomically`, streamed, for contents too large to build in
+  memory. `create(path, options)` makes the temporary beside the target by the same rules (a fresh name,
+  `O_EXCL | O_NOFOLLOW`, the mode asked for or the replaced file's, `create_directories`), `append()` takes byte spans
+  (`std::uint8_t`, `std::byte` or a `std::string_view`; small ones gathered into 64 KiB writes), `reserve(n)`
+  preallocates so a full disk fails before the data is produced, and `commit()` syncs the file, renames it over the
+  target and syncs the directory (`durable`, the default). Destroyed or `abandon()`ed before `commit()`, it removes
+  its temporary and the target is untouched. The first error removes the temporary at once and is returned by every
+  later call. `write_file_atomically` is now `create`, one `append`, `commit`. Tests: 48 MiB in chunks from 1 byte to
+  1 MiB, the target unchanged until `commit()`, abandoned and moved writers, six writers racing to one target under a
+  reader, and a write that fails (`EFBIG` under `RLIMIT_FSIZE`).
+- **`mapped_region::open_read_only(path)`** (`mmap/mapped_region.hpp`): `O_RDONLY`, `PROT_READ`, `MAP_SHARED`, so a
+  file the process may read but not write (a read-only cache, another user's file) maps without a copy, and others'
+  writes to it show through. `grow()` and `grow_or_move()` answer the new `mapped_errc::read_only`; `writable()` says
+  which kind a region is and `const_bytes()` is the read-only view. `open()` and every read-write call are unchanged.
+
+### Changed
+
+- **TLS builds warning-free against OpenSSL 4** (`tls/openssl.hpp`), which deprecates `SSL_set1_host`. With
+  `OPENSSL_VERSION_MAJOR >= 4` the client sets the name it checks with `SSL_set1_ipaddr` for an IP literal and
+  `SSL_set1_dnsname` otherwise (classified by OpenSSL's own `a2i_IPADDRESS`), which is what `SSL_set1_host` did;
+  OpenSSL 3 keeps `SSL_set1_host`. Verification is as strict as the OpenSSL linked: OpenSSL 4 no longer reads the
+  subject CN, so a certificate must name its host in a DNS subjectAltName there (OpenSSL 3 still falls back to the
+  CN). The TLS tests' certificates carry a subjectAltName, and new tests check an IP literal against an IP
+  subjectAltName and pin the CN behaviour of each version. CI builds the TLS suite against OpenSSL 4 on the macOS
+  jobs (Homebrew's `openssl@4`), and the TLS step now builds with `-Werror`.
+
+### Known limits, stated plainly
+
+- `http/client.hpp` still holds a response body whole; streaming bodies in chunks remains open.
+
 ## [1.10.0] — 2026-11-19
 
 ### Added
@@ -1201,6 +1235,7 @@ change cannot silently move a published number.
   batch APIs, or moodycamel, when that is the bottleneck. The gap and the reason
   for it are documented rather than hidden.
 
+[1.11.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.11.0
 [1.10.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.10.0
 [1.9.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.9.0
 [1.8.0]: https://github.com/saxonnicholls/ts-moveables/releases/tag/v1.8.0

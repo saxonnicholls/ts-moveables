@@ -422,6 +422,7 @@ If none of the benefits above matter, `std::vector` is faster to write.
 | Those objects, or any `std::pmr` container, outside the heap | `object_pool<T>` or `std::pmr::vector` on a `mapped_memory_resource` | an anonymous region for scratch larger than the heap; a file region to spill to disk. The memory is persistent, the pointers are not |
 | A huge scratch space that grows without moving and is never persisted | `mapped_region::anonymous(1 << 40)` | reserve a terabyte of address space, use what you touch |
 | Raw control: your own layout in a file | `mapped_region` | `open`, `grow`, `flush`, `advise(sequential / random / willneed)`; `grow_or_move` when the reservation is outgrown |
+| Read a file you may not write (a read-only cache, another user's file) without copying it | `mapped_region::open_read_only` | `O_RDONLY`, `PROT_READ`, `MAP_SHARED`: needs read permission only; `grow` answers `mapped_errc::read_only` |
 | Links inside a region that moves as a whole | core's `offset_ptr<T>` | stores the distance, so the links survive a remap; about 0.8 ns per hop over a raw pointer |
 
 ### Allocating in a mapping
@@ -490,6 +491,12 @@ auto bytes = snicholls::read_file_bytes("key.bin");      // result<std::vector<s
 
 if (auto w = snicholls::write_file_atomically("book.csv", updated); w.is_err())
     log(w.unwrap_err_unchecked().message());             // the old book.csv is untouched
+
+auto out = snicholls::atomic_file_writer::create("model.bin");   // the same replace, streamed
+if (out.is_err()) return out.unwrap_err_unchecked();
+out->reserve(total_bytes);                               // optional: a full disk fails here, not halfway
+for (auto chunk : chunks) out->append(chunk);            // spans of bytes, any number, any size
+out->commit();                                           // sync, rename, sync the directory
 ```
 
 - **`read_file` tells a missing file from an empty one.** Every failure is a `std::error_code` you can compare:
@@ -505,6 +512,11 @@ if (auto w = snicholls::write_file_atomically("book.csv", updated); w.is_err())
 - **The mode carries over.** The new file takes `.mode` if given, else the replaced file's mode, else 0666 less the
   umask. `{.create_directories = true}` makes missing parents. A symbolic link at `path` is itself replaced, not its
   target.
+- **`atomic_file_writer` streams it.** For contents too large to build in memory (a 10 GB checkpoint): `create()`
+  makes the temporary by the same rules, `append()` takes byte spans (small ones gathered into 64 KiB writes),
+  `reserve(n)` preallocates, and `commit()` syncs, renames and syncs the directory. Destroyed or `abandon()`ed before
+  `commit()`, it removes its temporary and the target is untouched. The first error removes the temporary at once
+  and is returned by every later call. `write_file_atomically` is `create`, one `append`, `commit`.
 - `full_sync(fd)` (`fs/sync.hpp`) is the one place the library pushes data through the drive's cache; `mapped_region`
   uses it too.
 
@@ -855,7 +867,7 @@ The library exports the interface target `snicholls::ts_moveables`, which carrie
 include(FetchContent)
 FetchContent_Declare(ts_moveables
     GIT_REPOSITORY https://github.com/saxonnicholls/ts-moveables.git
-    GIT_TAG v1.10.0)
+    GIT_TAG v1.11.0)
 FetchContent_MakeAvailable(ts_moveables)
 
 target_link_libraries(my_app PRIVATE snicholls::ts_moveables)
@@ -1466,6 +1478,8 @@ up.connect(loop, "wss://feed.example.com/stream");
 **A client's job is to check a certificate, not to present one** — and a client that skips the check isn't "TLS without the fuss", it's plaintext that looks encrypted, because anyone who can answer the connection can present any certificate and be believed. So verification is **on by default** and has to be disabled by name, on a field called `insecure_skip_verify`.
 
 Two checks, both required, and the second is the one that gets forgotten: the chain must be trusted **and the certificate must be for the host you dialled**. A valid certificate for a host you didn't ask for is exactly what an interception proxy presents; OpenSSL will not check it unless asked. Both are tested, and the tests were confirmed to fail with verification disabled — an untrusted certificate is refused, and so is a trusted one issued for the wrong name.
+
+A name is checked against the certificate's DNS names and an IP literal against its IP addresses: `SSL_set1_host` on OpenSSL 3, and on OpenSSL 4, which deprecates that call, `SSL_set1_dnsname` or `SSL_set1_ipaddr` by the same classification. The library builds warning-free against both. OpenSSL's own default decides the rest, so verification is never looser than the OpenSSL you link: OpenSSL 4 no longer falls back to the subject CN when a certificate has no DNS subjectAltName (RFC 9525), and a CN-only certificate that OpenSSL 3 accepts is refused there. The tests pin both behaviours.
 
 A `wss://` URL with no transport factory is **refused, never downgraded**. Silently connecting in plaintext would be the worst available failure.
 
