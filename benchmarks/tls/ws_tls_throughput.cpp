@@ -64,6 +64,7 @@ int main()
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 using namespace snicholls;
 using namespace snicholls::http;
@@ -91,10 +92,20 @@ struct throwaway_cert {
         X509_gmtime_adj(X509_getm_notBefore(cert), 0);
         X509_gmtime_adj(X509_getm_notAfter(cert), 60L * 60);
         X509_set_pubkey(cert, key);
-        X509_NAME* n = X509_get_subject_name(cert);
+        X509_NAME* n = X509_NAME_new();   // not X509_get_subject_name's: it is const from OpenSSL 4
         X509_NAME_add_entry_by_txt(n, "CN", MBSTRING_ASC,
                                    reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+        X509_set_subject_name(cert, n);
         X509_set_issuer_name(cert, n);
+        X509_NAME_free(n);
+        // The name the client checks: OpenSSL 4 reads the subjectAltName only, never the CN
+        X509V3_CTX v3{};
+        X509V3_set_ctx(&v3, cert, cert, nullptr, nullptr, 0);
+        X509_EXTENSION* san = X509V3_EXT_conf_nid(nullptr, &v3, NID_subject_alt_name, "DNS:localhost");
+        if (!san)
+            std::exit(1);
+        X509_add_ext(cert, san, -1);
+        X509_EXTENSION_free(san);
         if (X509_sign(cert, key, EVP_sha256()) <= 0)
             std::exit(1);
 

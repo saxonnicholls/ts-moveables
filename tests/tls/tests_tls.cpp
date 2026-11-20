@@ -93,7 +93,10 @@ struct self_signed {
     std::string cert_pem;                       // the same credential, for mbedTLS
     std::string key_pem;
 
-    self_signed()
+    // `alt_names` is the subjectAltName ("DNS:localhost", "IP:127.0.0.1"), the
+    // names a client checks; nullptr leaves only the CN, which OpenSSL 3 falls
+    // back to and OpenSSL 4 no longer reads (RFC 9525)
+    explicit self_signed(const char* alt_names = "DNS:localhost", const char* common_name = "localhost")
     {
         key = EVP_RSA_gen(2048);
         assert(key && "key generation");
@@ -106,10 +109,22 @@ struct self_signed {
         X509_gmtime_adj(X509_getm_notAfter(cert), 60L * 60 * 24);
         X509_set_pubkey(cert, key);
 
-        X509_NAME* name = X509_get_subject_name(cert);
+        // A name of our own rather than X509_get_subject_name's, which is const from OpenSSL 4
+        X509_NAME* name = X509_NAME_new();
+        assert(name);
         X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                                   reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
+                                   reinterpret_cast<const unsigned char*>(common_name), -1, -1, 0);
+        X509_set_subject_name(cert, name);
         X509_set_issuer_name(cert, name);       // self-signed: issuer is subject
+        X509_NAME_free(name);
+        if (alt_names) {
+            X509V3_CTX v3{};
+            X509V3_set_ctx(&v3, cert, cert, nullptr, nullptr, 0);
+            X509_EXTENSION* ext = X509V3_EXT_conf_nid(nullptr, &v3, NID_subject_alt_name, alt_names);
+            assert(ext && "subjectAltName");
+            X509_add_ext(cert, ext, -1);
+            X509_EXTENSION_free(ext);
+        }
         assert(X509_sign(cert, key, EVP_sha256()) > 0);
 
         cert_pem = to_pem([this](BIO* b) { return PEM_write_bio_X509(b, cert) == 1; });
@@ -726,7 +741,7 @@ void test_wss_round_trip(const self_signed& cred)
     };
 
     wss_attempt a;
-    // "localhost", not 127.0.0.1: the certificate's CN is localhost, and the
+    // "localhost", not 127.0.0.1: the certificate names DNS localhost, and the
     // name dialled is the name checked
     assert(run_wss("wss://localhost:" + std::to_string(s.port) + "/ws", cfg, a, "over-tls"));
     assert(a.opened.load());
@@ -783,6 +798,69 @@ void test_wss_refuses_hostname_mismatch(const self_signed& cred)
     assert(!a.opened.load());
     assert(a.closed.load());
     pass("wss: a trusted certificate for the wrong host is still refused");
+}
+
+// An IP literal is checked against the certificate's IP addresses and a name
+// against its DNS names (OpenSSL 4 asks for one call per kind; before it,
+// SSL_set1_host told them apart). The certificate names only IP 127.0.0.1, so
+// dialling 127.0.0.1 is verified and dialling localhost is refused.
+void test_wss_ip_literal_checked_against_ip_san()
+{
+    self_signed ip_cred("IP:127.0.0.1", "ip-only");
+    https_server<openssl_backend> s(ip_cred);
+    wss_fixture fx(ip_cred);
+
+    openssl_client_config ccfg;
+    ccfg.ca_file = fx.ca_path;
+    auto tls = std::make_shared<openssl_client_context>(ccfg);
+    ws_client_config cfg;
+    cfg.auto_reconnect = false;
+    cfg.transport_factory = [tls](const std::string& host) {
+        return std::unique_ptr<transport_delegate>(tls->connect(host).release());
+    };
+
+    wss_attempt by_ip;
+    assert(run_wss("wss://127.0.0.1:" + std::to_string(s.port) + "/ws", cfg, by_ip, "by-ip"));
+    assert(by_ip.opened.load());
+    {
+        std::lock_guard<moveable_mutex<>> g(by_ip.mtx);
+        assert(by_ip.got == "secure-echo:by-ip");
+    }
+    wss_attempt by_name;
+    assert(run_wss("wss://localhost:" + std::to_string(s.port) + "/ws", cfg, by_name));
+    assert(!by_name.opened.load());
+    assert(by_name.closed.load());
+    pass("wss: an IP literal is verified against the certificate's IP address, and a name against its DNS names");
+}
+
+// A certificate that names its host only in the subject CN: OpenSSL 3 falls
+// back to the CN when there is no DNS subjectAltName, OpenSSL 4 does not read
+// the CN at all. The library leaves OpenSSL's default in place either way, so
+// verification is never looser than the OpenSSL it is built against.
+void test_wss_common_name_only_follows_openssl()
+{
+    self_signed cn_only(nullptr);
+    https_server<openssl_backend> s(cn_only);
+    wss_fixture fx(cn_only);
+
+    openssl_client_config ccfg;
+    ccfg.ca_file = fx.ca_path;
+    auto tls = std::make_shared<openssl_client_context>(ccfg);
+    ws_client_config cfg;
+    cfg.auto_reconnect = false;
+    cfg.transport_factory = [tls](const std::string& host) {
+        return std::unique_ptr<transport_delegate>(tls->connect(host).release());
+    };
+
+    wss_attempt a;
+    assert(run_wss("wss://localhost:" + std::to_string(s.port) + "/ws", cfg, a));
+#if OPENSSL_VERSION_MAJOR >= 4
+    assert(!a.opened.load() && a.closed.load());
+    pass("wss: a certificate naming its host only in the CN is refused (OpenSSL 4 reads subjectAltName only)");
+#else
+    assert(a.opened.load());
+    pass("wss: a certificate naming its host only in the CN is accepted (OpenSSL 3's CN fallback)");
+#endif
 }
 
 #if __cplusplus >= 202002L && SNICHOLLS_HAS_HTTP_CLIENT
@@ -910,6 +988,8 @@ int main()
     test_wss_round_trip(cred);
     test_wss_refuses_untrusted_certificate(cred);
     test_wss_refuses_hostname_mismatch(cred);
+    test_wss_ip_literal_checked_against_ip_san();
+    test_wss_common_name_only_follows_openssl();
     test_wss_without_a_transport_is_refused_not_downgraded();
 #if __cplusplus >= 202002L && SNICHOLLS_HAS_HTTP_CLIENT
     test_https_client(cred);

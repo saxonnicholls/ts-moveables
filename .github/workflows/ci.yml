@@ -221,7 +221,21 @@ jobs:
       - name: TLS tests (OpenSSL and mbedTLS)
         run: |
           make check-mbedtls MBEDTLS_PREFIX="$HOME/mbedtls-install"
-          make test-tls CXX=${{ matrix.cxx }} STD=c++20 MBEDTLS_PREFIX="$HOME/mbedtls-install"
+          make test-tls CXX=${{ matrix.cxx }} STD=c++20 EXTRA_FLAGS=-Werror MBEDTLS_PREFIX="$HOME/mbedtls-install"
+
+      # OpenSSL 4 deprecates SSL_set1_host and stops reading the subject CN, so
+      # the same suite is built against it with warnings as errors. Homebrew
+      # pours it as a bottle, so the macOS jobs carry it; the Linux runners
+      # package OpenSSL 3 only, and building 4 from source on every job would
+      # cost more than the check is worth.
+      - name: TLS tests against OpenSSL 4
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          brew list openssl@4 >/dev/null 2>&1 || brew install openssl@4
+          rm -f build/tests_tls
+          make test-tls CXX=${{ matrix.cxx }} STD=c++20 EXTRA_FLAGS=-Werror \
+            OPENSSL_PREFIX="$(brew --prefix openssl@4)" MBEDTLS_PREFIX="$HOME/mbedtls-install"
+          rm -f build/tests_tls
 
       # The HTTP client's h2 against servers that are not ours: Go's standard
       # library (h2c, and h2 over TLS by ALPN, trailers included) and nghttpd.

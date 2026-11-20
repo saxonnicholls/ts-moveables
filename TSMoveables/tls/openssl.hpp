@@ -41,6 +41,10 @@
 //
 //  Build with, for example:
 //      -I$(brew --prefix openssl@3)/include -L$(brew --prefix openssl@3)/lib -lssl -lcrypto
+//  OpenSSL 3 and OpenSSL 4 are both supported, warning-free. A client checks
+//  the dialled name with SSL_set1_host on 3, and with SSL_set1_dnsname or
+//  SSL_set1_ipaddr on 4 (which deprecates SSL_set1_host); OpenSSL 4 also stops
+//  reading a certificate's subject CN, so it needs a DNS subjectAltName.
 //
 //  ALPN is answered here because that is where it belongs: the transport
 //  learns which protocol the client asked for during the handshake, and a
@@ -65,7 +69,9 @@
 #include <vector>
 
 #include <openssl/err.h>
+#include <openssl/opensslv.h>
 #include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 
 namespace snicholls {
 namespace http {
@@ -84,6 +90,23 @@ inline std::string openssl_error()
         out += buf;
     }
     return out.empty() ? std::string("unknown OpenSSL error") : out;
+}
+
+// The name the peer's certificate must match: an IP literal is checked against
+// the certificate's IP addresses, anything else against its DNS names. That is
+// what SSL_set1_host does; OpenSSL 4 deprecates it for one call per kind, so
+// the literal is classified here with the parser OpenSSL itself uses.
+inline bool openssl_expect_peer(SSL* ssl, const std::string& host)
+{
+#if OPENSSL_VERSION_MAJOR >= 4
+    if (ASN1_OCTET_STRING* ip = a2i_IPADDRESS(host.c_str())) {
+        ASN1_OCTET_STRING_free(ip);
+        return SSL_set1_ipaddr(ssl, host.c_str()) == 1;
+    }
+    return SSL_set1_dnsname(ssl, host.c_str()) == 1;
+#else
+    return SSL_set1_host(ssl, host.c_str()) == 1;
+#endif
 }
 
 } // namespace detail
@@ -490,7 +513,7 @@ public:
         if (!cfg_.insecure_skip_verify && !hostname.empty()) {
             // The check people forget. Without it a valid certificate for ANY
             // host passes, which is precisely what an interception proxy has.
-            if (SSL_set1_host(ssl, hostname.c_str()) != 1) {
+            if (!detail::openssl_expect_peer(ssl, hostname)) {
                 SSL_free(ssl);
                 throw std::runtime_error("openssl_client_context: set1_host failed for " +
                                          hostname);
