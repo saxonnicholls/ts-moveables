@@ -14,23 +14,30 @@
 //    - a failed write (missing directory, read-only directory) leaves the old file and no temporary
 //    - readers racing writers only ever see one writer's complete contents; so do racing writers
 //    - a child killed while replacing a file leaves the old contents or the new, never a mixture
+//    - atomic_file_writer: 48 MiB streamed in uneven chunks with reserve(), the target unchanged until commit();
+//      an abandoned writer leaves the target and no temporary; racing streamed writers leave one whole file;
+//      a write that fails (RLIMIT_FSIZE: EFBIG) removes the temporary and keeps returning its error
 //
 //  Files go in $TMPDIR (or /tmp), in a directory of their own, removed at the end.
 //
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -40,6 +47,7 @@
 namespace {
 
 namespace fs = std::filesystem;
+using snicholls::atomic_file_writer;
 using snicholls::read_file;
 using snicholls::read_file_bytes;
 using snicholls::write_file_atomically;
@@ -258,6 +266,205 @@ void test_full_sync()
     pass("full_sync: a file syncs; a bad descriptor is EBADF");
 }
 
+// Byte i of a streamed file: a pattern no chunking mistake (a dropped, repeated or reordered chunk) survives
+std::uint8_t pattern_byte(std::uint64_t i, std::uint8_t seed)
+{
+    return static_cast<std::uint8_t>((i * 2654435761u >> 13) ^ (i >> 20) ^ seed);
+}
+
+// Stream `total` bytes through `w` in chunks of uneven sizes, from 1 byte to 1 MiB
+void stream_pattern(atomic_file_writer& w, std::uint64_t total, std::uint8_t seed)
+{
+    static const std::size_t sizes[] = {1, 7, 4093, 65535, 65536, 65537, 100000, 1u << 20};
+    std::vector<std::uint8_t> chunk;
+    std::uint64_t at = 0;
+    for (std::size_t k = 0; at < total; ++k) {
+        const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(sizes[k % 8], total - at));
+        chunk.resize(n);
+        for (std::size_t j = 0; j < n; ++j) chunk[j] = pattern_byte(at + j, seed);
+        assert(w.append(std::span<const std::uint8_t>(chunk)).is_ok());
+        at += n;
+    }
+    assert(w.size() == total);
+}
+
+bool holds_pattern(const std::vector<std::uint8_t>& got, std::uint64_t total, std::uint8_t seed)
+{
+    if (got.size() != total) return false;
+    for (std::uint64_t i = 0; i < total; ++i)
+        if (got[static_cast<std::size_t>(i)] != pattern_byte(i, seed)) return false;
+    return true;
+}
+
+void test_writer_streams_a_large_file()
+{
+    const std::string d = path("streamed");
+    fs::create_directory(d);
+    const std::string p = d + "/model.bin";
+    assert(write_file_atomically(p, "old", {.mode = fs::perms::owner_read | fs::perms::owner_write}).is_ok());
+
+    const std::uint64_t total = 48ull << 20;
+    auto w = atomic_file_writer::create(p);
+    assert(w.is_ok() && w->active() && w->target() == p && !w->temporary().empty());
+    assert(w->temporary().parent_path() == fs::path(d));                // beside the target: the rename is one step
+    assert(w->reserve(total).is_ok());
+    stream_pattern(*w, total, 0x5a);
+    assert(w->append(std::string_view{}).is_ok());                       // an empty append is a no-op
+    assert(*read_file(p) == "old");                                       // nothing visible before commit()
+    assert(entries_in(d) == 2);                                           // the target and the temporary
+    const fs::path tmp = w->temporary();
+    assert(w->commit().is_ok());
+    assert(!w->active() && w->temporary().empty() && !fs::exists(tmp));
+    assert(entries_in(d) == 1);
+    assert(holds_pattern(*read_file_bytes(p), total, 0x5a));             // and the reserve() left no tail
+    assert(mode_of(p) == 0600);                                           // the replaced file's mode carried over
+
+    // Finished: every later call says so, and the file stays
+    const auto again = w->append(std::string_view("more"));
+    assert(again.is_err() && again.unwrap_err_unchecked() == std::errc::bad_file_descriptor);
+    assert(w->commit().is_err());
+    assert(fs::file_size(p) == total);
+
+    // std::byte spans, a mode asked for, directories made on demand, not durable
+    const std::string deep = path("streamed/a/b/c.bin");
+    auto v = atomic_file_writer::create(deep, {.durable = false, .mode = fs::perms::owner_all,
+                                               .create_directories = true});
+    assert(v.is_ok());
+    const std::byte two[] = {std::byte{1}, std::byte{2}};
+    assert(v->append(std::span<const std::byte>(two)).is_ok() && v->commit().is_ok());
+    assert(*read_file(deep) == std::string("\x01\x02", 2) && mode_of(deep) == 0700);
+    std::cout << "      (" << (total >> 20) << " MiB in " << 8 << " chunk sizes from 1 byte to 1 MiB)\n";
+    pass("atomic_file_writer: a large file streamed in uneven chunks replaces the target only at commit()");
+}
+
+void test_writer_abandoned_leaves_nothing()
+{
+    const std::string d = path("abandoned");
+    fs::create_directory(d);
+    const std::string p = d + "/target";
+    assert(write_file_atomically(p, "untouched").is_ok());
+    {
+        auto w = atomic_file_writer::create(p);
+        assert(w.is_ok());
+        stream_pattern(*w, 3u << 20, 1);
+        assert(entries_in(d) == 2);
+    }   // destroyed without commit()
+    assert(*read_file(p) == "untouched" && entries_in(d) == 1);
+
+    auto w = atomic_file_writer::create(p);
+    assert(w.is_ok() && w->append(std::string_view("discarded")).is_ok());
+    atomic_file_writer moved = std::move(*w);                             // the temporary goes with the move
+    assert(!w->active() && moved.active() && entries_in(d) == 2);
+    moved.abandon();
+    assert(!moved.active() && entries_in(d) == 1 && *read_file(p) == "untouched");
+    assert(moved.commit().is_err() && *read_file(p) == "untouched");
+
+    // A writer for a file that does not exist yet, abandoned: still nothing
+    {
+        auto n = atomic_file_writer::create(d + "/new");
+        assert(n.is_ok() && n->append(std::string_view("x")).is_ok());
+    }
+    assert(!fs::exists(d + "/new") && entries_in(d) == 1);
+
+    const auto nowhere = atomic_file_writer::create(path("no-such-dir/file"));
+    assert(nowhere.is_err() && nowhere.unwrap_err_unchecked() == std::errc::no_such_file_or_directory);
+    assert(atomic_file_writer::create(dir + "/").is_err());
+    pass("atomic_file_writer: destroyed or abandoned before commit(), the target is untouched and no temporary remains");
+}
+
+void test_writers_race_to_one_target()
+{
+    const std::string d = path("racing-writers");
+    fs::create_directory(d);
+    const std::string p = d + "/target";
+    constexpr int writers = 6;
+    constexpr std::uint64_t total = 2u << 20;
+
+    std::atomic<bool> stop{false};
+    std::atomic<long> reads{0};
+    auto whole = [&](const std::vector<std::uint8_t>& got) {
+        for (int k = 0; k < writers; ++k)
+            if (holds_pattern(got, total, static_cast<std::uint8_t>(k))) return true;
+        return false;
+    };
+    {
+        auto first = atomic_file_writer::create(p, {.durable = false});   // so readers have a file from the start
+        assert(first.is_ok());
+        stream_pattern(*first, total, 0);
+        assert(first->commit().is_ok());
+    }
+    std::vector<std::thread> threads;
+    for (int k = 0; k < writers; ++k) {
+        threads.emplace_back([&, k] {
+            for (int round = 0; round < 4; ++round) {
+                auto w = atomic_file_writer::create(p, {.durable = false});
+                assert(w.is_ok());
+                stream_pattern(*w, total, static_cast<std::uint8_t>(k));
+                assert(w->commit().is_ok());
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        while (!stop.load()) {
+            const auto got = read_file_bytes(p);
+            assert(got.is_ok() && whole(*got));
+            ++reads;
+        }
+    });
+    for (int k = 0; k < writers; ++k) threads[static_cast<std::size_t>(k)].join();
+    stop = true;
+    threads.back().join();
+    assert(whole(*read_file_bytes(p)));
+    assert(entries_in(d) == 1);
+    std::cout << "      (" << writers * 4 << " streamed commits, " << reads.load() << " reads, each one whole file)\n";
+    pass("atomic_file_writer: racing writers to one target leave one writer's whole file and no temporaries");
+}
+
+void test_writer_error_removes_the_temporary()
+{
+    // RLIMIT_FSIZE turns a write past 1 MiB into EFBIG (with SIGXFSZ ignored): a real write error, even as root
+    const std::string d = path("write-error");
+    fs::create_directory(d);
+    const std::string p = d + "/target";
+    assert(write_file_atomically(p, "before").is_ok());
+
+    struct rlimit saved {};
+    assert(::getrlimit(RLIMIT_FSIZE, &saved) == 0);
+    auto* const old_handler = ::signal(SIGXFSZ, SIG_IGN);
+    struct rlimit small = saved;
+    small.rlim_cur = 1u << 20;
+    assert(::setrlimit(RLIMIT_FSIZE, &small) == 0);
+
+    auto w = atomic_file_writer::create(p);
+    assert(w.is_ok());
+    const std::string chunk(256u << 10, 'z');
+    std::error_code first;
+    for (int i = 0; i < 16 && !first; ++i)
+        if (auto a = w->append(chunk); a.is_err()) first = a.unwrap_err_unchecked();
+    const bool removed_at_once = entries_in(d) == 1;
+    const auto later = w->append(std::string_view("x"));
+    const auto commit = w->commit();
+
+    assert(::setrlimit(RLIMIT_FSIZE, &saved) == 0);
+    ::signal(SIGXFSZ, old_handler);
+
+    assert(first == std::errc::file_too_large);
+    assert(removed_at_once && !w->active());
+    assert(later.is_err() && later.unwrap_err_unchecked() == first);      // the first error, again
+    assert(commit.is_err() && commit.unwrap_err_unchecked() == first);
+    assert(*read_file(p) == "before" && entries_in(d) == 1);
+
+    // write_file_atomically fails the same way
+    assert(::setrlimit(RLIMIT_FSIZE, &small) == 0);
+    ::signal(SIGXFSZ, SIG_IGN);
+    const auto whole = write_file_atomically(p, std::string(2u << 20, 'y'));
+    assert(::setrlimit(RLIMIT_FSIZE, &saved) == 0);
+    ::signal(SIGXFSZ, old_handler);
+    assert(whole.is_err() && whole.unwrap_err_unchecked() == std::errc::file_too_large);
+    assert(*read_file(p) == "before" && entries_in(d) == 1);
+    pass("atomic_file_writer: a failed write (EFBIG) removes the temporary, keeps the target, and repeats its error");
+}
+
 } // namespace
 
 int main()
@@ -280,6 +487,10 @@ int main()
     test_readers_and_writers_race();
     test_a_killed_writer_leaves_old_or_new();
     test_full_sync();
+    test_writer_streams_a_large_file();
+    test_writer_abandoned_leaves_nothing();
+    test_writers_race_to_one_target();
+    test_writer_error_removes_the_temporary();
 
     std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
     std::filesystem::remove_all(dir);

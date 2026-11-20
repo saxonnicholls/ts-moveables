@@ -13,6 +13,10 @@
 //      auto w = snicholls::write_file_atomically("book.csv", updated);
 //      // durable by default: the data, then the rename, are on stable storage when it returns
 //
+//      auto out = snicholls::atomic_file_writer::create("model.bin");   // too big to hold in memory
+//      for (auto chunk : chunks) if (auto a = out->append(chunk); a.is_err()) return a;
+//      if (auto c = out->commit(); c.is_err()) return c;                  // or destroy it: the target is untouched
+//
 //  ---------------------------------------------------------------- read_file
 //
 //  read_file(path) returns the bytes as a std::string, read_file_bytes(path)
@@ -42,6 +46,21 @@
 //  extended attributes are not carried over. If `path` is a symbolic link,
 //  the link itself is replaced, not its target.
 //
+//  ------------------------------------------------------ atomic_file_writer
+//
+//  The same replacement, streamed: atomic_file_writer::create(path, options)
+//  makes the temporary by the same rules (fresh name, O_EXCL | O_NOFOLLOW,
+//  the mode as above, create_directories honoured), append() adds bytes
+//  (small appends are gathered into 64 KiB writes, large ones go straight
+//  through), reserve(n) allocates blocks for n bytes up front so a full disk
+//  is an error before the data is produced, and commit() syncs the file,
+//  renames it over the target and syncs the directory, as write_file_atomically
+//  does (which is now create, one append, commit). A writer destroyed or
+//  abandon()ed before commit() removes its temporary; the target is never
+//  touched until the rename. The first error removes the temporary at once and
+//  is returned again by every later call. One writer, one thread; any number
+//  of writers may race to the same target, and one of them wins whole.
+//
 //  All of these come from comparing the copies in use: none synced the
 //  directory or retried EINTR, most could not tell a missing file from an
 //  empty one, and fixed temporary names let two writers corrupt each other.
@@ -65,6 +84,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -181,55 +201,203 @@ inline result<void, std::error_code> write_all(int fd, const unsigned char* data
     return ok();
 }
 
+} // namespace detail::fs_file
+
+// A file written piece by piece and then put in place atomically, like
+// write_file_atomically but without the whole contents in memory: create()
+// makes the temporary beside the target, append() adds bytes, and commit()
+// replaces the target. A writer destroyed (or abandon()ed) before commit()
+// removes its temporary and leaves the target as it was.
+class atomic_file_writer
+{
+public:
+    atomic_file_writer() noexcept = default;
+    atomic_file_writer(const atomic_file_writer&) = delete;
+    atomic_file_writer& operator=(const atomic_file_writer&) = delete;
+    atomic_file_writer(atomic_file_writer&& o) noexcept { take(o); }
+    atomic_file_writer& operator=(atomic_file_writer&& o) noexcept
+    {
+        if (this != &o) {
+            abandon();
+            take(o);
+        }
+        return *this;
+    }
+    ~atomic_file_writer() { abandon(); }
+
+    // Create the temporary beside `path`: a fresh name, O_EXCL | O_NOFOLLOW, with the mode the new file will have
+    [[nodiscard]] static result<atomic_file_writer, std::error_code> create(const std::filesystem::path& path,
+                                                                            const write_file_options& opt = {})
+    {
+        using namespace detail::fs_file;
+        if (path.filename().empty()) return err(std::make_error_code(std::errc::is_a_directory));
+        if (opt.create_directories) {
+            std::error_code ec;
+            std::filesystem::create_directories(directory_of(path), ec);
+            if (ec) return err(ec);
+        }
+
+        // The mode: asked for, else the replaced file's, else what open() gives under the umask
+        std::optional<::mode_t> mode;
+        if (opt.mode) {
+            mode = static_cast<::mode_t>(*opt.mode) & 07777;
+        } else if (struct stat st {}; ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            mode = st.st_mode & 07777;
+        }
+
+        // A fresh name; O_EXCL means a clash with a leftover is retried rather than written through
+        atomic_file_writer w;
+        for (int attempt = 0; attempt < 16 && w.fd_ < 0; ++attempt) {
+            w.tmp_ = temporary_beside(path);
+            w.fd_ = open_retrying(w.tmp_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
+            if (w.fd_ < 0 && errno != EEXIST) return err(errno_code());
+        }
+        if (w.fd_ < 0) return err(std::make_error_code(std::errc::file_exists));
+        w.target_ = path;
+        w.durable_ = opt.durable;
+        if (mode && ::fchmod(w.fd_, *mode) != 0) return err(w.fail(errno_code()));
+        return ok(std::move(w));
+    }
+
+    // Add bytes at the end. The first error is kept: the temporary is removed, and every later call returns it.
+    [[nodiscard]] result<void, std::error_code> append(std::span<const std::uint8_t> bytes)
+    {
+        if (fd_ < 0) return err(stopped());
+        if (bytes.size() >= buffer_bytes - buffer_.size()) {
+            if (auto e = drain()) return err(e);
+        }
+        if (bytes.size() >= buffer_bytes) {
+            if (auto w = detail::fs_file::write_all(fd_, bytes.data(), bytes.size()); w.is_err())
+                return err(fail(w.unwrap_err_unchecked()));
+        } else {
+            buffer_.insert(buffer_.end(), bytes.begin(), bytes.end());
+        }
+        written_ += bytes.size();
+        return ok();
+    }
+    [[nodiscard]] result<void, std::error_code> append(std::span<const std::byte> bytes)
+    {
+        return append(std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+    }
+    [[nodiscard]] result<void, std::error_code> append(std::string_view bytes)
+    {
+        return append(std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
+    }
+
+    // Allocate blocks for `total_bytes` now, so a full disk is an error here rather than part way through.
+    // Best effort where the filesystem cannot preallocate; the file's length stays what was appended.
+    [[nodiscard]] result<void, std::error_code> reserve(std::uint64_t total_bytes)
+    {
+        if (fd_ < 0) return err(stopped());
+        if (total_bytes <= reserved_) return ok();
+        if (auto e = drain()) return err(e);
+#if defined(__APPLE__)
+        if (total_bytes <= written_) return ok();
+        fstore_t fs{};
+        fs.fst_flags = F_ALLOCATEALL;
+        fs.fst_posmode = F_PEOFPOSMODE;   // from the end of what is written
+        fs.fst_length = static_cast<off_t>(total_bytes - written_);
+        if (::fcntl(fd_, F_PREALLOCATE, &fs) == -1 && errno != ENOTSUP && errno != EINVAL)
+            return err(fail(errno_code()));
+#else
+        const int rc = ::posix_fallocate(fd_, 0, static_cast<off_t>(total_bytes));
+        if (rc != 0 && rc != EOPNOTSUPP && rc != EINVAL) return err(fail({rc, std::system_category()}));
+#endif
+        reserved_ = total_bytes;
+        return ok();
+    }
+
+    // Put the file in place: sync it (if durable), rename it over the target, sync the directory (if durable).
+    // On failure before the rename the temporary is removed and the target is as it was. Ends the writer.
+    [[nodiscard]] result<void, std::error_code> commit()
+    {
+        using namespace detail::fs_file;
+        if (fd_ < 0) return err(stopped());
+        if (auto e = drain()) return err(e);
+        // posix_fallocate may have lengthened the file past what was written
+        if (reserved_ > written_ && ::ftruncate(fd_, static_cast<off_t>(written_)) != 0) return err(fail(errno_code()));
+        if (durable_) {
+            if (auto r = full_sync(fd_); r.is_err()) return err(fail(r.unwrap_err_unchecked()));
+        }
+        const int fd = std::exchange(fd_, -1);
+        if (::close(fd) != 0 && errno != EINTR) return err(fail(errno_code()));
+        if (::rename(tmp_.c_str(), target_.c_str()) != 0) return err(fail(errno_code()));
+        tmp_.clear();
+        if (durable_) {
+            // The rename is a change to the directory: sync it, or a crash can bring back the old name
+            fd_guard d(open_retrying(directory_of(target_).c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            if (d.get() < 0) return err(errno_code());
+            if (auto r = full_sync(d.get()); r.is_err()) return r;
+        }
+        return ok();
+    }
+
+    // Remove the temporary now; the target is untouched. Safe to call at any time.
+    void abandon() noexcept
+    {
+        if (fd_ >= 0) ::close(std::exchange(fd_, -1));
+        if (!tmp_.empty()) {
+            ::unlink(tmp_.c_str());
+            tmp_.clear();
+        }
+    }
+
+    bool active() const noexcept { return fd_ >= 0; }                            // created, not committed, no error
+    std::uint64_t size() const noexcept { return written_; }                     // bytes appended so far
+    const std::filesystem::path& target() const noexcept { return target_; }
+    const std::filesystem::path& temporary() const noexcept { return tmp_; }     // empty once committed or abandoned
+
+private:
+    static constexpr std::size_t buffer_bytes = std::size_t{1} << 16;
+
+    std::error_code stopped() const noexcept
+    {
+        return error_ ? error_ : std::make_error_code(std::errc::bad_file_descriptor);
+    }
+    std::error_code fail(std::error_code e) noexcept
+    {
+        error_ = e;
+        abandon();
+        return e;
+    }
+    std::error_code drain()
+    {
+        if (buffer_.empty()) return {};
+        auto w = detail::fs_file::write_all(fd_, buffer_.data(), buffer_.size());
+        buffer_.clear();
+        return w.is_err() ? fail(w.unwrap_err_unchecked()) : std::error_code{};
+    }
+    void take(atomic_file_writer& o) noexcept
+    {
+        target_ = std::move(o.target_);
+        tmp_ = std::exchange(o.tmp_, {});
+        buffer_ = std::exchange(o.buffer_, {});
+        fd_ = std::exchange(o.fd_, -1);
+        written_ = std::exchange(o.written_, 0);
+        reserved_ = std::exchange(o.reserved_, 0);
+        durable_ = o.durable_;
+        error_ = std::exchange(o.error_, {});
+    }
+
+    std::filesystem::path target_;
+    std::filesystem::path tmp_;
+    std::vector<std::uint8_t> buffer_;
+    int fd_ = -1;
+    std::uint64_t written_ = 0;
+    std::uint64_t reserved_ = 0;
+    bool durable_ = true;
+    std::error_code error_{};
+};
+
+namespace detail::fs_file {
+
 inline result<void, std::error_code> write_atomically(const std::filesystem::path& path, const unsigned char* data,
                                                       std::size_t size, const write_file_options& opt)
 {
-    if (path.filename().empty()) return err(std::make_error_code(std::errc::is_a_directory));
-    const std::filesystem::path dir = directory_of(path);
-    if (opt.create_directories) {
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        if (ec) return err(ec);
-    }
-
-    // The mode: asked for, else the replaced file's, else what open() gives under the umask
-    std::optional<::mode_t> mode;
-    if (opt.mode) {
-        mode = static_cast<::mode_t>(*opt.mode) & 07777;
-    } else if (struct stat st {}; ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
-        mode = st.st_mode & 07777;
-    }
-
-    // A fresh name; O_EXCL means a clash with a leftover is retried rather than written through
-    std::filesystem::path tmp;
-    int raw = -1;
-    for (int attempt = 0; attempt < 16 && raw < 0; ++attempt) {
-        tmp = temporary_beside(path);
-        raw = open_retrying(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
-        if (raw < 0 && errno != EEXIST) return err(errno_code());
-    }
-    if (raw < 0) return err(std::make_error_code(std::errc::file_exists));
-    fd_guard fd(raw);
-
-    auto fail = [&](std::error_code e) -> result<void, std::error_code> {
-        ::unlink(tmp.c_str());
-        return err(e);
-    };
-    if (mode && ::fchmod(fd.get(), *mode) != 0) return fail(errno_code());
-    if (auto w = write_all(fd.get(), data, size); w.is_err()) return fail(w.unwrap_err_unchecked());
-    if (opt.durable) {
-        if (auto s = full_sync(fd.get()); s.is_err()) return fail(s.unwrap_err_unchecked());
-    }
-    if (auto e = fd.close()) return fail(e);
-    if (::rename(tmp.c_str(), path.c_str()) != 0) return fail(errno_code());
-
-    if (opt.durable) {
-        // The rename is a change to the directory: sync it, or a crash can bring back the old name
-        fd_guard d(open_retrying(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        if (d.get() < 0) return err(errno_code());
-        if (auto s = full_sync(d.get()); s.is_err()) return s;
-    }
-    return ok();
+    auto w = atomic_file_writer::create(path, opt);
+    if (w.is_err()) return err(w.unwrap_err_unchecked());
+    if (auto a = w->append(std::span(data, size)); a.is_err()) return a;
+    return w->commit();
 }
 
 } // namespace detail::fs_file
