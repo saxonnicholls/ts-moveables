@@ -49,7 +49,7 @@
 //      srv.listen("0.0.0.0", 8443);
 //
 //  Build with, for example:
-//      -I$(brew --prefix mbedtls)/include -L$(brew --prefix mbedtls)/lib \
+//      -I$(brew --prefix mbedtls)/include -L$(brew --prefix mbedtls)/lib
 //      -lmbedtls -lmbedx509 -lmbedcrypto
 //
 //  mbedTLS 3.x is assumed. The 2.x API differs enough (version constants,
