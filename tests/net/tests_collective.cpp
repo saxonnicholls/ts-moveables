@@ -1270,7 +1270,9 @@ void test_all_to_all_v_errors()
          "another collective are a mismatched call on both ranks, then broken");
 }
 
-// A rank killed in the middle of a large all-to-all: an error naming it on every survivor, not a hang
+// A rank killed while the others' large all-to-all is in flight: an error naming it on every survivor, not a hang.
+// The killed rank never calls the all-to-all, so the others cannot complete it before the kill however fast or slow
+// the machine (it was killed 20 ms into its own call, which a loaded runner under ASan could outlast)
 void test_all_to_all_v_killed_peer()
 {
     auto j = make_job(3, 43);
@@ -1284,9 +1286,7 @@ void test_all_to_all_v_killed_peer()
         j.listeners[1].close();
         auto c = collective::connect(j.cfgs[2], std::move(j.listeners[2]));
         if (c.is_ok()) {
-            std::vector<float> s(3 * big, 1.0f), g(3 * big);
-            std::thread killer([] { std::this_thread::sleep_for(20ms); ::kill(::getpid(), SIGKILL); });
-            (void)c->all_to_all_v(s.data(), cnt, off, g.data(), cnt, off);
+            std::this_thread::sleep_for(200ms);   // the others are sending to it by now, or start against a dead peer
             ::kill(::getpid(), SIGKILL);
         }
         ::_exit(3);
