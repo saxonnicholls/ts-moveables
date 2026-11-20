@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory_resource>
 #include <numeric>
 #include <string>
@@ -137,6 +138,85 @@ void test_region_file_round_trip()
     mapped_region empty;
     assert(!empty.mapped() && empty.grow(1).err() == mapped_errc::not_mapped);
     pass("mapped_region: a file grows in place, flushes, and reopens with its bytes");
+}
+
+bool running_as_root() { return ::geteuid() == 0; }
+
+void test_region_read_only()
+{
+    const std::size_t page = mapped_region::page_size();
+    const auto file = path("read_only.bin");
+    const std::size_t n = 2 * page + 123;   // not a page multiple
+    {
+        auto w = mapped_region::open(file, {.reserve = 4 * page, .truncate = true});
+        assert(w.is_ok() && w->grow(n).is_ok());
+        for (std::size_t i = 0; i < n; ++i) w->data()[i] = static_cast<std::byte>(i * 7 + 1);
+        assert(w->flush().is_ok());
+    }
+    // The page-rounded file, cut back to n bytes, then read-only for everyone
+    assert(::truncate(file.c_str(), static_cast<off_t>(n)) == 0);
+    assert(::chmod(file.c_str(), 0444) == 0);
+
+    // The read-write open needs write permission (root has it regardless)
+    if (!running_as_root())
+        assert(mapped_region::open(file, {.create = false}).err() == std::errc::permission_denied);
+
+    auto r = mapped_region::open_read_only(file);
+    assert(r.is_ok());
+    assert(r->mapped() && !r->writable() && !r->is_anonymous() && r->size() == n);
+    for (std::size_t i = 0; i < n; ++i) assert(r->const_bytes()[i] == static_cast<std::byte>(i * 7 + 1));
+    std::byte* base = r->data();
+
+    // Writes are refused at the API: it cannot grow, in place or by moving, and nothing changes
+    assert(r->grow(n + 1).err() == mapped_errc::read_only);
+    assert(r->grow(1).err() == mapped_errc::read_only);
+    assert(r->grow_or_move(64 * page).err() == mapped_errc::read_only);
+    assert(r->data() == base && r->size() == n && std::filesystem::file_size(file) == n);
+    assert(r->grow(n + 1).unwrap_err_unchecked().message() == "the region is mapped read-only");
+
+    // Reading operations work as for any file
+    assert(r->advise(snicholls::map_advice::sequential).is_ok());
+    assert(r->flush().is_ok() && r->flush_async().is_ok());
+
+    // Moving carries the mode; the moved-from region is empty and writable again by default
+    mapped_region moved = std::move(*r);
+    assert(!moved.writable() && moved.size() == n && moved.data() == base);
+    assert(!r->mapped() && !r->writable() && r->grow(1).err() == mapped_errc::not_mapped);
+
+    // MAP_SHARED: a write to the file by someone allowed to make it shows through
+    const auto shared = path("read_only_shared.bin");
+    {
+        auto w = mapped_region::open(shared, {.reserve = page, .truncate = true});
+        assert(w.is_ok() && w->grow(page).is_ok());
+        std::memset(w->data(), 'a', page);
+        auto ro = mapped_region::open_read_only(shared);
+        assert(ro.is_ok() && ro->const_bytes()[100] == std::byte{'a'});
+        w->data()[100] = std::byte{'b'};
+        assert(ro->const_bytes()[100] == std::byte{'b'});
+        const char c = 'c';
+        const int fd = ::open(shared.c_str(), O_WRONLY);
+        assert(fd >= 0 && ::pwrite(fd, &c, 1, 200) == 1);
+        ::close(fd);
+        assert(ro->const_bytes()[200] == std::byte{'c'});
+    }
+
+    // An empty file maps to an empty region; a missing file and a directory are errors
+    const auto empty = path("read_only_empty.bin");
+    { std::ofstream touch(empty); }
+    auto e = mapped_region::open_read_only(empty);
+    assert(e.is_ok() && e->size() == 0 && !e->writable() && e->grow(1).err() == mapped_errc::read_only);
+    assert(mapped_region::open_read_only(path("missing.bin")).err() == std::errc::no_such_file_or_directory);
+    assert(mapped_region::open_read_only(dir).err() == std::errc::is_a_directory);
+
+    // A file with no read permission is refused (root reads it anyway)
+    if (!running_as_root()) {
+        const auto secret = path("unreadable.bin");
+        { std::ofstream(secret) << "x"; }
+        assert(::chmod(secret.c_str(), 0200) == 0);
+        assert(mapped_region::open_read_only(secret).err() == std::errc::permission_denied);
+    }
+    assert(::chmod(file.c_str(), 0644) == 0);
+    pass("mapped_region: open_read_only maps a chmod 0444 file, reads it, refuses to grow, and sees others' writes");
 }
 
 void test_region_file_moves_past_its_reservation()
@@ -455,6 +535,7 @@ int main()
     test_region_grow_or_move_keeps_contents();
     test_region_file_round_trip();
     test_region_file_moves_past_its_reservation();
+    test_region_read_only();
     test_resource_object_pool_and_pmr_vector();
     test_vector_round_trip_past_the_reservation();
     test_vector_growth_inside_the_reservation_never_moves();

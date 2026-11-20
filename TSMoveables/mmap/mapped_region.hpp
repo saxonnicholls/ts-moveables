@@ -14,6 +14,8 @@
 //      r->advise(snicholls::map_advice::sequential);
 //      r->flush();                                      // msync(MS_SYNC): durable on return
 //
+//      auto ro = snicholls::mapped_region::open_read_only("cache.bin");   // a file we may read, not write
+//
 //  ----------------------------------------------------------- how it grows
 //
 //  open() reserves a large range of address space once - PROT_NONE, private,
@@ -63,6 +65,17 @@
 //  MS_ASYNC, which schedules the write and returns. On macOS, MS_SYNC does not
 //  issue F_FULLFSYNC: a power cut can still lose data in the drive's cache
 //  (full_sync() does F_FULLFSYNC; on Linux it is fsync).
+//
+//  ------------------------------------------------------------- read-only
+//
+//  open_read_only() opens the file O_RDONLY and maps it PROT_READ, MAP_SHARED:
+//  a file this process may read but not write (a read-only cache, another
+//  user's file, a chmod 0444 file) maps, and a write by another process to
+//  the file shows through. Nothing can grow it: grow() and grow_or_move()
+//  answer mapped_errc::read_only, and writable() is false. A store through
+//  data() is a SIGSEGV, as it is for any PROT_READ page; const_bytes() is the
+//  view that says so in its type. flush() and advise() work as for any file.
+//  The size is the file's when it was opened.
 //
 //  -------------------------------------------------------------- the rules
 //
@@ -176,6 +189,34 @@ public:
         return ok(std::move(r));
     }
 
+    // Map an existing file for reading only: O_RDONLY, PROT_READ, MAP_SHARED.
+    // It needs read permission only; the region cannot grow (mapped_errc::read_only).
+    [[nodiscard]] static result<mapped_region, std::error_code> open_read_only(const std::string& path) noexcept
+    {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return err(errno_code());
+        struct stat st {};
+        if (::fstat(fd, &st) != 0) {
+            const auto e = errno_code();
+            ::close(fd);
+            return err(e);
+        }
+        if (S_ISDIR(st.st_mode)) {
+            ::close(fd);
+            return err(std::make_error_code(std::errc::is_a_directory));
+        }
+        const auto file_size = static_cast<std::size_t>(st.st_size);
+        mapped_region r;
+        r.fd_ = fd;
+        r.writable_ = false;
+        if (auto e = r.reserve_range(round_up(file_size))) return err(e);
+        if (file_size > 0) {
+            if (auto e = r.map_file(0, round_up(file_size))) return err(e);
+        }
+        r.size_ = file_size;
+        return ok(std::move(r));
+    }
+
     // Anonymous memory: zero-filled, private, not persisted. `initial` bytes
     // are usable at once; grow() makes more of the reservation usable.
     [[nodiscard]] static result<mapped_region, std::error_code> anonymous(std::size_t reserve,
@@ -196,6 +237,7 @@ public:
     [[nodiscard]] result<void, std::error_code> grow(std::size_t new_size) noexcept
     {
         if (base_ == nullptr) return err(make_error_code(mapped_errc::not_mapped));
+        if (!writable_) return err(make_error_code(mapped_errc::read_only));
         if (new_size <= size_) return ok();
         if (new_size > reserved_) return err(make_error_code(mapped_errc::reservation_exhausted));
         const std::size_t old_mapped = round_up(size_);
@@ -227,6 +269,7 @@ public:
     [[nodiscard]] result<void, std::error_code> grow_or_move(std::size_t new_size) noexcept
     {
         if (base_ == nullptr) return err(make_error_code(mapped_errc::not_mapped));
+        if (!writable_) return err(make_error_code(mapped_errc::read_only));
         if (new_size <= reserved_) return grow(new_size);
         mapped_region bigger;
         bigger.fd_ = -1;
@@ -300,7 +343,9 @@ public:
     std::size_t size() const noexcept { return size_; }             // usable bytes
     std::size_t reserved() const noexcept { return reserved_; }     // address space reserved
     std::span<std::byte> bytes() const noexcept { return {base_, size_}; }
+    std::span<const std::byte> const_bytes() const noexcept { return {base_, size_}; }
     bool mapped() const noexcept { return base_ != nullptr; }
+    bool writable() const noexcept { return base_ != nullptr && writable_; }   // false for open_read_only
     bool is_anonymous() const noexcept { return base_ != nullptr && fd_ < 0; }
     int fd() const noexcept { return fd_; }
     unsigned generation() const noexcept { return generation_; }   // how many times grow_or_move moved it
@@ -334,8 +379,8 @@ private:
 
     std::error_code map_file(std::size_t offset, std::size_t length) noexcept
     {
-        void* p = ::mmap(base_ + offset, length, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd_,
-                         static_cast<off_t>(offset));
+        const int prot = writable_ ? PROT_READ | PROT_WRITE : PROT_READ;
+        void* p = ::mmap(base_ + offset, length, prot, MAP_SHARED | MAP_FIXED, fd_, static_cast<off_t>(offset));
         if (p == MAP_FAILED) return errno_code();
         struct stat st {};
         if (::fstat(fd_, &st) == 0) file_bytes_ = static_cast<std::size_t>(st.st_size);
@@ -408,6 +453,7 @@ private:
         file_bytes_ = std::exchange(o.file_bytes_, 0);
         fd_ = std::exchange(o.fd_, -1);
         preallocate_ = o.preallocate_;
+        writable_ = std::exchange(o.writable_, true);
         generation_ = o.generation_;
     }
 
@@ -417,6 +463,7 @@ private:
         if (fd_ >= 0) ::close(fd_);
         base_ = nullptr;
         fd_ = -1;
+        writable_ = true;
         size_ = reserved_ = file_bytes_ = 0;
     }
 
@@ -426,6 +473,7 @@ private:
     std::size_t file_bytes_ = 0;
     int fd_ = -1;
     bool preallocate_ = true;
+    bool writable_ = true;
     unsigned generation_ = 0;
 };
 

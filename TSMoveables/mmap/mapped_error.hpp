@@ -55,6 +55,8 @@ enum class mapped_errc : int
     pool_not_formatted,
     pool_layout_mismatch,
     pool_corrupt,
+    // this library's own again
+    read_only,                   // a growth of a region mapped read-only
 };
 
 } // namespace snicholls
@@ -93,6 +95,7 @@ namespace detail {
             case mapped_errc::pool_not_formatted: return "pool: region is not a pool";
             case mapped_errc::pool_layout_mismatch: return "pool: slot size or index width differs";
             case mapped_errc::pool_corrupt: return "pool: counters contradict each other";
+            case mapped_errc::read_only: return "the region is mapped read-only";
             }
             return "unknown mapped error";
         }
