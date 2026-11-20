@@ -98,7 +98,7 @@ struct throwaway_cert {
         X509_set_subject_name(cert, n);
         X509_set_issuer_name(cert, n);
         X509_NAME_free(n);
-        // The name the client checks: OpenSSL 4 reads the subjectAltName only, never the CN
+        // The name the client checks: OpenSSL 4.1 reads the subjectAltName only, never the CN
         X509V3_CTX v3{};
         X509V3_set_ctx(&v3, cert, cert, nullptr, nullptr, 0);
         X509_EXTENSION* san = X509V3_EXT_conf_nid(nullptr, &v3, NID_subject_alt_name, "DNS:localhost");

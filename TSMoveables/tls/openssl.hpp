@@ -43,8 +43,8 @@
 //      -I$(brew --prefix openssl@3)/include -L$(brew --prefix openssl@3)/lib -lssl -lcrypto
 //  OpenSSL 3 and OpenSSL 4 are both supported, warning-free. A client checks
 //  the dialled name with SSL_set1_host on 3, and with SSL_set1_dnsname or
-//  SSL_set1_ipaddr on 4 (which deprecates SSL_set1_host); OpenSSL 4 also stops
-//  reading a certificate's subject CN, so it needs a DNS subjectAltName.
+//  SSL_set1_ipaddr on 4 (which deprecates SSL_set1_host); OpenSSL 4.1 also
+//  stops reading a certificate's subject CN, so it needs a DNS subjectAltName.
 //
 //  ALPN is answered here because that is where it belongs: the transport
 //  learns which protocol the client asked for during the handshake, and a

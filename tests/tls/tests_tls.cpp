@@ -95,7 +95,7 @@ struct self_signed {
 
     // `alt_names` is the subjectAltName ("DNS:localhost", "IP:127.0.0.1"), the
     // names a client checks; nullptr leaves only the CN, which OpenSSL 3 falls
-    // back to and OpenSSL 4 no longer reads (RFC 9525)
+    // back to and OpenSSL 4.1 no longer reads (RFC 9525)
     explicit self_signed(const char* alt_names = "DNS:localhost", const char* common_name = "localhost")
     {
         key = EVP_RSA_gen(2048);
@@ -833,9 +833,9 @@ void test_wss_ip_literal_checked_against_ip_san()
     pass("wss: an IP literal is verified against the certificate's IP address, and a name against its DNS names");
 }
 
-// A certificate that names its host only in the subject CN: OpenSSL 3 falls
-// back to the CN when there is no DNS subjectAltName, OpenSSL 4 does not read
-// the CN at all. The library leaves OpenSSL's default in place either way, so
+// A certificate that names its host only in the subject CN: OpenSSL 3 and 4.0
+// fall back to the CN when there is no DNS subjectAltName, OpenSSL 4.1 does
+// not read the CN at all. The library leaves OpenSSL's default in place either way, so
 // verification is never looser than the OpenSSL it is built against.
 void test_wss_common_name_only_follows_openssl()
 {
@@ -854,12 +854,12 @@ void test_wss_common_name_only_follows_openssl()
 
     wss_attempt a;
     assert(run_wss("wss://localhost:" + std::to_string(s.port) + "/ws", cfg, a));
-#if OPENSSL_VERSION_MAJOR >= 4
+#if OPENSSL_VERSION_PREREQ(4, 1)
     assert(!a.opened.load() && a.closed.load());
-    pass("wss: a certificate naming its host only in the CN is refused (OpenSSL 4 reads subjectAltName only)");
+    pass("wss: a certificate naming its host only in the CN is refused (OpenSSL 4.1 reads subjectAltName only)");
 #else
     assert(a.opened.load());
-    pass("wss: a certificate naming its host only in the CN is accepted (OpenSSL 3's CN fallback)");
+    pass("wss: a certificate naming its host only in the CN is accepted (the CN fallback of OpenSSL 3 and 4.0)");
 #endif
 }
 

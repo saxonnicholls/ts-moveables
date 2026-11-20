@@ -31,9 +31,9 @@ git tag, and `make check-version` fails if those three ever disagree.
 - **TLS builds warning-free against OpenSSL 4** (`tls/openssl.hpp`), which deprecates `SSL_set1_host`. With
   `OPENSSL_VERSION_MAJOR >= 4` the client sets the name it checks with `SSL_set1_ipaddr` for an IP literal and
   `SSL_set1_dnsname` otherwise (classified by OpenSSL's own `a2i_IPADDRESS`), which is what `SSL_set1_host` did;
-  OpenSSL 3 keeps `SSL_set1_host`. Verification is as strict as the OpenSSL linked: OpenSSL 4 no longer reads the
-  subject CN, so a certificate must name its host in a DNS subjectAltName there (OpenSSL 3 still falls back to the
-  CN). The TLS tests' certificates carry a subjectAltName, and new tests check an IP literal against an IP
+  OpenSSL 3 keeps `SSL_set1_host`. Verification is as strict as the OpenSSL linked: OpenSSL 4.1 no longer reads the
+  subject CN, so a certificate must name its host in a DNS subjectAltName there (OpenSSL 3 and 4.0 still fall back to
+  the CN). The TLS tests' certificates carry a subjectAltName, and new tests check an IP literal against an IP
   subjectAltName and pin the CN behaviour of each version. CI builds the TLS suite against OpenSSL 4 on the macOS
   jobs (Homebrew's `openssl@4`), and the TLS step now builds with `-Werror`.
 
