@@ -7,6 +7,12 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [1.11.1] — 2026-11-23
+
+### Changed
+
+- `third_party/core` pinned to snicholls-core `v0.21.0`, the family's one core version (no API change here).
+
 ## [1.11.0] — 2026-11-20
 
 ### Added
