@@ -12,7 +12,7 @@ git tag, and `make check-version` fails if those three ever disagree.
 ### Changed
 
 - **The single include is generated, never committed.** `ts_moveables.hpp` and `ts_http_server.hpp` are now written
-  by snicholls-tooling's `single_include.py` (`third_party/tooling`, pinned at `v0.2.1`, build-time only; settings in
+  by snicholls-tooling's `single_include.py` (`third_party/tooling`, pinned at `v0.2.3`, build-time only; settings in
   `tooling.conf`, with the opt-in list and its reasons), and the committed copies in `single_include/` are deleted, so
   they cannot be stale. Download them from the GitHub release instead: every release tag generates them from the
   tagged commit, compiles them alone as C++17 with warnings as errors, and attaches them. Every CMake build generates
