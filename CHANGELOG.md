@@ -7,6 +7,27 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
+## [Unreleased]
+
+### Changed
+
+- **The single include is generated, never committed.** `ts_moveables.hpp` and `ts_http_server.hpp` are now written
+  by snicholls-tooling's `single_include.py` (`third_party/tooling`, pinned at `v0.2.1`, build-time only; settings in
+  `tooling.conf`, with the opt-in list and its reasons), and the committed copies in `single_include/` are deleted, so
+  they cannot be stale. Download them from the GitHub release instead: every release tag generates them from the
+  tagged commit, compiles them alone as C++17 with warnings as errors, and attaches them. Every CMake build generates
+  and compiles them too (`ts_moveables_single_include`), the CTest `check.single_include` and CI fail while a header
+  is in no single include and not opted out, and `make check-amalgamate` still builds and runs
+  `tests/amalgamation/drop_in.cpp` against them alone, now in CI as both C++17 and C++20. The output is the same code
+  as before, without the `// begin` / `// end` markers and the leading `#pragma once` (every header keeps its guard).
+- `make single-include` writes them locally (git-ignored); `make amalgamate` is kept as its alias; `make check` runs
+  every static check.
+
+### Removed
+
+- `scripts/amalgamate.py` and `scripts/check_amalgamation.py`, replaced by tooling's `single_include.py` and its
+  `--check`.
+
 ## [1.11.2] — 2026-11-24
 
 ### Changed

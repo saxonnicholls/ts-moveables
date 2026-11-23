@@ -15,9 +15,9 @@
 //  on the part that did not. Here each component is constructed and does one
 //  real thing, so leaving one out of the umbrella is a compile error.
 //
-//  scripts/check_amalgamation.py asks the same question from the other side
-//  (every header in the tree is in the file); this proves what is in the file
-//  actually works on its own.
+//  tooling's single_include.py --check asks the same question from the other
+//  side (every header in the tree is in the file, or opted out in
+//  tooling.conf); this proves what is in the file actually works on its own.
 //
 
 #include "ts_moveables.hpp"

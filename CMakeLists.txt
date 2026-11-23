@@ -126,6 +126,22 @@ if(TS_MOVEABLES_BUILD_TESTS)
         add_test(NAME remote_compute_selftest COMMAND ts_moveables_remote_compute_demo selftest --no-lan)
         set_tests_properties(remote_compute_selftest PROPERTIES TIMEOUT 180)
     endif()
+
+    # tooling (third_party/tooling, a test-only submodule pinned to a tag): ts_moveables.hpp and ts_http_server.hpp, the
+    # single includes, are generated in the build tree and compiled on their own as C++17, and the CTest
+    # check.single_include proves every header is in one or opted out, from tooling.conf
+    if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tooling/cmake/SnichollsTooling.cmake)
+        message(FATAL_ERROR "third_party/tooling is empty - run: git submodule update --init --recursive")
+    endif()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/third_party/tooling/cmake/SnichollsTooling.cmake)
+    if(MSVC)
+        set(TS_MOVEABLES_SINGLE_INCLUDE_WARNINGS /W4)
+    else()
+        set(TS_MOVEABLES_SINGLE_INCLUDE_WARNINGS -Wall -Wextra -Wpedantic -Werror)
+    endif()
+    snicholls_single_include_check(ts_moveables_single_include CXX_STANDARD 17
+        COMPILE_OPTIONS ${TS_MOVEABLES_SINGLE_INCLUDE_WARNINGS})
+    snicholls_tooling_add_checks(SINGLE_INCLUDE)
 endif()
 
 # Install and export - headers live in subdirectories, so the tree is

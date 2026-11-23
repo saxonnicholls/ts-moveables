@@ -878,7 +878,7 @@ snicholls_core_assert_single_version()
 
 ### Which version am I compiling against?
 
-`find_package` answers that for CMake users, but the pitch above is "copy one file" — and someone who dropped `single_include/ts_moveables.hpp` into a tree with no build system has no CMake to ask. So the version is in the headers too, and travels with the amalgamated file:
+`find_package` answers that for CMake users, but the pitch above is "copy one file" — and someone who dropped the single include `ts_moveables.hpp` into a tree with no build system has no CMake to ask. So the version is in the headers too, and travels with the amalgamated file:
 
 ```cpp
 #if SNICHOLLS_VERSION >= SNICHOLLS_VERSION_CHECK(1, 1, 0)
@@ -1670,7 +1670,7 @@ srv.listen("0.0.0.0", 8080);
 srv.run();
 ```
 
-**Single file, if you want one.** `make amalgamate` flattens the headers into `single_include/ts_http_server.hpp` — copy that one file into your project, `#include` it, link pthreads, done. CI compiles *and runs* the amalgamated header on every push, so the drop-in claim cannot quietly rot.
+**Single file, if you want one.** Download `ts_http_server.hpp` (the server alone) or `ts_moveables.hpp` (the whole library) from the [release](https://github.com/saxonnicholls/ts-moveables/releases) you pin — copy that one file into your project, `#include` it, link pthreads, done. Each is the headers, and the snicholls-core headers they use, flattened into one file by snicholls-tooling's `single_include.py`; it is generated, never committed, so it cannot be stale, and `make single-include` writes it for any other commit (`single_include/README.md`). CI generates it and compiles *and runs* the drop-in against it on every push, so the drop-in claim cannot quietly rot.
 
 Three things make it different from the blocking servers it resembles:
 

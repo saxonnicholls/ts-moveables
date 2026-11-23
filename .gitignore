@@ -21,3 +21,6 @@ scratch/
 
 # Local, unpublished agent instructions (they name private paths)
 CLAUDE.local.md
+
+# the single include is generated, never committed (single_include/README.md)
+/single_include/*.hpp

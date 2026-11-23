@@ -9,6 +9,8 @@
 #   make demo    build and run the demo (same code as the Xcode target)
 #   make demo-remote  remote execution: client and workers over loopback (C++20, POSIX)
 #   make test-collective  allreduce, broadcast, barrier and all-to-all over TCP (C++20, POSIX)
+#   make single-include  write single_include/ts_moveables.hpp and ts_http_server.hpp (git-ignored)
+#   make check-amalgamate  the single includes are complete, and the drop-in builds and runs on them alone
 #   make clean
 #
 #   make test STD=c++17    any target can be built against a different standard
@@ -560,24 +562,30 @@ build/loop_dispatch: benchmarks/loop_dispatch.cpp $(HEADERS) | build
 bench-dispatch: build/loop_dispatch
 	./build/loop_dispatch
 
-# One self-contained file per entry header, for drop-in use
-amalgamate:
-	python3 scripts/amalgamate.py http/server.hpp -o single_include/ts_http_server.hpp
-	python3 scripts/amalgamate.py ts_moveables.hpp
+# The single include: ts_moveables.hpp (the library) and ts_http_server.hpp (the HTTP server), each with the
+# snicholls-core headers it uses, written to single_include/ for this commit by tooling's single_include.py (from
+# tooling.conf). Never committed (git-ignored): a release's files are attached to the GitHub release, and every CMake
+# build generates and compiles its own. `make amalgamate` is the old name.
+single-include:
+	python3 third_party/tooling/scripts/single_include.py
 
-# The amalgamated headers must always still compile - and run - on their own,
-# and must contain the library rather than just the part that already worked:
-# check_amalgamation.py proves every header in the tree is in the file, and
-# tests/amalgamation/drop_in.cpp uses every shipped component through it
-check-amalgamate: amalgamate | build
-	python3 scripts/check_amalgamation.py
+amalgamate: single-include
+
+# Every header in the tree is in a single include or opted out (tooling's --check), and the files compile - and
+# run - on their own: tests/amalgamation/drop_in.cpp sees ONLY single_include/ and uses every shipped component
+check-amalgamate: single-include | build
+	python3 third_party/tooling/scripts/single_include.py --check
 	printf '#include "ts_http_server.hpp"\nint main(){ snicholls::http::server s; s.get("/", [](const auto&, auto r){ r.send(200, "text/plain", "ok"); }); return s.listen("127.0.0.1", 0) ? 0 : 1; }\n' > build/amalgam_http_check.cpp
-	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include build/amalgam_http_check.cpp -o build/amalgam_http_check
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic $(EXTRA_FLAGS) -O2 -pthread -Isingle_include build/amalgam_http_check.cpp -o build/amalgam_http_check $(LDLIBS)
 	./build/amalgam_http_check && echo "single-header http drop-in: builds and runs"
-	$(CXX) $(CORE_INC) -std=$(STD) -Wall -Wextra -O2 -pthread -Isingle_include tests/amalgamation/drop_in.cpp -o build/amalgam_check
+	$(CXX) -std=$(STD) -Wall -Wextra -pedantic $(EXTRA_FLAGS) -O2 -pthread -Isingle_include tests/amalgamation/drop_in.cpp -o build/amalgam_check $(LDLIBS)
 	./build/amalgam_check
+
+# The static checks, together
+check: check-msvc check-tests check-version
+	python3 third_party/tooling/scripts/single_include.py --check
 
 clean:
 	rm -rf build
 
-.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap test-fs asan-fs test-process asan-process test-client asan-client test-collective asan-collective tsan-collective demo-collective bench-collective h2-client-interop demo-text-index amalgamate check-amalgamate clean
+.PHONY: all test test-debug stress check-msvc check-tests tsan asan demo bench demo-signals demo-capture demo-pcap demo-taskflow demo-timemaster demo-http demo-webhook demo-remote tsan-remote bench-remote bench-tokenizer demo-bwt demo-replay demo-drones test-tls check-mbedtls check-version autobahn h2spec bench-http bench-scale bench-request bench-dispatch bench-wshub bench-parallel bench-pool-dispatch bench-relay bench-relay-memory bench-wss bench-rpc test-mmap asan-mmap bench-mmap test-fs asan-fs test-process asan-process test-client asan-client test-collective asan-collective tsan-collective demo-collective bench-collective h2-client-interop demo-text-index single-include amalgamate check-amalgamate check clean

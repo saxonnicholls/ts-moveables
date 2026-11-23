@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          submodules: true   # third_party/core (snicholls-core): constexpr_for
+          submodules: recursive   # third_party/core (snicholls-core), third_party/tooling
 
       # MSVC C3493 has broken CI five times. It is a static property of the
       # source, so it is checked on every job rather than discovered on the one
@@ -72,6 +72,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
         run: python3 scripts/check_version.py
+
+      # Every header is in a single include (ts_moveables.hpp, ts_http_server.hpp) or opted out with a reason
+      - name: The single include holds every public header
+        run: python3 third_party/tooling/scripts/single_include.py --check
 
       - name: Unit tests (C++17)
         run: make clean && make test CXX=${{ matrix.cxx }} STD=c++17 EXTRA_FLAGS=-Werror
@@ -279,15 +283,12 @@ jobs:
             ./build/ws_tls_throughput --msgs 8000 --markdown
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # The single-file drop-in must build, run, and match the source headers -
-      # a stale committed amalgamation is a broken promise, so fail on drift
-      - name: Single-header amalgamation
+      # The single include is generated, never committed, so it cannot be stale: here it is generated and the
+      # drop-in builds and runs against it alone, as C++17 and C++20
+      - name: Single-header drop-in
         run: |
-          make check-amalgamate CXX=${{ matrix.cxx }}
-          git diff --exit-code -- single_include/ || {
-            echo "::error::single_include/ is stale - run 'make amalgamate' and commit"
-            exit 1
-          }
+          make check-amalgamate CXX=${{ matrix.cxx }} STD=c++17 EXTRA_FLAGS=-Werror
+          make check-amalgamate CXX=${{ matrix.cxx }} STD=c++20 EXTRA_FLAGS=-Werror
 
       # What typed signal dispatch costs against a raw epoll/kqueue loop. Six
       # platforms give a better answer than one developer laptop.
@@ -442,7 +443,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          submodules: true   # third_party/core (snicholls-core): constexpr_for
+          submodules: recursive   # third_party/core (snicholls-core), third_party/tooling
 
       - name: Configure
         run: cmake -B build-cmake -DCMAKE_BUILD_TYPE=Release
@@ -489,7 +490,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          submodules: true   # third_party/core (snicholls-core): constexpr_for
+          submodules: recursive   # third_party/core (snicholls-core), third_party/tooling
 
       - name: Unit tests (C++17 and C++20)
         shell: cmd
@@ -499,3 +500,43 @@ jobs:
           tests17.exe || exit /b 1
           cl /nologo /std:c++20 /EHsc /W4 /O2 /Ithird_party\core\include tests\*.cpp /Fe:tests20.exe || exit /b 1
           tests20.exe || exit /b 1
+
+  # The single include is never committed, so it cannot be stale: on a release tag it is generated from the tagged
+  # commit, compiled alone with warnings as errors, and attached to the GitHub release, once the gating legs are green
+  single-include:
+    name: Release the single include
+    needs: [build-and-test, cmake, msvc]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Generate it from the tagged commit
+        run: |
+          set -euo pipefail
+          python3 third_party/tooling/scripts/single_include.py --check
+          python3 third_party/tooling/scripts/single_include.py --out "$RUNNER_TEMP/single_include"
+          ls -l "$RUNNER_TEMP/single_include"
+
+      - name: It compiles alone, warnings as errors
+        run: |
+          for f in ts_moveables ts_http_server; do
+            printf '#include "%s.hpp"\n' "$f" > "$RUNNER_TEMP/use.cpp"
+            g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -fsyntax-only -I"$RUNNER_TEMP/single_include" "$RUNNER_TEMP/use.cpp"
+          done
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --title "ts-moveables $TAG" --notes "See CHANGELOG.md for $TAG."
+          gh release upload "$TAG" "$RUNNER_TEMP/single_include/ts_moveables.hpp" \
+            "$RUNNER_TEMP/single_include/ts_http_server.hpp" --clobber
