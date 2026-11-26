@@ -43,6 +43,8 @@
 #include "http/websocket_client.hpp"            // IWYU pragma: export (the outbound half)
 #include "net/outbound.hpp"                      // IWYU pragma: export (one outbound connection)
 #include "net/url.hpp"                           // IWYU pragma: export
+#include "concepts/transport_delegate.hpp"       // IWYU pragma: export (transport_delegate's concept twin)
+#include "interfaces/transport_delegate_conformance.hpp"// IWYU pragma: export (the kit every transport runs through)
 #include "concurrent/synchronized.hpp"                 // IWYU pragma: export
 #include "concurrent/synchronized_heterogeneous.hpp"   // IWYU pragma: export
 #include "process/global.hpp"                     // IWYU pragma: export

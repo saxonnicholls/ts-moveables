@@ -867,7 +867,7 @@ The library exports the interface target `snicholls::ts_moveables`, which carrie
 include(FetchContent)
 FetchContent_Declare(ts_moveables
     GIT_REPOSITORY https://github.com/saxonnicholls/ts-moveables.git
-    GIT_TAG v1.11.2)
+    GIT_TAG v1.12.0)
 FetchContent_MakeAvailable(ts_moveables)
 
 target_link_libraries(my_app PRIVATE snicholls::ts_moveables)
@@ -1856,6 +1856,13 @@ The policies *are* the design: `block` for a flight record that must lose nothin
 Honest positioning against [spdlog](https://github.com/gabime/spdlog): it is faster at formatting, far more mature, and has a battle-tested rotating-file story we do not. What this has is the fabric — one pipeline, any thread, sinks that are ordinary signal slots with lifetime tracking, and a live WebSocket sink that falls out of composition rather than a plugin API. See [`make demo-drones`](#demos) for the whole thing under load.
 
 ## HTTPS (TLS)
+
+**Writing a backend.** A backend implements `transport_delegate` (`interfaces/transport_delegate.hpp`), or, with no
+vtable, models its concept twin `transport_like` (`concepts/transport_delegate.hpp`) and is wrapped in
+`transport_adapter<Impl>`. Either form is graded by the one conformance kit
+(`interfaces/transport_delegate_conformance.hpp`): `check_transport_pair(client, server, {"h2"})` runs the
+handshake, ALPN, payloads to 1 MiB both ways and shutdown in memory, and `check_rejects_garbage` checks that
+anything that encrypts refuses bytes that are not a handshake. The OpenSSL and mbedTLS backends here pass it.
 
 The other axis. A protocol delegate turns bytes into requests; a **transport delegate** decides how those bytes arrive — and TLS is just a transport:
 

@@ -7,7 +7,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(ts_moveables
-    VERSION 1.11.2
+    VERSION 1.12.0
     DESCRIPTION "Thread Safe Moveable Objects - moveable wrappers for the immovable C++ synchronisation primitives"
     HOMEPAGE_URL "https://github.com/saxonnicholls/ts-moveables"
     LANGUAGES CXX)
@@ -86,7 +86,9 @@ if(TS_MOVEABLES_BUILD_TESTS)
         tests/tests_ws_deflate.cpp
         tests/tests_logging.cpp
         tests/tests_http2.cpp
-        tests/tests_global.cpp)
+        tests/tests_global.cpp
+        tests/concepts/transport_delegate_test.cpp
+        tests/interfaces/transport_delegate_test.cpp)
     target_link_libraries(ts_moveables_tests PRIVATE snicholls::ts_moveables)
     add_test(NAME unit_tests COMMAND ts_moveables_tests)
 

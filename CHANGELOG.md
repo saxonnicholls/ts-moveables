@@ -7,10 +7,34 @@ this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The version is written in `TSMoveables/version.hpp`, `CMakeLists.txt` and the
 git tag, and `make check-version` fails if those three ever disagree.
 
-## [Unreleased]
+## [1.12.0] — 2026-11-26
+
+### Added
+
+- **`transport_delegate`'s concept twin** (`TSMoveables/concepts/transport_delegate.hpp`): the trait
+  `is_transport_like_v` (C++17), the concept `transport_like` (C++20) and the `TS_MOVEABLES_TRANSPORT` macro. The
+  adapters go both ways: `transport_adapter<Impl>` turns a model into a `transport_delegate`, held by value or as a
+  view, and `delegate_transport` turns a `transport_delegate` into a model. `make_transport_factory<Impl>` builds
+  a `net::transport_factory` from a model. Static asserts check the interface against its own concept.
+- **The transport conformance kit** (`TSMoveables/interfaces/transport_delegate_conformance.hpp`), the one test
+  every transport passes, in either form:
+  - `check_transport_pair(client, server, {alpn})` wires the pair back to back in memory. It checks the
+    handshake, both sides agreeing on ALPN, payloads from 1 byte to 1 MiB both ways, a zero-byte write, and
+    shutdown.
+  - `check_rejects_garbage` is the extra check for anything that encrypts.
+  - Both return a list of failures instead of asserting, so any test framework can report them.
+  - `plain_transport` passes it, a no-vtable model passes it through every adapter, and a transport that drops
+    bytes fails it. So do both TLS backends in `make test-tls`, with h2 agreed by ALPN.
+  - A TLS backend written outside this repository is graded by the same call.
+- `TSMoveables/concepts/detect.hpp`: the C++20 concepts detection the twins share, moved out of
+  `concepts/task_pool.hpp`.
+- Twin tests use tooling's `check_interfaces` layout, `tests/concepts/<x>_test.cpp` and
+  `tests/interfaces/<x>_test.cpp`. The Makefile, CMake and `check_test_registry.py` include them.
 
 ### Changed
 
+- `third_party/core` is pinned at snicholls-core **`v0.24.1`** and `third_party/tooling` at **`v0.3.1`**, one
+  version each across the libraries built together. No API change here.
 - **The single include is generated, never committed.** `ts_moveables.hpp` and `ts_http_server.hpp` are now written
   by snicholls-tooling's `single_include.py` (`third_party/tooling`, pinned at `v0.2.3`, build-time only; settings in
   `tooling.conf`, with the opt-in list and its reasons), and the committed copies in `single_include/` are deleted, so

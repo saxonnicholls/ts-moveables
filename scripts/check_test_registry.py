@@ -36,6 +36,12 @@ CMAKE = os.path.join(ROOT, "CMakeLists.txt")
 def main():
     on_disk = sorted(f for f in os.listdir(TESTS)
                      if f.startswith("tests_") and f.endswith(".cpp"))
+    # The interface twins' tests (tooling's check_interfaces layout): tests/concepts/<x>_test.cpp and
+    # tests/interfaces/<x>_test.cpp, which the Makefile globs too
+    for sub in ("concepts", "interfaces"):
+        d = os.path.join(TESTS, sub)
+        if os.path.isdir(d):
+            on_disk += sorted(sub + "/" + f for f in os.listdir(d) if f.endswith("_test.cpp"))
     if not on_disk:
         print("check_test_registry: found no tests/tests_*.cpp at all", file=sys.stderr)
         return 1
@@ -45,7 +51,7 @@ def main():
 
     # The reverse direction matters just as much: a file listed but deleted
     # breaks the CMake configure step for everyone who clones.
-    listed = set(re.findall(r"tests/(tests_\w+\.cpp)", cmake))
+    listed = set(re.findall(r"tests/(tests_\w+\.cpp|(?:concepts|interfaces)/\w+_test\.cpp)", cmake))
     stale = sorted(listed - set(on_disk))
 
     print("  %d test sources on disk, %d listed in CMakeLists.txt"

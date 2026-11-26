@@ -58,21 +58,7 @@
 
 #include "../interfaces/task_pool.hpp"
 
-// The language feature comes from the compiler, the library one from <version>
-#if defined(__has_include)
-#if __has_include(<version>)
-#include <version>
-#endif
-#endif
-#if defined(__cpp_concepts) && __cpp_concepts >= 201907L && defined(__cpp_lib_concepts) && __cpp_lib_concepts >= 202002L
-#define TS_MOVEABLES_HAS_CONCEPTS 1
-#else
-#define TS_MOVEABLES_HAS_CONCEPTS 0
-#endif
-
-#if TS_MOVEABLES_HAS_CONCEPTS
-#include <concepts>
-#endif
+#include "detect.hpp"
 
 namespace snicholls
 {

@@ -42,6 +42,8 @@ void run_ws_deflate_tests();
 void run_logging_tests();
 void run_http2_tests();
 void run_global_tests();
+void run_transport_concept_tests();
+void run_transport_interface_tests();
 
 using namespace snicholls;
 using namespace std::chrono_literals;
@@ -923,6 +925,8 @@ int main(int argc, char** argv)
     run_logging_tests();
     run_http2_tests();
     run_global_tests();
+    run_transport_concept_tests();
+    run_transport_interface_tests();
 
     test_once_flag();
 

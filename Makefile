@@ -45,7 +45,7 @@ ifeq ($(UNAME_S),Linux)
 endif
 
 HEADERS  := $(shell find TSMoveables -name '*.hpp') $(wildcard tests/*.hpp)
-TEST_SRC := $(wildcard tests/*.cpp)
+TEST_SRC := $(wildcard tests/*.cpp) $(wildcard tests/concepts/*_test.cpp) $(wildcard tests/interfaces/*_test.cpp)
 
 all: build/tests build/demo
 

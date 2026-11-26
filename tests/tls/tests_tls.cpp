@@ -54,6 +54,7 @@
 #if __cplusplus >= 202002L
 #include "../../TSMoveables/http/client.hpp"
 #include "../../TSMoveables/http/http2.hpp"
+#include "../../TSMoveables/interfaces/transport_delegate_conformance.hpp"
 #endif
 #include "../../TSMoveables/moveable/mutex.hpp"
 
@@ -685,6 +686,32 @@ struct wss_fixture {
     }
 };
 
+// The transport conformance kit (interfaces/transport_delegate_conformance.hpp), the one every transport passes,
+// on a real TLS pair in memory: the OpenSSL client against each backend's server, h2 agreed by ALPN, payloads to
+// 1 MiB both ways, shutdown, and garbage refused. Another TLS backend anywhere in the family is graded the same way.
+template <class Backend>
+void test_tls_transport_conformance(const self_signed& cred)
+{
+    typename Backend::context tls;
+    Backend::configure(tls, cred);
+    tls.set_alpn({"h2", "http/1.1"});
+    auto server = tls.make_transport();
+    wss_fixture fx(cred);
+    openssl_client_config ccfg;
+    ccfg.ca_file = fx.ca_path;
+    ccfg.alpn = {"h2", "http/1.1"};
+    openssl_client_context client_ctx(ccfg);
+    auto client = client_ctx.connect("localhost");
+    auto failures = snicholls::http::check_transport_pair(*client, *server, {"h2"});
+    for (const auto& f : failures) std::cerr << "  conformance: " << f << "\n";
+    assert(failures.empty());
+    auto fresh = tls.make_transport();
+    failures = snicholls::http::check_rejects_garbage(*fresh);
+    for (const auto& f : failures) std::cerr << "  conformance: " << f << "\n";
+    assert(failures.empty());
+    pass(tagged(Backend::label(), "transport conformance kit: handshake, h2 by ALPN, 1 MiB both ways, shutdown, garbage").c_str());
+}
+
 // Drive one connection attempt to a verdict: opened, or closed with a reason.
 struct wss_attempt {
     std::atomic<bool> opened{false};
@@ -995,12 +1022,14 @@ int main()
     test_https_client(cred);
     test_https_client_h2<openssl_backend>(cred, "openssl");
 #endif
+    test_tls_transport_conformance<openssl_backend>(cred);
 
 #if defined(SNICHOLLS_TEST_MBEDTLS)
     run_backend<mbedtls_backend>(cred);
 #if __cplusplus >= 202002L && SNICHOLLS_HAS_HTTP_CLIENT
     test_https_client_h2<mbedtls_backend>(cred, "mbedtls");
 #endif
+    test_tls_transport_conformance<mbedtls_backend>(cred);
 #else
     std::cout << "\n-- backend: mbedtls - not installed, skipped\n";
 #endif
